@@ -153,9 +153,70 @@ inline i64 cpu_max_khz(i64 cpu) {
     return 0;
 }
 
+#if defined(_WIN32)
+// Windows hybrid detection: EfficiencyClass from RelationProcessorCore is the
+// only portable signal (higher = P/performance on Intel 12th+ and Qualcomm X).
+// Returns true and fills t when it can order logical processors; false leaves
+// the caller on the identity fallback. Single-group only (< 64 logical CPUs),
+// which covers every client hybrid this engine targets.
+inline bool detect_cpu_topology_win(CpuTopology &t, i64 hc) {
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || len == 0) return false;
+    std::vector<unsigned char> buf(len);
+    auto *info = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *>(buf.data());
+    if (!GetLogicalProcessorInformationEx(RelationProcessorCore, info, &len)) return false;
+
+    struct Lp { int id; BYTE eff; };
+    std::vector<Lp> lps;
+    lps.reserve(static_cast<size_t>(hc));
+    for (unsigned char *p = buf.data(); p < buf.data() + len; ) {
+        auto *e = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *>(p);
+        if (e->Relationship == RelationProcessorCore) {
+            const BYTE eff = e->Processor.EfficiencyClass;
+            for (WORD g = 0; g < e->Processor.GroupCount; g++) {
+                const auto &gm = e->Processor.GroupMask[g];
+                KAFFINITY mask = gm.Mask;
+                for (int b = 0; b < 64 && mask; b++, mask >>= 1) {
+                    if (mask & 1) lps.push_back({static_cast<int>(gm.Group) * 64 + b, eff});
+                }
+            }
+        }
+        p += e->Size;
+    }
+    if (lps.empty()) return false;
+    std::stable_sort(lps.begin(), lps.end(), [](const Lp &a, const Lp &b) {
+        if (a.eff != b.eff) return a.eff > b.eff; // P cores first
+        return a.id < b.id;
+    });
+    BYTE max_eff = 0, min_eff = 255;
+    for (const auto &lp : lps) { if (lp.eff > max_eff) max_eff = lp.eff; if (lp.eff < min_eff) min_eff = lp.eff; }
+    t.order.clear();
+    t.order.reserve(lps.size());
+    t.n_fast = 0; t.n_slow = 0; t.max_khz = 0;
+    // Split by efficiency class, not by clock (unavailable here): the top class
+    // is the performance cluster. A two-class split (P+E) is the common case;
+    // three classes (P+E+LP-E, Meteor Lake) fold LP-E into "slow".
+    for (const auto &lp : lps) {
+        t.order.push_back(static_cast<i64>(lp.id));
+        if (lp.eff == max_eff) t.n_fast++; else t.n_slow++;
+    }
+    t.hybrid = max_eff != min_eff;
+    // If the OS reports more logical CPUs than we enumerated (multi-group box
+    // we don't fully map), keep the enumeration as the preferred prefix and do
+    // not claim a complete topology.
+    if (static_cast<i64>(t.order.size()) < hc && !t.hybrid) return false;
+    return true;
+}
+#endif
+
 inline CpuTopology detect_cpu_topology(i64 hc) {
     CpuTopology t;
     t.order.reserve(static_cast<size_t>(hc));
+#if defined(_WIN32)
+    if (detect_cpu_topology_win(t, hc)) return t;
+    t.order.clear();
+#endif
     std::vector<std::pair<i64, i64>> f;  // (khz, cpu)
     f.reserve(static_cast<size_t>(hc));
     for (i64 i = 0; i < hc; i++) {
@@ -359,13 +420,22 @@ private:
     }
 
     Pool() {
-        i64 hc = static_cast<i64>(std::thread::hardware_concurrency());
+        const i64 hw = std::max<i64>(1, static_cast<i64>(std::thread::hardware_concurrency()));
+        i64 hc = hw;
+        bool hc_forced = false;
         if (const char *e = std::getenv("KRK_THREADS")) {
             const i64 v = std::atoll(e);
-            if (v > 0) hc = v;
+            if (v > 0) { hc = v; hc_forced = true; }
         }
+        topo_ = detect_cpu_topology(hw);
+        // On a hybrid part the slow cluster drags the whole pool (a decode step
+        // is as slow as its slowest participant). Default to the performance
+        // cluster unless the user asked for a specific count; prefill-heavy work
+        // can opt back in with KRK_THREADS=<all> or --threads.
+        if (!hc_forced && topo_.hybrid && topo_.n_fast > 0 && hc > topo_.n_fast)
+            hc = topo_.n_fast;
         if (hc < 1) hc = 1;
-        setup_placement(hc);
+        setup_placement_pinning();
         const i64 nw = std::min<i64>(hc - 1, 63);
         const i64 start = task_id_.load(std::memory_order_acquire);
         for (i64 i = 0; i < nw; i++)
@@ -375,12 +445,10 @@ private:
             });
     }
 
-    // Decide the placement once, then apply it: the caller keeps the fastest
-    // core (it also runs a slice, and on the MoE path it does the routing, the
-    // sampling and the device submissions between slices) and the workers take
-    // the cores that follow, in the same fastest-first order.
-    void setup_placement(i64 hc) {
-        topo_ = detect_cpu_topology(hc);
+    // Apply pinning policy to the already-detected topology: auto on hybrid,
+    // forced or disabled by KRK_AFFINITY. The caller keeps the fastest core and
+    // workers take the cores that follow in fastest-first order.
+    void setup_placement_pinning() {
         bool want = topo_.hybrid;
         if (const char *e = std::getenv("KRK_AFFINITY")) want = std::atoll(e) != 0;
         if (!want) return;
