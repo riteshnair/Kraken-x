@@ -6868,11 +6868,10 @@ bool Engine::configure_expert_cache(std::string *err) {
                                      &largest_fits, err))
             return false;
     } else if (!be_ || !be_->has_device_memory()) {
-        // CPU backend, or a run with no device tier: there is no VRAM to
-        // budget. Keep the device expert pool at 0 and size the host/WARM
-        // tier from live free RAM below, leaving headroom for the user's
-        // desktop/workload (the user's laptop constraint).
-        budget = 0;
+        // CPU/no-device: sized after host RAM policy below (bounded host-resident
+    // pool, no VRAM tier). Leave budget at 0 here as a placeholder.
+    budget = 0;
+    vram_cap = 0;
     } else {
         // A partial budget is worse than useless at MoE scale: top-k routing
         // touches every expert within a few dozen tokens, so a set that only
@@ -6904,20 +6903,25 @@ bool Engine::configure_expert_cache(std::string *err) {
     // after it, so it is clamped to the free memory measured HERE minus the
     // reserve, and the warm-up enforces the same reserve again at promotion
     // time. Both numbers are reported: they are the plan and the floor.
-    if (total_vram > 0 && budget > room_now) budget = room_now;
-    KRK_INFO("vram policy: %.1f GiB cap%s (%.1f GiB already in use, %.1f GiB "
-             "demand, %.1f GiB free of %.1f GiB, %.1f GiB reserved) -> expert "
-             "budget %.1f MiB",
-             static_cast<f64>(vram_cap) / static_cast<f64>(gib),
-             (cfg_.vram_tier_gb > 0 && cfg_.vram_cap_mb <= 0)
-                 ? " [planned for the --vram-tier class]"
-                 : (cfg_.vram_cap_mb > 0 ? " [--vram-cap-mb]" : ""),
-             static_cast<f64>(used_now) / static_cast<f64>(gib),
-             static_cast<f64>(demand) / static_cast<f64>(gib),
-             static_cast<f64>(free_now) / static_cast<f64>(gib),
-             static_cast<f64>(total_vram) / static_cast<f64>(gib),
-             static_cast<f64>(vram_reserve) / static_cast<f64>(gib),
-             static_cast<f64>(budget) / (1024.0 * 1024.0));
+    if (be_ && be_->has_device_memory()) {
+        if (total_vram > 0 && budget > room_now) budget = room_now;
+        KRK_INFO("vram policy: %.1f GiB cap%s (%.1f GiB already in use, %.1f GiB "
+                 "demand, %.1f GiB free of %.1f GiB, %.1f GiB reserved) -> expert "
+                 "budget %.1f MiB",
+                 static_cast<f64>(vram_cap) / static_cast<f64>(gib),
+                 (cfg_.vram_tier_gb > 0 && cfg_.vram_cap_mb <= 0)
+                     ? " [planned for the --vram-tier class]"
+                     : (cfg_.vram_cap_mb > 0 ? " [--vram-cap-mb]" : ""),
+                 static_cast<f64>(used_now) / static_cast<f64>(gib),
+                 static_cast<f64>(demand) / static_cast<f64>(gib),
+                 static_cast<f64>(free_now) / static_cast<f64>(gib),
+                 static_cast<f64>(total_vram) / static_cast<f64>(gib),
+                 static_cast<f64>(vram_reserve) / static_cast<f64>(gib),
+                 static_cast<f64>(budget) / (1024.0 * 1024.0));
+    } else if (mc.is_moe) {
+        KRK_INFO("cpu policy: no VRAM tier; expert residency uses bounded host RAM "
+                 "(live free RAM minus reserves, lazy load from GGUF/mapping)");
+    }
 
     // The number of device slots the budget above is sized for, when this code
     // knows it exactly rather than estimating it. Two cases do: an explicit
@@ -7154,7 +7158,38 @@ bool Engine::configure_expert_cache(std::string *err) {
                  cfg_.expert_warm_mb == 0 ? " (disabled by --expert-warm-mb 0)"
                                           : "");
 
+    // CPU/no-device MoE: use a bounded host-resident pool (LFU-evicted) sized
+    // from live free RAM/reserves. Disable the separate WARM tier to avoid
+    // host->host "promotion" copies and double-counting while keeping lazy
+    // loading from the GGUF/mapping and leaving headroom for other work.
+    if (be_ && !be_->has_device_memory() && mc.is_moe) {
+        const size_t ram_cap = host_budget > 0 ? host_budget : warm;
+        if (cfg_.expert_cache_mb > 0) {
+            const size_t req =
+                static_cast<size_t>(cfg_.expert_cache_mb) * 1024u * 1024u;
+            budget = ram_cap > 0 ? std::min(req, ram_cap) : req;
+        } else if (ram_cap > 0) {
+            budget = std::min(ram_cap, total_bytes > 0 ? total_bytes : ram_cap);
+        } else if (live_host_avail > 0) {
+            budget = std::min(static_cast<size_t>(512) * 1024u * 1024u,
+                              total_bytes > 0 ? total_bytes
+                                              : static_cast<size_t>(512) * 1024u * 1024u);
+        } else {
+            budget = std::min(total_bytes > 0 ? total_bytes : static_cast<size_t>(256) * 1024u * 1024u,
+                              static_cast<size_t>(1024) * 1024u * 1024u);
+        }
+        warm = 0;
+        slot_budget = 0;
+        cfg_.expert_warmup = 0;
+        cfg_.expert_warm_prefetch = 0;
+        KRK_INFO("expert cache: cpu host-resident pool %.0f MiB for %.0f MiB routed "
+                 "set (bounded by live free RAM/reserves, lazy load, no VRAM tier)",
+                 static_cast<f64>(budget) / (1024.0 * 1024.0),
+                 static_cast<f64>(total_bytes) / (1024.0 * 1024.0));
+    }
     model_.set_expert_budget(budget, warm, slot_budget);
+    if (be_ && !be_->has_device_memory() && mc.is_moe)
+        be_->set_expert_pool_budget(budget);
     // ---- the pageable path and the pinned WARM prefix ----------------------
     // A promotion out of pageable WARM is either a bounce-buffer copy through a
     // narrow aperture or a direct DMA, and WHICH of those it is depends on the
@@ -7538,14 +7573,30 @@ bool Engine::configure_expert_cache(std::string *err) {
                       " + WARM %.0f MiB pageable%s",
                       static_cast<f64>(warm) / (1024.0 * 1024.0),
                       prefetch && !expert_warmup_wanted() ? " (prefetched)" : "");
-    KRK_INFO(             "expert cache: budget %.1f MiB%s, %d experts x top-%d, %d layers, "
-             "policy LFU+aging (pin at %u hits, decay every %u); cold reads are "
-             "read-through",
-             static_cast<f64>(budget) / (1024.0 * 1024.0), warm_note, mc.n_expert,
-             mc.n_expert_used, mc.n_layer, ExpertCache::pin_threshold(),
-             ExpertCache::kPinDecay);
+    if (be_ && !be_->has_device_memory()) {
+        KRK_INFO("expert cache (cpu, host-resident): budget %.1f MiB, %d experts x "
+                 "top-%d, %d layers, policy LFU+aging (pin at %u hits, decay every "
+                 "%u); lazy load from GGUF/mapping, no WARM/VRAM tier",
+                 static_cast<f64>(budget) / (1024.0 * 1024.0), mc.n_expert,
+                 mc.n_expert_used, mc.n_layer, ExpertCache::pin_threshold(),
+                 ExpertCache::kPinDecay);
+    } else {
+        KRK_INFO("expert cache: budget %.1f MiB%s, %d experts x top-%d, %d layers, "
+                 "policy LFU+aging (pin at %u hits, decay every %u); cold reads are "
+                 "read-through",
+                 static_cast<f64>(budget) / (1024.0 * 1024.0), warm_note, mc.n_expert,
+                 mc.n_expert_used, mc.n_layer, ExpertCache::pin_threshold(),
+                 ExpertCache::kPinDecay);
+    }
     if (budget < total_bytes && total_bytes > 0) {
-        if (be_->caps().vram_free == 0) {
+        if (be_ && !be_->has_device_memory()) {
+            KRK_INFO("expert cache: %.0f MiB host budget covers %.0f%% of the %.1f GiB "
+                     "routed set; only hot/selected experts stay resident and misses "
+                     "load lazily (live free RAM/headroom enforced)",
+                     static_cast<f64>(budget) / (1024.0 * 1024.0),
+                     100.0 * static_cast<f64>(budget) / static_cast<f64>(total_bytes),
+                     static_cast<f64>(total_bytes) / (1024.0 * 1024.0 * 1024.0));
+        } else if (be_->caps().vram_free == 0) {
             KRK_WARN("expert cache: the routed set is %.1f GiB and this "
                      "machine cannot tell the device capacity, so the device "
                      "budget stays near its host-RAM fallback. %s",
@@ -9657,6 +9708,10 @@ bool Engine::expert_warmup_wanted() const {
     const ModelConfig &mc = model_.cfg();
     if (!mc.is_moe || mc.n_expert <= 0) return false;
     const ExpertCache &ec = model_.experts();
+    // CPU/no-device: no VRAM tier to stage into. The bounded host-resident pool
+    // is filled on demand by acquire(); a full warmup pass would read the whole
+    // routed set and thrash memory on laptops. Keep it opt-in.
+    if (be_ && !be_->has_device_memory()) return false;
     if (ec.warm_capacity_bytes() == 0 && !ec.warm_as_mapping())
         return false; // no second tier to fill
     bool on = cfg_.expert_warmup > 0;

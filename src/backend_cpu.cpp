@@ -550,10 +550,11 @@ public:
     // separate tier for the engine's VRAM ledger, expert cache or weight
     // streaming to plan against.
     bool has_device_memory() const override { return false; }
+    bool host_load_supported() const override { return true; }
     DType act_type() const override { return DType::F32; }
     size_t act_size() const override { return 4; }
 
-    static size_t pool_cap() {
+    static size_t pool_cap_default() {
         static const size_t cap = [] {
             const char *e = std::getenv("KRK_CPU_POOL_MB");
             if (e && e[0] != '\0') {
@@ -564,10 +565,15 @@ public:
         }();
         return cap;
     }
+    size_t pool_cap() const {
+        const size_t b = pool_budget_.load(std::memory_order_relaxed);
+        return b > 0 ? b : pool_cap_default();
+    }
     mutable std::mutex pool_mu_;
     std::unordered_map<size_t, std::vector<void *>> pool_free_;
     size_t pool_free_bytes_ = 0, pool_reuse_ = 0, pool_alloc_ = 0, pool_free_n_ = 0,
            pool_drop_ = 0;
+    std::atomic<size_t> pool_budget_{0};
 
     void *alloc(size_t bytes) override { return host_alloc(bytes); }
     void release(void *p) override { npu_flush_(); host_free(p); }
@@ -629,6 +635,10 @@ public:
         }
         npu_flush_();
         host_free(p);
+    }
+
+    void set_expert_pool_budget(size_t bytes) override {
+        pool_budget_.store(bytes, std::memory_order_relaxed);
     }
 
     ExpertPoolStats expert_pool_stats() const override {

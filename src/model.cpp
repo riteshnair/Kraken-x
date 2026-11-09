@@ -845,15 +845,16 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                        "and the used count must be within it)";
             return false;
         }
-    } else if (cfg_.n_expert_group_used > 0) {
-        // Used without a count is a half-declared grouping: honouring it would
-        // mean one group, so the file would route plain top-k while claiming
-        // otherwise.
+    } else if (cfg_.n_expert_group_used > 1 ||
+               (cfg_.n_expert_group_used == 1 && cfg_.n_expert_group <= 0)) {
+        // "group_count=1, used_count=1" is the degenerate no-grouping case some
+        // exporters write. A used count > 1 with no real partition, or used=1
+        // with no group count at all, is contradictory.
         if (err)
             *err = "arch '" + a + "': expert_group_used_count is " +
                    std::to_string(cfg_.n_expert_group_used) +
-                   " but expert_group_count is missing, so there is no "
-                   "partition to select from";
+                   " but expert_group_count is missing or degenerate, so there "
+                   "is no partition to select from";
         return false;
     }
     if (const std::vector<i32> *ff_arr =

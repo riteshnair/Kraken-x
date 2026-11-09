@@ -1619,6 +1619,10 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
 
     const u64 key = slot_key(layer, expert);
     auto it = slots_.find(key);
+    static const bool dbg = [] {
+        const char *e = std::getenv("KRK_EXPERT_DEBUG");
+        return e && e[0] == '1';
+    }();
     if (it != slots_.end()) {
         Slot &s = it->second;
         if (s.in_vram()) {
@@ -1628,6 +1632,10 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
                 touch(s);
                 ++host_hits_;
                 xtrace(layer, expert, 1);
+                if (dbg && (acquires_ < 40 || (acquires_ % 50) == 0))
+                    KRK_INFO("expert dbg: acq=%llu L%d E%d HIT staged slots=%zu/%zu bytes=%zu/%zu",
+                             (unsigned long long)acquires_, layer, expert,
+                             vram_slots_, capacity_, bytes_, budget_);
                 if (++acquires_ >= decay_period()) decay();
                 return &s.m;
             }
@@ -1635,9 +1643,16 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
             touch(s);
             hits_++;
             xtrace(layer, expert, 0);
+            if (dbg && (acquires_ < 40 || (acquires_ % 50) == 0))
+                KRK_INFO("expert dbg: acq=%llu L%d E%d HIT slots=%zu/%zu bytes=%zu/%zu",
+                         (unsigned long long)acquires_, layer, expert,
+                         vram_slots_, capacity_, bytes_, budget_);
             if (++acquires_ >= decay_period()) decay();
             return &s.m;
         }
+        if (dbg && acquires_ < 40)
+            KRK_INFO("expert dbg: acq=%llu L%d E%d FOUND not-in-vram host=%d staged=%d",
+                     (unsigned long long)acquires_, layer, expert, (int)s.in_host(), (int)s.staged);
         // WARM hit: the weights are already in RAM, so this acquire costs a DMA
         // instead of a re-read of the file. It also earns the same counter —
         // an expert hot enough to be evicted is still hot.
@@ -1687,6 +1702,14 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
     warm_admit(src, expert, s);
 
     xtrace(layer, expert, 2);
+    {
+        const char *e = std::getenv("KRK_EXPERT_DEBUG");
+        static const bool dbg = e && e[0] == '1';
+        if (dbg && (acquires_ < 60 || (acquires_ % 50) == 0))
+            KRK_INFO("expert dbg: acq=%llu L%d E%d COLD need=%zu slots=%zu/%zu bytes=%zu/%zu",
+                     (unsigned long long)acquires_, layer, expert, need,
+                     vram_slots_, capacity_, bytes_, budget_);
+    }
 
     {
         MsTimer t(&room_ms_, phase_sink(&pf_room_ms_, &dc_room_ms_));
@@ -1815,6 +1838,14 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
     loads_++;
     bytes_loaded_ += need;
     auto ins = slots_.emplace(key, std::move(s));
+    {
+        const char *e = std::getenv("KRK_EXPERT_DEBUG");
+        static const bool dbg = e && e[0] == '1';
+        if (dbg && (acquires_ < 60 || (acquires_ % 50) == 0))
+            KRK_INFO("expert dbg: acq=%llu L%d E%d LOADED slots=%zu evict=%llu hit=%llu",
+                     (unsigned long long)acquires_, layer, expert,
+                     vram_slots_, (unsigned long long)evictions_, (unsigned long long)hits_);
+    }
     if (!ins.second) {
         // Defensive: a key that reappeared between the erase above and here is
         // an invariant break, not a policy choice. Hand the cells back rather
