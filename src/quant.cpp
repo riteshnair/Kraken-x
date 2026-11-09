@@ -1975,14 +1975,14 @@ namespace {
 //
 // It is still opt-in, because the four-lane path it accelerates is opt-in: the
 // flag alone turns that order on.
-__attribute__((target("avx2,fma"))) inline void fma8(__m128 &acc, __m256 w,
+KRK_TARGET_ATTR("avx2,fma") inline void fma8(__m128 &acc, __m256 w,
                                                     const f32 *x) {
     acc = _mm_fmadd_ps(_mm256_castps256_ps128(w), _mm_loadu_ps(x), acc);
     acc = _mm_fmadd_ps(_mm256_extractf128_ps(w, 1), _mm_loadu_ps(x + 4), acc);
 }
 
 // q8_0: d (f16) + 32 int8, 34 bytes per block.
-__attribute__((target("avx2,fma"))) f32 dot_q8_0_avx2(const u8 *p, const f32 *x,
+KRK_TARGET_ATTR("avx2,fma") f32 dot_q8_0_avx2(const u8 *p, const f32 *x,
                                                       i64 nb) {
     __m128 acc = _mm_setzero_ps();
     for (i64 b = 0; b < nb; b++, p += 34, x += 32) {
@@ -2006,7 +2006,7 @@ __attribute__((target("avx2,fma"))) f32 dot_q8_0_avx2(const u8 *p, const f32 *x,
 // values 0..15 and high nibbles 16..31, so the four widen-and-FMA passes below
 // walk the block in that order and land on the same accumulators the four-lane
 // path would have used.
-__attribute__((target("avx2,fma"))) f32 dot_q4_0_avx2(const u8 *p, const f32 *x,
+KRK_TARGET_ATTR("avx2,fma") f32 dot_q4_0_avx2(const u8 *p, const f32 *x,
                                                       i64 nb) {
     __m128 acc = _mm_setzero_ps();
     const __m128i m4 = _mm_set1_epi8(0x0F);
@@ -2107,7 +2107,7 @@ bool cpu_has_vnni() {
 // gate is not a tolerance, it is the text: the greedy trajectory must be
 // identical to the exact path, and docs/DECODE-REVIEW.md records the measured
 // relative error per format next to it.
-__attribute__((target("avx2,fma"))) inline i32 hsum8_i32(__m256i v) {
+KRK_TARGET_ATTR("avx2,fma") inline i32 hsum8_i32(__m256i v) {
     __m128i s = _mm_add_epi32(_mm256_castsi256_si128(v),
                               _mm256_extracti128_si256(v, 1));
     s = _mm_hadd_epi32(s, s);
@@ -2119,7 +2119,7 @@ __attribute__((target("avx2,fma"))) inline i32 hsum8_i32(__m256i v) {
 // eight-wide steps: the max has to span all 32 before any of them is rounded,
 // or the four halves would be scaled by different amounts and the block would
 // no longer have a single dx to apply at the end.
-__attribute__((target("avx2,fma"))) inline void quantize_q8_32_d(const f32 *x,
+KRK_TARGET_ATTR("avx2,fma") inline void quantize_q8_32_d(const f32 *x,
                                                                 i8 *xq, f32 *dx) {
     const __m256 sign = _mm256_set1_ps(-0.0f);
     __m256 v[4];
@@ -2152,7 +2152,7 @@ __attribute__((target("avx2,fma"))) inline void quantize_q8_32_d(const f32 *x,
 }
 
 // n must be a multiple of 32; xq gets n int8, dx gets n/32 scales.
-__attribute__((target("avx2,fma"))) void quantize_q8_row_d(const f32 *x, i64 n,
+KRK_TARGET_ATTR("avx2,fma") void quantize_q8_row_d(const f32 *x, i64 n,
                                                           i8 *xq, f32 *dx) {
     for (i64 b = 0; b < n; b += 32)
         quantize_q8_32_d(x + b, xq + b, dx + b / 32);
@@ -2162,7 +2162,7 @@ __attribute__((target("avx2,fma"))) void quantize_q8_row_d(const f32 *x, i64 n,
 // ONLY on the activation, so it is computed once per quantise, not once per
 // weight row. maddubs pairs (1*xi) twice into int16, then madd widens to int32:
 // |xi| <= 127 so a pair is <= 254 and nothing overflows.
-__attribute__((target("avx2"))) inline i32 sum_i8_32(const i8 *p) {
+KRK_TARGET_ATTR("avx2") inline i32 sum_i8_32(const i8 *p) {
     const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(p));
     const __m256i m = _mm256_maddubs_epi16(_mm256_set1_epi8(1), v);
     const __m256i s = _mm256_madd_epi16(m, _mm256_set1_epi16(1));
@@ -2184,7 +2184,7 @@ __attribute__((target("avx2"))) inline i32 sum_i8_32(const i8 *p) {
 // sub-block, which are converted to f32, scaled by that sub-block's
 // (dx, d*s, dmin*m) and ACCUMULATED into one vector across the whole row. The
 // horizontal sum happens once, at the end, instead of twice per sub-block.
-__attribute__((target("avx2,fma"))) f32 dot_q4_K_q8_d(const u8 *w, const i8 *xq,
+KRK_TARGET_ATTR("avx2,fma") f32 dot_q4_K_q8_d(const u8 *w, const i8 *xq,
                                                       const f32 *dx, i64 n) {
     const __m256i kLo = _mm256_set1_epi8(0x0F);
     const __m256i ones16 = _mm256_set1_epi16(1);
@@ -2239,7 +2239,7 @@ __attribute__((target("avx2,fma"))) f32 dot_q4_K_q8_d(const u8 *w, const i8 *xq,
 // re-read per input row and the kernel runs at GEMV speed, which is what the
 // 1.53x measured -- the same defect vec_dot_tiled() was written to fix, one
 // level down.
-__attribute__((target("avx2,fma"))) void dot_q4_K_q8_x8_d(
+KRK_TARGET_ATTR("avx2,fma") void dot_q4_K_q8_x8_d(
     const u8 *w, const i8 *xq, const f32 *dx, i64 n, i64 rstride, i64 dstride,
     f32 *out, i64 out_stride) {
     const __m256i kLo = _mm256_set1_epi8(0x0F);
@@ -2318,7 +2318,7 @@ __attribute__((target("avx2,fma"))) void dot_q4_K_q8_x8_d(
 // unsigned operand and the int8 activation the signed one) then does a 32-value
 // sub-block in a single instruction, against two for maddubs + madd.
 #if defined(KRK_DOT_AVX512)
-__attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni")))
+KRK_TARGET_ATTR("avx512f,avx512bw,avx512vl,avx512vnni")
 void dot_q4_K_q8_sx_x8_vnni_d(const u8 *w, const i8 *xq, const f32 *dx,
                               const i32 *sx, i64 n, i64 rstride, i64 dstride,
                               i64 sstride, f32 *out, i64 out_stride) {
@@ -2389,7 +2389,7 @@ void dot_q4_K_q8_sx_x8_vnni_d(const u8 *w, const i8 *xq, const f32 *dx,
 #if defined(KRK_DOT_AVX2)
 // The AVX2 twin, for hosts without VNNI: maddubs + madd instead of dpbusd.
 // Same batched min term, which is where most of the gain is.
-__attribute__((target("avx2,fma")))
+KRK_TARGET_ATTR("avx2,fma")
 void dot_q4_K_q8_sx_x8_avx2_d(const u8 *w, const i8 *xq, const f32 *dx,
                               const i32 *sx, i64 n, i64 rstride, i64 dstride,
                               i64 sstride, f32 *out, i64 out_stride) {
@@ -2470,7 +2470,7 @@ void dot_q4_K_q8_sx_x8_avx2_d(const u8 *w, const i8 *xq, const f32 *dx,
 // values each, so lanes 0-3 are the first 16 values and 4-7 the second -- which
 // is exactly where `sc` changes. One f32 vector carries both scales.
 // One 32-value group's Q6_K nibbles: 4 bits from ql, 2 from qh, plus the 4.
-__attribute__((target("avx2")))
+KRK_TARGET_ATTR("avx2")
 inline __m256i q6_group(const u8 *ql, __m256i qhv, int g) {
     const __m256i kLo = _mm256_set1_epi8(0x0F);
     const __m256i k3 = _mm256_set1_epi8(0x03);
@@ -2489,7 +2489,7 @@ inline __m256i q6_group(const u8 *ql, __m256i qhv, int g) {
 }
 
 #if defined(KRK_DOT_AVX512)
-__attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni")))
+KRK_TARGET_ATTR("avx512f,avx512bw,avx512vl,avx512vnni")
 f32 dot_q6_K_q8_sq4_vnni_d(const u8 *w, const i8 *xq, const f32 *dx,
                            const i32 *sq4, i64 n) {
     const __m256i zero = _mm256_setzero_si256();
@@ -2531,7 +2531,7 @@ f32 dot_q6_K_q8_sq4_vnni_d(const u8 *w, const i8 *xq, const f32 *dx,
 
 // The AVX2 twin. maddubs + madd give the same four-values-per-lane structure,
 // so the pre-biased sums are one vpaddd instead of being the accumulator.
-__attribute__((target("avx2,fma")))
+KRK_TARGET_ATTR("avx2,fma")
 f32 dot_q6_K_q8_sq4_avx2_d(const u8 *w, const i8 *xq, const f32 *dx,
                            const i32 *sq4, i64 n) {
     const __m256i ones16 = _mm256_set1_epi16(1);
@@ -2575,7 +2575,7 @@ f32 dot_q6_K_q8_sq4_avx2_d(const u8 *w, const i8 *xq, const f32 *dx,
 // and the nibble unpack with it -- is decoded ONCE and used eight times. That
 // is the prefill shape, and without it Q6_K prefill runs at GEMV speed.
 #if defined(KRK_DOT_AVX512)
-__attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni")))
+KRK_TARGET_ATTR("avx512f,avx512bw,avx512vl,avx512vnni")
 void dot_q6_K_q8_sq4_x8_vnni_d(const u8 *w, const i8 *xq, const f32 *dx,
                                const i32 *sq4, i64 n, i64 rstride, i64 dstride,
                                i64 sstride, f32 *out, i64 out_stride) {
@@ -2634,7 +2634,7 @@ void dot_q6_K_q8_sq4_x8_vnni_d(const u8 *w, const i8 *xq, const f32 *dx,
 }
 #endif // KRK_DOT_AVX512
 
-__attribute__((target("avx2,fma")))
+KRK_TARGET_ATTR("avx2,fma")
 void dot_q6_K_q8_sq4_x8_avx2_d(const u8 *w, const i8 *xq, const f32 *dx,
                                const i32 *sq4, i64 n, i64 rstride, i64 dstride,
                                i64 sstride, f32 *out, i64 out_stride) {
@@ -2707,7 +2707,7 @@ void dot_q6_K_q8_sq4_x8_avx2_d(const u8 *w, const i8 *xq, const f32 *dx,
 // Lane structure: maddubs puts values 0..15 in lanes 0-3 and 16..31 in lanes
 // 4-7, which is exactly where the scale changes (one sc per 16 values), so a
 // single 8-lane float vector carries both halves' scales.
-__attribute__((target("avx2,fma"))) f32 dot_q6_K_q8_d(const u8 *w, const i8 *xq,
+KRK_TARGET_ATTR("avx2,fma") f32 dot_q6_K_q8_d(const u8 *w, const i8 *xq,
                                                       const f32 *dx, i64 n) {
     const __m256i kLo = _mm256_set1_epi8(0x0F);
     const __m256i ones16 = _mm256_set1_epi16(1);
@@ -2777,7 +2777,7 @@ __attribute__((target("avx2,fma"))) f32 dot_q6_K_q8_d(const u8 *w, const i8 *xq,
 // applied once per sub-block -- but the dot itself is one instruction per 32
 // values instead of two. Measured at the GEMM shapes Tiny-Moe actually calls:
 // 3.5 MAC/instr (AVX2) -> 7.4 (VNNI).
-__attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni")))
+KRK_TARGET_ATTR("avx512f,avx512bw,avx512vl,avx512vnni")
 f32 dot_q4_K_q8_vnni_d(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
     const __m256i kLo = _mm256_set1_epi8(0x0F);
     const __m256i ones8 = _mm256_set1_epi8(1);
@@ -2837,7 +2837,7 @@ f32 dot_q4_K_q8_vnni_d(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
 // per sub-block against a value that was computed once.
 //
 // Measured on Tiny-Moe: see the commit.
-__attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni")))
+KRK_TARGET_ATTR("avx512f,avx512bw,avx512vl,avx512vnni")
 f32 dot_q4_K_q8_sx_vnni_d(const u8 *w, const i8 *xq, const f32 *dx,
                           const i32 *sx, i64 n) {
     const __m256i kLo = _mm256_set1_epi8(0x0F);
@@ -2889,7 +2889,7 @@ f32 dot_q4_K_q8_sx_vnni_d(const u8 *w, const i8 *xq, const f32 *dx,
 }
 
 // The same, on the AVX2 path (no VNNI: maddubs + madd instead of dpbusd).
-__attribute__((target("avx2,fma")))
+KRK_TARGET_ATTR("avx2,fma")
 f32 dot_q4_K_q8_sx_avx2_d(const u8 *w, const i8 *xq, const f32 *dx,
                           const i32 *sx, i64 n) {
     const __m256i kLo = _mm256_set1_epi8(0x0F);
@@ -3028,7 +3028,7 @@ static bool dequant_bf16_wide(const u16 *h, f32 *out, i64 n) {
 // ACCUMULATOR the dot lands on, so the correction costs the kernel nothing at
 // all -- not a subtract, not a multiply, not a permute. One int32 per four
 // values is n bytes per row.
-__attribute__((target("avx2"))) inline __m256i bias4_of_32(const i8 *p) {
+KRK_TARGET_ATTR("avx2") inline __m256i bias4_of_32(const i8 *p) {
     const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(p));
     const __m256i pairs = _mm256_maddubs_epi16(_mm256_set1_epi8(1), v);
     const __m256i quads = _mm256_madd_epi16(pairs, _mm256_set1_epi16(1));
@@ -3178,7 +3178,7 @@ bool env_dot_x8sx() {
 // per-block cost above the dot is the scale product. Q8_0 blocks 32 values, so
 // the scale changes every 32 and one cvt + one fma per block per row is the
 // floor for this layout.
-__attribute__((target("avx2,fma")))
+KRK_TARGET_ATTR("avx2,fma")
 // ---------------------------------------------------------------------------
 // Single-row q8_0 dot: the DECODE kernel.
 //
@@ -3221,7 +3221,7 @@ f32 dot_q8_0_q8_scalar(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
 }
 
 // 512-bit, two blocks per iteration, sign flipped. BW only -- no VNNI needed.
-__attribute__((target("avx512f,avx512bw,f16c")))
+KRK_TARGET_ATTR("avx512f,avx512bw,f16c")
 f32 dot_q8_0_q8_bw(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
     const i64 nb = n / 32;
     const __m512i zero = _mm512_setzero_si512();
@@ -3274,7 +3274,7 @@ f32 dot_q8_0_q8_bw(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
 }
 
 // VNNI: one dpbusd where the BW rung needs maddubs + madd.
-__attribute__((target("avx512f,avx512bw,avx512vnni,f16c")))
+KRK_TARGET_ATTR("avx512f,avx512bw,avx512vnni,f16c")
 f32 dot_q8_0_q8_vnni(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
     const i64 nb = n / 32;
     const __m512i zero = _mm512_setzero_si512();
@@ -3395,7 +3395,7 @@ f32 dot_q8_0_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
 // all eight rows. That halves the per-row instruction count to 8 per 64 MACs.
 #if defined(KRK_DOT_AVX512)
 template <bool kF16C>
-__attribute__((target("avx512f,avx512bw,f16c")))
+KRK_TARGET_ATTR("avx512f,avx512bw,f16c")
 void dot_q8_0_q8_x8_bw_impl(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
                             i64 rstride, i64 dstride, f32 *out, i64 out_stride) {
     const i64 nb = n / 32;
@@ -3461,7 +3461,7 @@ void dot_q8_0_q8_x8_bw_impl(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
 }
 #endif // KRK_DOT_AVX512
 
-__attribute__((target("avx2,fma")))
+KRK_TARGET_ATTR("avx2,fma")
 void dot_q8_0_q8_x8_avx2(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
                          i64 rstride, i64 dstride, f32 *out, i64 out_stride) {
     const i64 nb = n / 32;
@@ -3568,7 +3568,7 @@ void dot_q8_0_q8_x8_scalar(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
 // NOT MEASURED HERE. This host has no VNNI (checked: avx512vnni absent), so the
 // kernel is compiled, dispatched and accuracy-tested only on a host that has
 // it. tools/ta_q80_tiers.cpp reports it as absent rather than skipping silently.
-__attribute__((target("avx512f,avx512bw,avx512vnni,f16c")))
+KRK_TARGET_ATTR("avx512f,avx512bw,avx512vnni,f16c")
 void dot_q8_0_q8_x8_vnni(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
                          i64 rstride, i64 dstride, f32 *out, i64 out_stride) {
     const i64 nb = n / 32;
@@ -3690,7 +3690,7 @@ void build_q8_0_xscales(const f32 *dx, i64 dstride, i64 nrows, i64 n, f32 *out) 
     }
 }
 
-__attribute__((target("avx512f,avx512bw,avx512vnni,f16c")))
+KRK_TARGET_ATTR("avx512f,avx512bw,avx512vnni,f16c")
 void dot_q8_0_q8_wsc8_vnni(const u8 *w, const i8 *xq, i64 n, i64 rstride,
                            f32 *out, i64 out_stride, const f32 *wsc,
                            const f32 *xsc) {
@@ -3789,7 +3789,7 @@ static i64 pf_ahead_init() {
 }
 
 template <i32 kC>
-__attribute__((target("avx512f,avx512bw,avx512vnni,f16c")))
+KRK_TARGET_ATTR("avx512f,avx512bw,avx512vnni,f16c")
 void dot_q8_0_q8_xk_gemv(const u8 *w, i64 wstride, const i8 *xq, const f32 *dx,
                          i64 n, f32 *out, i64 out_stride) {
     const i64 nb = n / 32;
@@ -4059,7 +4059,7 @@ void dot_q4_K_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n, i64 rstride
 // (enough to saturate the ports, no loop-carried latency), register-only
 // operands, and a MAC count that is exactly what those instructions retire.
 #if defined(KRK_DOT_AVX512)
-__attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni")))
+KRK_TARGET_ATTR("avx512f,avx512bw,avx512vl,avx512vnni")
 double probe_int8_vnni_gmacs() {
     const int iters = 20000;
     __m256i a0 = _mm256_set1_epi8(3), a1 = _mm256_set1_epi8(5);
@@ -4098,7 +4098,7 @@ double probe_int8_vnni_gmacs() { return 0.0; }
 #endif
 
 #if defined(KRK_DOT_AVX2)
-__attribute__((target("avx2,fma"))) double probe_f32_avx2_gmacs() {
+KRK_TARGET_ATTR("avx2,fma") double probe_f32_avx2_gmacs() {
     const int iters = 20000;
     __m256 p = _mm256_set1_ps(1.0001f), q = _mm256_set1_ps(0.9999f);
     __m256 s0 = _mm256_setzero_ps(), s1 = _mm256_setzero_ps();
@@ -4147,7 +4147,7 @@ double probe_f32_avx2_gmacs() { return 0.0; }
 // measures throughput and not latency. Both widths are reported: if they agree,
 // the core is not width-limited and the 256-bit path is the one to build.
 #if defined(KRK_DOT_AVX2)
-__attribute__((target("avx2,fma"))) double probe_int8_avx2_gmacs() {
+KRK_TARGET_ATTR("avx2,fma") double probe_int8_avx2_gmacs() {
     const int iters = 20000;
     // `a` is bumped every iteration on purpose. With both operands loop
     // invariant the whole maddubs is a constant, the compiler hoists it out,
@@ -4195,7 +4195,7 @@ double probe_int8_avx2_gmacs() { return 0.0; }
 #endif
 
 #if defined(KRK_DOT_AVX512)
-__attribute__((target("avx512f,avx512bw"))) double probe_int8_bw_gmacs() {
+KRK_TARGET_ATTR("avx512f,avx512bw") double probe_int8_bw_gmacs() {
     const int iters = 20000;
     __m512i a = _mm512_set1_epi8(3);
     // One multiplier per chain. With a shared `b` all eight maddubs are the
@@ -4387,7 +4387,7 @@ namespace {
 constexpr i64 kTileRows = 8;
 
 // q8_0: d (f16) + 32 int8 per 34-byte block.
-__attribute__((target("avx2,fma"))) void dot_q8_0_tiled(
+KRK_TARGET_ATTR("avx2,fma") void dot_q8_0_tiled(
     const u8 *w, const f32 *x, i64 n, i64 rows, f32 *out, i64 stride) {
     const i64 nb = n / 32;
     for (i64 r0 = 0; r0 + kTileRows <= rows; r0 += kTileRows) {
@@ -4419,7 +4419,7 @@ __attribute__((target("avx2,fma"))) void dot_q8_0_tiled(
 
 // q4_0: d (f16) + 16 bytes of nibbles, 18-byte block. Low nibble is value k,
 // high nibble is value k+16, both biased by 8.
-__attribute__((target("avx2,fma"))) void dot_q4_0_tiled(
+KRK_TARGET_ATTR("avx2,fma") void dot_q4_0_tiled(
     const u8 *w, const f32 *x, i64 n, i64 rows, f32 *out, i64 stride) {
     const i64 nb = n / 32;
     const __m128i m4 = _mm_set1_epi8(0x0F);
@@ -4482,7 +4482,7 @@ __attribute__((target("avx2,fma"))) void dot_q4_0_tiled(
 namespace {
 
 template <bool IsF16>
-__attribute__((target("f16c,fma"))) void dot_wide_tiled(
+KRK_TARGET_ATTR("f16c,fma") void dot_wide_tiled(
     const void *w, const f32 *x, i64 n, i64 rows, f32 *out, i64 stride) {
     constexpr i64 kT = 8;
     for (i64 r0 = 0; r0 + kT <= rows; r0 += kT) {
@@ -4542,7 +4542,7 @@ __attribute__((target("f16c,fma"))) void dot_wide_tiled(
 
 #if defined(KRK_DOT_AVX2)
 template <bool IsF16>
-__attribute__((target("avx2,fma,f16c"))) void dot_wide_tiled_avx2(
+KRK_TARGET_ATTR("avx2,fma,f16c") void dot_wide_tiled_avx2(
     const void *w, const f32 *x, i64 n, i64 rows, f32 *out, i64 stride) {
     constexpr i64 kT = 8;
     for (i64 r0 = 0; r0 + kT <= rows; r0 += kT) {
@@ -4581,7 +4581,7 @@ __attribute__((target("avx2,fma,f16c"))) void dot_wide_tiled_avx2(
 // One weight row against one activation row, for the leftovers of the tiled
 // square below. Same fold as the other wide kernels.
 template <bool IsF16>
-__attribute__((target("avx512f,avx512bw,fma,f16c"))) f32 vec_dot_wide_row(
+KRK_TARGET_ATTR("avx512f,avx512bw,fma,f16c") f32 vec_dot_wide_row(
     const u8 *w, const f32 *x, i64 n) {
     __m512 acc = _mm512_setzero_ps();
     i64 i = 0;
@@ -4625,7 +4625,7 @@ __attribute__((target("avx512f,avx512bw,fma,f16c"))) f32 vec_dot_wide_row(
 // single-row kernel, so no output is ever dropped and no shape is special-cased
 // at the call site.
 template <bool IsF16>
-__attribute__((target("avx512f,avx512bw,fma,f16c"))) void dot_tile_avx512(
+KRK_TARGET_ATTR("avx512f,avx512bw,fma,f16c") void dot_tile_avx512(
     const u8 *wbase, i64 row_bytes, const f32 *x, i64 n, i64 o0, i64 o1, i64 r0,
     i64 r1, i64 n_out, f32 *out) {
     const i64 no = o1 - o0;   // output rows in this square's column span

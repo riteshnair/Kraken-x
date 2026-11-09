@@ -16,6 +16,17 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+
+#if defined(_WIN32)
+#ifndef setenv
+static inline int krk_test_setenv(const char *name, const char *value, int) { return _putenv_s(name, value ? value : ""); }
+#define setenv(n, v, o) krk_test_setenv((n), (v), (o))
+#endif
+#ifndef unsetenv
+static inline int krk_test_unsetenv(const char *name) { return _putenv_s(name, ""); }
+#define unsetenv(n) krk_test_unsetenv(n)
+#endif
+#endif
 #include <algorithm>
 #include <condition_variable>
 #include <mutex>

@@ -919,6 +919,13 @@ public:
         // cost saved by batching here is not worth a second NPU contract.
         if (npu_) return fallback();
         npu_flush_();
+        {
+            static const bool grp_enabled = [] {
+                const char *e = std::getenv("KRK_CPU_GEMM_GROUP");
+                return !(e != nullptr && e[0] == '0');
+            }();
+            if (!grp_enabled) return fallback();
+        }
 
         const bool int8ok = (twt == DType::Q4_K || twt == DType::Q6_K ||
                              twt == DType::Q8_0 || twt == DType::TQ1_0 ||
