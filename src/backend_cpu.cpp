@@ -695,13 +695,25 @@ public:
     bool preparing() const override { return npu_ && npu::preparing(npu_); }
 
     std::string describe() const override {
-        // Report placement with the part: on a hybrid host this line is the
-        // difference between "why is it slow" and "it is on the E cores".
-        const std::string topo = Pool::get().topology().summary();
+        // Report placement and the active thread count: on a hybrid host this
+        // line is the difference between "why is it slow" and "it is on the E
+        // cores", and the active count matters because the topology can be
+        // larger than the pool (P-cluster default on hybrid).
+        const auto &topo = Pool::get().topology();
+        const i64 active = Pool::get().workers();
+        std::string ts = format("%lld", static_cast<long long>(active));
+        if (static_cast<i64>(topo.order.size()) != active && !topo.order.empty())
+            ts += format("/%lld", static_cast<long long>(topo.order.size()));
+        ts += " threads";
+        if (topo.hybrid)
+            ts += format(" (%lldP+%lldE)", static_cast<long long>(topo.n_fast),
+                         static_cast<long long>(topo.n_slow));
+        ts += topo.pinned ? ", pinned" : ", unpinned";
+        const std::string place = ts;
         if (npu_)
             return format("CPU (scalar reference) + %s, %s, %s",
-                          npu::describe(npu_).c_str(), caps_.gfx.c_str(), topo.c_str());
-        return format("CPU (scalar reference), %s, %s", caps_.gfx.c_str(), topo.c_str());
+                          npu::describe(npu_).c_str(), caps_.gfx.c_str(), place.c_str());
+        return format("CPU (scalar reference), %s, %s", caps_.gfx.c_str(), place.c_str());
     }
     // No card here, so the memory policy has nothing to measure and would take
     // its "cannot say" path for every run. `KRK_VRAM_TOTAL_MB` says "behave as if
@@ -3391,7 +3403,9 @@ public:
         const f32 *bp = static_cast<const f32 *>(beta);
         f32 *op = static_cast<f32 *>(out);
         // Value heads own disjoint state, so they are the parallel units; the
-        // token loop inside one head is sequential by definition.
+        // token loop inside one head is sequential by definition (state evolves
+        // per token). Inner loops are SIMD'd over hd (contiguous j) with
+        // sequential i accumulation, preserving per-element accumulation order.
         par_for(n_v_head, 1, 8.0 * static_cast<f64>(n_tok) * n_v_head * d_state * hd,
                 [&](i64 hb, i64 he) {
                     std::vector<f32> kv(static_cast<size_t>(hd));
@@ -3404,7 +3418,59 @@ public:
                             const f32 *qt = qp + t * row_stride + kh * d_state;
                             const f32 *kt = kp + t * row_stride + kh * d_state;
                             const f32 *vt = vp + t * row_stride + h * hd;
-
+#if defined(__AVX2__) && defined(__FMA__)
+                            const __m256 vdec = _mm256_set1_ps(decay);
+                            const __m256 vbta = _mm256_set1_ps(bta);
+                            const i64 hd8 = hd & ~7LL;
+                            // S <- S * exp(g)
+                            for (i64 i = 0; i < d_state; i++) {
+                                f32 *row = Sh + i * hd;
+                                i64 j = 0;
+                                for (; j < hd8; j += 8)
+                                    _mm256_storeu_ps(row + j, _mm256_mul_ps(_mm256_loadu_ps(row + j), vdec));
+                                for (; j < hd; j++) row[j] *= decay;
+                            }
+                            // kv = S^T k  (kv[j] = sum_i S[i, j] k[i])
+                            std::fill(kv.begin(), kv.end(), 0.0f);
+                            for (i64 i = 0; i < d_state; i++) {
+                                const f32 *row = Sh + i * hd;
+                                const __m256 vki = _mm256_set1_ps(kt[i]);
+                                i64 j = 0;
+                                for (; j < hd8; j += 8) {
+                                    __m256 a = _mm256_loadu_ps(kv.data() + j);
+                                    a = _mm256_fmadd_ps(_mm256_loadu_ps(row + j), vki, a);
+                                    _mm256_storeu_ps(kv.data() + j, a);
+                                }
+                                for (; j < hd; j++) kv[static_cast<size_t>(j)] += row[j] * kt[i];
+                            }
+                            // S += k (x) d, d = (v - kv) * beta
+                            for (i64 i = 0; i < d_state; i++) {
+                                f32 *row = Sh + i * hd;
+                                const __m256 vkib = _mm256_mul_ps(_mm256_set1_ps(kt[i]), vbta);
+                                i64 j = 0;
+                                for (; j < hd8; j += 8) {
+                                    __m256 r = _mm256_loadu_ps(row + j);
+                                    __m256 d = _mm256_sub_ps(_mm256_loadu_ps(vt + j), _mm256_loadu_ps(kv.data() + j));
+                                    _mm256_storeu_ps(row + j, _mm256_fmadd_ps(vkib, d, r));
+                                }
+                                for (; j < hd; j++)
+                                    row[j] += kt[i] * (vt[j] - kv[static_cast<size_t>(j)]) * bta;
+                            }
+                            // out = S^T q
+                            f32 *ot = op + (t * n_v_head + h) * hd;
+                            std::fill(ot, ot + hd, 0.0f);
+                            for (i64 i = 0; i < d_state; i++) {
+                                const f32 *row = Sh + i * hd;
+                                const __m256 vqi = _mm256_set1_ps(qt[i]);
+                                i64 j = 0;
+                                for (; j < hd8; j += 8) {
+                                    __m256 a = _mm256_loadu_ps(ot + j);
+                                    a = _mm256_fmadd_ps(_mm256_loadu_ps(row + j), vqi, a);
+                                    _mm256_storeu_ps(ot + j, a);
+                                }
+                                for (; j < hd; j++) ot[j] += row[j] * qt[i];
+                            }
+#else
                             // S <- S * exp(g)
                             for (i64 i = 0; i < d_state; i++) {
                                 f32 *row = Sh + i * hd;
@@ -3432,6 +3498,7 @@ public:
                                     acc += Sh[i * hd + j] * qt[i];
                                 ot[j] = acc;
                             }
+#endif
                         }
                     }
                 });
