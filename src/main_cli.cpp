@@ -8,6 +8,17 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#ifndef setenv
+static inline int krk_win_setenv(const char *name, const char *value, int) { return _putenv_s(name, value ? value : ""); }
+#define setenv(n, v, o) krk_win_setenv((n), (v), (o))
+#endif
+#ifndef unsetenv
+static inline int krk_win_unsetenv(const char *name) { return _putenv_s(name, ""); }
+#define unsetenv(n) krk_win_unsetenv(n)
+#endif
+#endif
+
 #include "engine_usage.hpp"
 #include "krk/backend.hpp"
 #include "krk/cli_value.hpp"

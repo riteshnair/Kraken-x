@@ -880,6 +880,290 @@ public:
     }
 
 
+    // A grouped GEMM: n_mat independent projections that share `x`. The CPU
+    // reference does them one by one, but quantizing `x` once is a large win for
+    // the int8 fast path (prefill: qkv, gate/up, recurrent projections), and
+    // `vec_dot_tiled`'s f32 path already takes `xf` directly so sharing costs
+    // nothing there. Falls back to the per-matrix path for any shape, type mix,
+    // per-matrix `xs`, or case where the shared-activation int8 path is not the
+    // safe/identical choice. `silu_fused` is never set on this backend (the
+    // caller applies the activation), matching the base contract.
+    bool gemm_group(void *const out[], const void *x, const void *const w[],
+                    DType wt, const i64 n_out[], i64 n_in, int n_mat, i64 rows,
+                    bool silu = false, bool *silu_fused = nullptr,
+                    bool row_parallel_only = false, const DType *wts = nullptr,
+                    const void *const xs[] = nullptr) override {
+        (void)silu;
+        (void)row_parallel_only;
+        if (silu_fused) *silu_fused = false;
+        auto fallback = [&]() -> bool {
+            for (int m = 0; m < n_mat; m++)
+                gemm(out[m], xs ? xs[m] : x, w[m], wts ? wts[m] : wt, n_out[m],
+                     n_in, rows);
+            return false;
+        };
+        if (!out || !x || !w || !n_out || n_mat <= 0 || rows <= 0 || n_in <= 0 || xs)
+            return fallback();
+        // Uniform type only for the shared int8 fast path: the dot dispatch and
+        // activation sidecars (sq4/sx) are type-specific.
+        DType twt = wts ? wts[0] : wt;
+        for (int m = 1; m < n_mat; m++)
+            if ((wts ? wts[m] : wt) != twt) return fallback();
+        if (!out[0] || !w[0]) return fallback();
+        for (int m = 1; m < n_mat; m++)
+            if (!out[m] || !w[m] || n_out[m] < 0) return fallback();
+
+        // Per-matrix NPU: the device path is shape/type/weight dependent and
+        // gemm() already owns its flush/fallback; do it there rather than
+        // guessing. A uniform NPU accept is rare enough that the quantization
+        // cost saved by batching here is not worth a second NPU contract.
+        if (npu_) return fallback();
+        npu_flush_();
+
+        const bool int8ok = (twt == DType::Q4_K || twt == DType::Q6_K ||
+                             twt == DType::Q8_0 || twt == DType::TQ1_0 ||
+                             twt == DType::PTQ1_0 || twt == DType::TQ2_0 ||
+                             twt == DType::PQ2_0 || twt == DType::Q2_0 ||
+                             twt == DType::Q2_0_64 || twt == DType::I2_S ||
+                             twt == DType::Q2_K || twt == DType::Q3_K) &&
+                            (n_in % 256) == 0 && vec_dot_int8();
+        if (!int8ok) return fallback();
+        // Preserve gemm()'s debug-only non-hoisted q8_0 wsc behavior by falling
+        // back per matrix (rare; keeps correctness/observability identical).
+        if (twt == DType::Q8_0) {
+            static const bool wsc_enabled_dbg = [] {
+                const char *e = std::getenv("KRK_CPU_Q80_WSC");
+                return !(e != nullptr && e[0] == '0');
+            }();
+            static const bool xsc_hoist_dbg = [] {
+                const char *e = std::getenv("KRK_CPU_XSC_HOIST");
+                return !(e != nullptr && e[0] == '0');
+            }();
+            if (wsc_enabled_dbg && !xsc_hoist_dbg && n_in > 0 &&
+                (n_in / 32) >= 2 && ((n_in / 32) & 1) == 0 && q8_0_wsc_supported())
+                return fallback();
+        }
+
+        // ---- shared activation quantization (once for all matrices) ----------
+        // This is the prefill win: gemm()'s int8 fast path quantizes `x` every
+        // call, and grouped projections (qkv, gate/up) all read the same `x`.
+        const f32 *xf = static_cast<const f32 *>(x);
+        const i64 nb = n_in / 32;
+        std::vector<i8> qx(static_cast<size_t>(rows * n_in));
+        std::vector<f32> dx(static_cast<size_t>(rows * nb));
+        std::vector<i32> xsq; // Q6_K: one sum per 4 codes
+        std::vector<i32> xsx; // Q4_K family: sum(xq) per block
+        const bool q6 = twt == DType::Q6_K;
+        const bool q80 = twt == DType::Q8_0;
+        const bool tq1 = twt == DType::TQ1_0;
+        const bool ptq1 = twt == DType::PTQ1_0;
+        const bool tq2 = twt == DType::TQ2_0;
+        const bool i2s = twt == DType::I2_S;
+        const bool pq2 = twt == DType::PQ2_0;
+        const bool q20 = twt == DType::Q2_0;
+        const bool q20_64 = twt == DType::Q2_0_64;
+        const bool q2k = twt == DType::Q2_K;
+        const bool q3k = twt == DType::Q3_K;
+        if (q6) xsq.resize(static_cast<size_t>(rows * (n_in / 4)));
+        else if (!(q80 || tq1 || ptq1 || tq2 || i2s || pq2 || q20 || q20_64 || q2k || q3k))
+            xsx.resize(static_cast<size_t>(rows * nb));
+        for (i64 r = 0; r < rows; r++) {
+            if (q6)
+                quantize_q8_row_sq4(xf + r * n_in, n_in, qx.data() + r * n_in,
+                                    dx.data() + r * nb,
+                                    xsq.data() + r * (n_in / 4));
+            else if (q80 || tq1 || ptq1 || tq2 || i2s || pq2 || q20 || q20_64 || q2k || q3k)
+                quantize_q8_row(xf + r * n_in, n_in, qx.data() + r * n_in,
+                                dx.data() + r * nb);
+            else
+                quantize_q8_row_sx(xf + r * n_in, n_in, qx.data() + r * n_in,
+                                   dx.data() + r * nb, xsx.data() + r * nb);
+        }
+        const i8 *xqp = qx.data();
+        const f32 *xdp = dx.data();
+        const i32 *xs4p = xsq.empty() ? nullptr : xsq.data();
+        const i32 *xsp = xsx.empty() ? nullptr : xsx.data();
+        const i64 nq4 = n_in / 4;
+        const i64 rows8 = rows - rows % 8;
+        // Shared xsc hoist for q8_0 wsc path: activation scales depend on x, not w.
+        static const bool wsc_enabled = [] {
+            const char *e = std::getenv("KRK_CPU_Q80_WSC");
+            return !(e != nullptr && e[0] == '0');
+        }();
+        static const bool xsc_hoist = [] {
+            const char *e = std::getenv("KRK_CPU_XSC_HOIST");
+            return !(e != nullptr && e[0] == '0');
+        }();
+        // For the grouped path, always hoist activation scales when the q8_0
+        // wsc fast path is used: xsc depends only on activations (shared) and
+        // rebuilding per tile/matrix would negate the win and diverge from
+        // gemm()'s default. If the user explicitly disables hoisting, keep
+        // gemm()'s behavior by falling back per matrix for q8_0 wsc cases.
+        const bool use_wsc = wsc_enabled && q80 && xsc_hoist && n_in > 0 &&
+                             (n_in / 32) >= 2 && ((n_in / 32) & 1) == 0 &&
+                             q8_0_wsc_supported();
+        const i64 npair = (n_in / 32) / 2;
+        std::vector<f32> xsc_all;
+        if (use_wsc && rows8 > 0) {
+            xsc_all.resize(static_cast<size_t>(rows8 * npair * 16));
+            build_q8_0_xscales(xdp, nb, rows8, n_in, xsc_all.data());
+        }
+
+        for (int mi = 0; mi < n_mat; mi++) {
+            void *outm = out[mi];
+            const void *wm = w[mi];
+            const i64 n_cols = n_out[mi];
+            if (!outm || !wm || n_cols <= 0) continue;
+            f32 *of = static_cast<f32 *>(outm);
+            const u8 *wb = static_cast<const u8 *>(wm);
+            const size_t row_bytes = dtype_row_bytes(twt, n_in);
+            const double flops = 2.0 * static_cast<double>(rows) *
+                                 static_cast<double>(n_cols) * static_cast<double>(n_in);
+            KRK_KTIME_MAC(rows == 1 ? dtype_tag_r1(twt, n_in) : dtype_tag_rn(twt, n_in),
+                          static_cast<double>(rows) * static_cast<double>(n_cols) *
+                              static_cast<double>(n_in),
+                          isa_peak_gmacs(true));
+
+            auto dot8 = [&](const u8 *wr, i64 r, i64 o) {
+                if (q3k)
+                    dot_q3_K_q8_x8(wr, xqp + r * n_in, xdp + r * nb, n_in, n_in, nb,
+                                   of + r * n_cols + o, n_cols);
+                else if (q2k)
+                    dot_q2_K_q8_x8(wr, xqp + r * n_in, xdp + r * nb, n_in, n_in, nb,
+                                   of + r * n_cols + o, n_cols);
+                else if (tq1)
+                    dot_tq1_0_q8_x8(wr, xqp + r * n_in, xdp + r * nb, n_in, n_in, nb,
+                                    of + r * n_cols + o, n_cols);
+                else if (ptq1)
+                    dot_ptq1_0_q8_x8(wr, xqp + r * n_in, xdp + r * nb, n_in, n_in, nb,
+                                     of + r * n_cols + o, n_cols);
+                else if (tq2)
+                    dot_tq2_0_q8_x8(wr, xqp + r * n_in, xdp + r * nb, n_in, n_in, nb,
+                                    of + r * n_cols + o, n_cols);
+                else if (i2s)
+                    dot_i2_s_q8_x8(wr, xqp + r * n_in, xdp + r * nb, n_in, n_in, nb,
+                                   of + r * n_cols + o, n_cols);
+                else if (pq2)
+                    dot_pq2_0_q8_x8(wr, xqp + r * n_in, xdp + r * nb, n_in, n_in, nb,
+                                    of + r * n_cols + o, n_cols);
+                else if (q20)
+                    dot_q2_0_q8_x8(wr, xqp + r * n_in, xdp + r * nb, n_in, n_in, nb,
+                                   of + r * n_cols + o, n_cols);
+                else if (q20_64)
+                    dot_q2_0_64_q8_x8(wr, xqp + r * n_in, xdp + r * nb, n_in, n_in, nb,
+                                      of + r * n_cols + o, n_cols);
+                else if (q80)
+                    dot_q8_0_q8_x8(wr, xqp + r * n_in, xdp + r * nb, n_in, n_in, nb,
+                                   of + r * n_cols + o, n_cols);
+                else if (q6)
+                    dot_q6_K_q8_sq4_x8(wr, xqp + r * n_in, xdp + r * nb,
+                                       xs4p + r * nq4, n_in, n_in, nb, nq4,
+                                       of + r * n_cols + o, n_cols);
+                else
+                    dot_q4_K_q8_sx_x8(wr, xqp + r * n_in, xdp + r * nb,
+                                      xsp + r * nb, n_in, n_in, nb, nb,
+                                      of + r * n_cols + o, n_cols);
+            };
+            auto dot1 = [&](const u8 *wr, i64 r, i64 o) {
+                if (q3k) return dot_q3_K_q8(wr, xqp + r * n_in, xdp + r * nb, n_in);
+                if (q2k) return dot_q2_K_q8(wr, xqp + r * n_in, xdp + r * nb, n_in);
+                if (tq1) return dot_tq1_0_q8(wr, xqp + r * n_in, xdp + r * nb, n_in);
+                if (ptq1) return dot_ptq1_0_q8(wr, xqp + r * n_in, xdp + r * nb, n_in);
+                if (tq2) return dot_tq2_0_q8(wr, xqp + r * n_in, xdp + r * nb, n_in);
+                if (i2s) return dot_i2_s_q8(wr, xqp + r * n_in, xdp + r * nb, n_in);
+                if (pq2) return dot_pq2_0_q8(wr, xqp + r * n_in, xdp + r * nb, n_in);
+                if (q20) return dot_q2_0_q8(wr, xqp + r * n_in, xdp + r * nb, n_in);
+                if (q20_64) return dot_q2_0_64_q8(wr, xqp + r * n_in, xdp + r * nb, n_in);
+                if (q80) return dot_q8_0_q8(wr, xqp + r * n_in, xdp + r * nb, n_in);
+                if (q6) return dot_q6_K_q8_sq4(wr, xqp + r * n_in, xdp + r * nb,
+                                               xs4p + r * nq4, n_in);
+                return dot_q4_K_q8_sx(wr, xqp + r * n_in, xdp + r * nb, xsp + r * nb, n_in);
+            };
+
+            // rows==1 q8_0 VNNI special case (decode), same as gemm().
+            if (rows == 1 && q80 && n_in > 0 && (n_in % 64) == 0 && n_cols >= 4 &&
+                ((n_in / 32) & 1) == 0) {
+                const i32 kw = q8_0_gemv_width();
+                const i64 n4 = n_cols - n_cols % kw;
+                const i64 g4 = std::max<i64>(1, std::min<i64>(1024, (n4 / kw) / 16));
+                par_for(n4 / kw, g4, 2.0 * static_cast<f64>(n4) * n_in,
+                        [&](i64 b, i64 e) {
+                            for (i64 g = b; g < e; g++) {
+                                const i64 o = g * kw;
+                                dot_q8_0_q8_r1xN(
+                                    wb + static_cast<size_t>(o) * row_bytes,
+                                    row_bytes, xqp, xdp, n_in, nb, of + o, 1, kw);
+                            }
+                        });
+                for (i64 o = n4; o < n_cols; o++)
+                    of[o] = dot_q8_0_q8(wb + static_cast<size_t>(o) * row_bytes,
+                                        xqp, xdp, n_in);
+                continue;
+            }
+
+            const i64 nc = [&]() -> i64 {
+                const char *e = std::getenv("KRK_CPU_GEMM_NC");
+                if (e && e[0] != '\0') {
+                    const i64 v = std::atoll(e);
+                    if (v <= 0) return 0;
+                    return std::min<i64>(v, n_cols);
+                }
+                if (n_cols < 2) return 0;
+                const i64 per = std::max<i64>(1, static_cast<i64>(row_bytes));
+                return std::max<i64>(16, std::min<i64>(512, 131072 / per));
+            }();
+            if (nc > 0) {
+                const i64 nblk = (n_cols + nc - 1) / nc;
+                par_for(nblk, 1, flops, [&](i64 cb, i64 ce) {
+                    std::vector<f32> wsc;
+                    for (i64 c = cb; c < ce; c++) {
+                        const i64 o0 = c * nc;
+                        const i64 o1 = std::min<i64>(n_cols, o0 + nc);
+                        if (use_wsc) {
+                            wsc.resize(static_cast<size_t>((o1 - o0) * npair * 16));
+                            build_q8_0_wscales(
+                                wb + static_cast<size_t>(o0) * row_bytes,
+                                row_bytes, o1 - o0, n_in, wsc.data());
+                        }
+                        for (i64 r = 0; r < rows8; r += 8) {
+                            // xsc is shared/hoisted (activation-only). The
+                            // non-hoisted path would rebuild per (matrix,block,
+                            // tile) and cost more than the gemm fallback; keep
+                            // the hoisted form for the group fast path.
+                            for (i64 o = o0; o < o1; o++) {
+                                const u8 *wr =
+                                    wb + static_cast<size_t>(o) * row_bytes;
+                                if (use_wsc)
+                                    dot_q8_0_q8_wsc8(
+                                        wr, xqp + r * n_in, xdp + r * nb, n_in,
+                                        n_in, nb, of + r * n_cols + o, n_cols,
+                                        wsc.data() + (o - o0) * npair * 16,
+                                        xsc_all.data() + r * npair * 16);
+                                else
+                                    dot8(wr, r, o);
+                            }
+                        }
+                        for (i64 r = rows8; r < rows; r++)
+                            for (i64 o = o0; o < o1; o++)
+                                of[r * n_cols + o] =
+                                    dot1(wb + static_cast<size_t>(o) * row_bytes, r, o);
+                    }
+                });
+                continue;
+            }
+            const i64 grain = std::max<i64>(8, std::min<i64>(256, n_cols / 8));
+            par_for(n_cols, grain, flops, [&](i64 b, i64 e) {
+                for (i64 o = b; o < e; o++) {
+                    const u8 *wr = wb + static_cast<size_t>(o) * row_bytes;
+                    i64 r = 0;
+                    for (; r + 8 <= rows; r += 8) dot8(wr, r, o);
+                    for (; r < rows; r++) of[r * n_cols + o] = dot1(wr, r, o);
+                }
+            });
+        }
+        return false;
+    }
+
     void gemm(void *out, const void *x, const void *w, DType wt, i64 n_out,
               i64 n_in, i64 rows) override {
         // The virtual NPU computes this dot product block on its own SIMD

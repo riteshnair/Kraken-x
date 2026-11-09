@@ -6867,11 +6867,12 @@ bool Engine::configure_expert_cache(std::string *err) {
         if (!krk::expert_budget_fits(budget, total_vram, used_now, vram_reserve,
                                      &largest_fits, err))
             return false;
-    } else if (be_->caps().vram_free == 0) {
-        // CPU backend, or a driver that cannot say: no device memory to
-        // divide, so a generous fixed share of host RAM instead.
-        budget = static_cast<size_t>(512) * 1024u * 1024u;
-        if (total_bytes > 0 && total_bytes < budget) budget = total_bytes;
+    } else if (!be_ || !be_->has_device_memory()) {
+        // CPU backend, or a run with no device tier: there is no VRAM to
+        // budget. Keep the device expert pool at 0 and size the host/WARM
+        // tier from live free RAM below, leaving headroom for the user's
+        // desktop/workload (the user's laptop constraint).
+        budget = 0;
     } else {
         // A partial budget is worse than useless at MoE scale: top-k routing
         // touches every expert within a few dozen tokens, so a set that only
@@ -7088,12 +7089,18 @@ bool Engine::configure_expert_cache(std::string *err) {
                      static_cast<f64>(host_budget) / (1024.0 * 1024.0));
             warm = host_budget;
         }
-    } else if (cfg_.expert_warm_mb < 0 && be_->caps().vram_free > 0) {
+    } else if (cfg_.expert_warm_mb < 0 && be_ &&
+               (be_->caps().vram_free > 0 || !be_->has_device_memory())) {
         // The default: as much of the routed set as the machine can hold while
         // leaving the OS its reserve. See krk::warm_tier_bytes for the rule and
         // PERF-ANALYSIS 12d for why the old cautious half-room is not it -- a
         // tier shorter than the corpus misses on the same experts forever, and
         // the measured difference at the small end is 23.5 against 29.4 tok/s.
+        //
+        // On CPU/no-device runs, this is the HOT-IN-RAM expert tier (there is
+        // no VRAM tier). It must stay bounded by live free RAM and reserves so
+        // the laptop keeps headroom for other work; warm_tier_bytes and the
+        // clamps below enforce that.
         warm = krk::warm_tier_bytes(ram_total, live_host_avail,
                                     model_.total_expert_bytes(),
                                     model_.max_expert_bytes() * 4);
@@ -7135,13 +7142,14 @@ bool Engine::configure_expert_cache(std::string *err) {
         KRK_INFO("ram policy: %.1f GiB of the host room is the file mapping "
                  "itself (the disk tier's page cache); WARM gets what is left",
                  static_cast<f64>(mapped_share) / static_cast<f64>(gib));
-    if (host_budget > 0 || cfg_.host_ram_mb > 0)
+    if (host_budget > 0 || cfg_.host_ram_mb > 0 || (be_ && !be_->has_device_memory() && mc.is_moe))
         KRK_INFO("ram policy: %.1f GiB budget (%.1f GiB installed, %.1f GiB "
-                 "free) -> WARM tier %.0f MiB%s%s",
+                 "free now) -> expert WARM tier %.0f MiB%s%s%s",
                  static_cast<f64>(host_budget) / static_cast<f64>(gib),
                  static_cast<f64>(ram_installed) / static_cast<f64>(gib),
                  static_cast<f64>(be_->host_available_bytes()) / static_cast<f64>(gib),
                  static_cast<f64>(warm) / (1024.0 * 1024.0),
+                 (be_ && !be_->has_device_memory()) ? " [cpu/no device tier]" : "",
                  cfg_.ram_tier_gb > 0 ? " [planned for the --ram-tier class]" : "",
                  cfg_.expert_warm_mb == 0 ? " (disabled by --expert-warm-mb 0)"
                                           : "");

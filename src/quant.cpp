@@ -12,9 +12,18 @@
 #include <ctime>
 #include <thread>
 
-#if defined(__F16C__) && defined(__FMA__) && \
-    (defined(__x86_64__) || defined(__i386__))
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <immintrin.h>
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+#define KRK_TARGET_ATTR(x) __attribute__((target(x)))
+#else
+#define KRK_TARGET_ATTR(x)
+#endif
+
+#if defined(__F16C__) && defined(__FMA__) && \
+    (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86))
 #define KRK_DOT_F16C 1
 #endif
 
@@ -3887,7 +3896,6 @@ void dot_q8_0_q8_r1xN(const u8 *w, i64 wstride, const i8 *xq, const f32 *dx,
         if (g_pf_ahead < 0) g_pf_ahead = pf_ahead_init();
         switch (kc) {
             case 1:
-                out[0] = _mm512_reduce_add_ps(_mm512_setzero_ps());
                 out[0] = dot_q8_0_q8(w, xq, dx, n);
                 return;
             case 2: dot_q8_0_q8_xk_gemv<2>(w, wstride, xq, dx, n, out, out_stride); return;
@@ -4684,7 +4692,7 @@ __attribute__((target("avx512f,avx512bw,fma,f16c"))) void dot_tile_avx512(
             // The tail past the last whole 16 runs scalar, in vec_dot's order,
             // and is added to the folded vector sum -- the same treatment the
             // single-row kernel gives its own tail.
-            auto fold = [](__m512 v) {
+            auto fold = [](__m512 v) KRK_TARGET_ATTR("avx512f,avx512bw,fma,f16c") {
                 alignas(64) f32 a[16];
                 _mm512_store_ps(a, v);
                 f32 s4[4];
