@@ -279,6 +279,20 @@ public:
         return static_cast<i64>(workers_.size()) + 1;
     }
 
+    // Cap the number of participants used by par_for (workers + calling thread).
+    // 0 (default) means all available. Values > available are clamped at run
+    // time. This does not retire workers: it is cheap to change between phases
+    // (e.g. prefill vs decode) and must only be called when no task is in
+    // flight. With static partitioning, workers are assigned slot indices
+    // 0..participants-2 and the caller takes slot participants-1, so a cap
+    // uses the fastest-prefix participants (P cores first on hybrid).
+    void set_active_cap(i64 n) {
+        active_cap_.store(n > 0 ? n : 0, std::memory_order_release);
+    }
+    i64 active_cap() const {
+        return active_cap_.load(std::memory_order_acquire);
+    }
+
     // Which core each participant landed on. Settled at construction and
     // re-settled by set_workers(), so it is safe to read any time.
     const CpuTopology &topology() const { return topo_; }
@@ -338,16 +352,21 @@ public:
         };
         if (grain < 1) grain = n < 1 ? 1 : n;
         const i64 blocks = (n + grain - 1) / grain;
-        const i64 participants = static_cast<i64>(workers_.size()) + 1;
-        if (!split || blocks <= 1 || workers_.empty()) {
+        const i64 all = static_cast<i64>(workers_.size()) + 1;
+        i64 participants = all;
+        const i64 cap = active_cap_.load(std::memory_order_acquire);
+        if (cap > 0 && cap < participants) participants = cap;
+        if (!split || blocks <= 1 || participants <= 1) {
             invoke(&body, 0, n);
             return;
         }
         // Static partition of the (uniform) blocks. stride >= 1 even
         // when blocks < participants; participants whose range is empty
-        // simply do nothing.
+        // simply do nothing. Worker slots 0..participants-2 and the
+        // calling thread as slot participants-1 take part; any workers
+        // with index >= participants-1 are idle for this task.
         const i64 stride = (blocks + participants - 1) / participants;
-        // The calling thread is the last participant. It publishes and
+        // The calling thread is the last active participant. It publishes and
         // claims its own slice in one critical section, so no worker can
         // observe a half-written task.
         Slice s;
@@ -357,6 +376,7 @@ public:
             grain_ = grain;
             blocks_ = blocks;
             stride_ = stride;
+            participants_ = participants;
             body_ctx_ = &body;
             body_fn_ = invoke;
             done_ = 0;
@@ -390,14 +410,15 @@ private:
     // task's body, covering some indices twice and others not at all
     // (test_par_pool_covers_every_block failed ~1 run in 3).
     struct Slice {
-        i64 n = 0, grain = 0, blocks = 0, stride = 0;
+        i64 n = 0, grain = 0, blocks = 0, stride = 0, participants = 0;
         void *ctx = nullptr;
         void (*invoke)(void *, i64, i64) = nullptr;
     };
 
     // Snapshot the published geometry. Called under mu_.
     Slice snapshot() const {
-        return Slice{n_, grain_, blocks_, stride_, body_ctx_, body_fn_};
+        return Slice{n_, grain_, blocks_, stride_, participants_,
+                     body_ctx_, body_fn_};
     }
 
     // Run blocks [me*stride, min((me+1)*stride, blocks)) of the task
@@ -541,7 +562,11 @@ private:
                 }
                 cpu_relax();
             }
-            run_slice(s, my_idx);
+            // Workers own slots 0..participants-2; the calling thread owns
+            // slot participants-1. A worker outside the active set for this
+            // task (active_cap) must skip the slice but still advance `seen`.
+            if (s.participants > 1 && my_idx < s.participants - 1)
+                run_slice(s, my_idx);
             // Mark the task just drained — NOT whatever task_id_ says now.
             // The caller may publish the next op while we report, and
             // re-reading the id here would swallow that task: its blocks
@@ -562,10 +587,12 @@ private:
     i64 grain_ = 0;
     i64 blocks_ = 0;
     i64 stride_ = 1;
+    i64 participants_ = 0;
     i64 done_ = 0;
     std::atomic<i64> gen_{0};
     std::atomic<i64> task_id_{0};
     std::atomic<bool> quit_{false};
+    std::atomic<i64> active_cap_{0}; // 0 = use all participants
 };
 
 } // namespace krk
