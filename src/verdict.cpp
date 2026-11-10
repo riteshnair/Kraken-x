@@ -10,6 +10,7 @@
 #include "krk/verdict.hpp"
 
 #include <algorithm>
+#include <cctype>
 
 namespace krk {
 namespace {
@@ -45,15 +46,16 @@ i32 mtp_block_count(const Gguf &g, const std::string &arch, i32 block_count) {
 } // namespace
 
 std::string ModelVerdict::headline() const {
-    const std::string name = arch.empty() ? std::string("<absent>") : arch;
-    if (!known) return name + " — unknown (llama-like defaults)";
+    std::string name = arch.empty() ? std::string("<absent>") : arch;
+    if (!family_hint.empty()) name += " (" + family_hint + ")";
+    if (!known) return name + " â unknown (llama-like defaults)";
     if (spec && spec->role == ArchRole::Draft)
-        return name + " — draft file (not a model)";
+        return name + " â draft file (not a model)";
     if (spec && spec->support == ArchSupport::Yes)
-        return name + " — supported (" + arch_shape_name(spec->shape) + ")";
+        return name + " â supported (" + arch_shape_name(spec->shape) + ")";
     if (spec && spec->support == ArchSupport::Partial)
-        return name + " — partial (" + arch_shape_name(spec->shape) + ")";
-    return name + " — not supported";
+        return name + " â partial (" + arch_shape_name(spec->shape) + ")";
+    return name + " â not supported";
 }
 
 namespace {
@@ -91,6 +93,26 @@ const std::vector<ArchAlias> kAliases = {
 ModelVerdict assess_model(const Gguf &g) {
     ModelVerdict v;
     v.arch = g.get_str("general.architecture");
+
+    // Some GGUF exporters label GLM-family MLA/MoE models as deepseek2 while
+    // the model is GLM (e.g. GLM-4.7-Flash). Keep the GGUF arch key for schema/
+    // metadata lookup, but surface the family identity in reporting.
+    {
+        const std::string gname = g.get_str("general.name", "");
+        const std::string pre = g.get_str("tokenizer.ggml.pre", "");
+        auto contains_ci = [](const std::string &hay, const char *needle) {
+            if (!needle || !*needle) return false;
+            std::string n(needle), h = hay;
+            for (char &c : n) c = static_cast<char>(std::tolower((unsigned char)c));
+            for (char &c : h) c = static_cast<char>(std::tolower((unsigned char)c));
+            return h.find(n) != std::string::npos;
+        };
+        if (v.arch == "deepseek2" && (contains_ci(gname, "glm") || pre == "glm4" || contains_ci(pre, "glm"))) {
+            v.family_hint = "GLM family";
+            add_unique(v.notes, "GLM-family model exported with general.architecture=deepseek2 MLA schema "
+                                "(identity/name indicates GLM; handled as GLM-correct deepseek2 MLA)");
+        }
+    }
 
     // Some converters omit the label but keep the per-arch keys, and the key
     // prefix is then the arch in everything but name: `<arch>.block_count`

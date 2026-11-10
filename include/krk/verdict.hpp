@@ -40,6 +40,10 @@ struct ModelVerdict {
     const ArchSpec *spec = nullptr; // the table entry, or the fallback
     bool known = false; // the table knows this name
     bool runnable = false;
+    // Optional identity/family hint when the GGUF arch string is a technical
+    // schema label but the model belongs to a named family (e.g. GLM exported
+    // as deepseek2 MLA). Used for display/reporting only.
+    std::string family_hint;
     // Multi-token-prediction blocks at the top of the stack: real weights the
     // engine loads past, not layers. Zero when the file declares none.
     i32 mtp_blocks = 0;

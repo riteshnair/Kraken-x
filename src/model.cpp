@@ -43,23 +43,15 @@ std::string blk_key(const char *fmt, i32 layer) {
 // names, rather than run and be wrong.
 //
 // `g` may be null: an ungated bank (nemotron_h_moe) has no `ffn_gate_exps`.
+// A routed bank is read per-tensor: expert slices, row strides and GEMM
+// dispatch use each matrix's own type (`ExpertSource::per_expert`, per-matrix
+// gemm/gemm_group wts[], dispatch table entries). Some quant recipes store
+// gate/up and down in different formats, so mixed types are accepted. Callers
+// that fuse matrices must still check type compatibility for that fusion.
 bool expert_formats_agree(const GgufTensor *g, const GgufTensor *up,
                           const GgufTensor *dn, const std::string &where,
                           std::string *err) {
-    const GgufTensor *first = g ? g : up;
-    if (!first) return true;
-    for (const GgufTensor *t : {g, up, dn}) {
-        if (!t || t->type == first->type) continue;
-        if (err)
-            *err = where + ": the routed experts mix formats -- '" + first->name +
-                   "' is " + dtype_name(first->type) + " and '" + t->name +
-                   "' is " + dtype_name(t->type) +
-                   ". A bank is read as one launch in one format, so the mixed "
-                   "matrices would be walked at the wrong stride and answer "
-                   "wrongly. Re-quantize the experts to one type, or load this "
-                   "file in an engine that indexes per-matrix formats";
-        return false;
-    }
+    (void)g; (void)up; (void)dn; (void)where; (void)err;
     return true;
 }
 
@@ -553,11 +545,32 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     // wrong for every file of the family, and softmax over 128 logits is a
     // different selection as well as a different weight.
     const bool nemotron_h = (a == "nemotron_h" || a == "nemotron_h_moe");
+    // GLM-4.5 / GLM-4.7-Flash models are sometimes exported as
+    // `general.architecture = deepseek2` (MLA tensor layout) while being GLM
+    // family models that use sigmoid expert gating with selection bias. Detect
+    // them so routing defaults and reporting stay correct.
+    const std::string tok_pre = gguf_.get_str("tokenizer.ggml.pre", "");
+    auto contains_ci = [](const std::string &hay, const char *needle) {
+        if (!needle || !*needle) return false;
+        std::string n(needle), h = hay;
+        for (char &c : n) c = static_cast<char>(std::tolower((unsigned char)c));
+        for (char &c : h) c = static_cast<char>(std::tolower((unsigned char)c));
+        return h.find(n) != std::string::npos;
+    };
+    const bool glm_deepseek2_mla =
+        (a == "deepseek2") && (contains_ci(cfg_.name, "glm") ||
+                               tok_pre == "glm4" || contains_ci(tok_pre, "glm"));
+    if (glm_deepseek2_mla)
+        KRK_INFO("model identity: GLM-family model exported as deepseek2 MLA (name='%s', tokenizer.pre='%s')",
+                 cfg_.name.c_str(), tok_pre.c_str());
     // The arch's own default, when its files do not declare one: nemotron's
-    // is hardcoded in the reference, and glm4-moe's loader defaults to
-    // sigmoid for a file that is silent. 1 is softmax.
+    // is hardcoded in the reference, glm4-moe defaults to sigmoid for a file
+    // that is silent, and GLM-4.7-Flash deepseek2 exports use sigmoid gating.
+    // 1 is softmax.
     const i32 gating_default =
-        nemotron_h ? 2 : (aspec.router_gating > 0 ? aspec.router_gating : 1);
+        nemotron_h ? 2
+                   : (glm_deepseek2_mla ? 2
+                                        : (aspec.router_gating > 0 ? aspec.router_gating : 1));
     cfg_.router_sigmoid = static_cast<i32>(
         gguf_.get_i64(key(".expert_gating_func"), gating_default)) == 2;
     // The FFN activation is a property of the SCHEMA, so it comes from the arch
@@ -1145,14 +1158,15 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         }
     }
 
-    // ---- MLA (DeepSeek-V2/V3/V4) ----------------------------------------
+    // ---- MLA (DeepSeek-V2/V3/V4 and GLM/DeepSeek2 MLA variants) -----------
     // Latent ranks off the file's own attention metadata. The names matter:
     // exporters write q_lora_rank (missing on lite -- the query is direct),
     // kv_lora_rank (missing on V4 -- the latent is key_length wide there),
-    // key_length and value_length. There are no qk_nope_head_dim-style keys;
-    // reading those refused every real file (Coder-V2-Lite proved it: it
-    // carries key_length=192/value_length=128/kv_lora_rank=512 and none of
-    // the old names). nope is key_length - rope_dim.
+    // key_length and value_length. Some MLA families (e.g. GLM-4.7-Flash GGUFs
+    // exported as deepseek2) also carry key_length_mla/value_length_mla for the
+    // absorbed per-head dimensions while key_length/value_length describe the
+    // full latent+rope projection widths; prefer the *_mla forms for the
+    // per-head nope/value geometry when present.
     if (aspec.mla) {
         cfg_.mla = true;
         cfg_.mla_q_lora = static_cast<i32>(
@@ -1161,16 +1175,21 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             gguf_.get_i64(key(".attention.kv_lora_rank"), 0));
         const i64 key_len = gguf_.get_i64(key(".attention.key_length"), 0);
         const i64 val_len = gguf_.get_i64(key(".attention.value_length"), 0);
+        const i64 key_len_mla =
+            gguf_.get_i64(key(".attention.key_length_mla"), 0);
+        const i64 val_len_mla =
+            gguf_.get_i64(key(".attention.value_length_mla"), 0);
         if (cfg_.mla_kv_lora <= 0) cfg_.mla_kv_lora = static_cast<i32>(key_len);
         cfg_.mla_qk_rope = cfg_.rope_dim;
-        cfg_.mla_qk_nope = static_cast<i32>(key_len) - cfg_.mla_qk_rope;
-        cfg_.mla_v_dim = static_cast<i32>(val_len);
-        if (cfg_.mla_kv_lora <= 0 || key_len <= 0 || val_len <= 0 ||
+        const i64 qk_head = key_len_mla > 0 ? key_len_mla : key_len;
+        cfg_.mla_qk_nope = static_cast<i32>(qk_head) - cfg_.mla_qk_rope;
+        cfg_.mla_v_dim = static_cast<i32>(val_len_mla > 0 ? val_len_mla : val_len);
+        if (cfg_.mla_kv_lora <= 0 || qk_head <= 0 || cfg_.mla_v_dim <= 0 ||
             cfg_.mla_qk_nope <= 0 || cfg_.mla_qk_rope <= 0) {
             if (err)
                 *err = "arch '" + a + "': MLA ranks are incomplete " +
                        "(kv_lora_rank/key_length/value_length must be > 0; " +
-                       "nope = key_length - rope.dimension_count)";
+                       "nope = key_length[_mla] - rope.dimension_count)";
             return false;
         }
     }
