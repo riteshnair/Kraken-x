@@ -659,6 +659,14 @@ endif()
 add_executable(kraken-kquant-dot tools/ta_kquant_dot.cpp)
 target_link_libraries(kraken-kquant-dot PRIVATE krk_core)
 
+# Chunk invariance at the arithmetic boundary: eight activation rows must be
+# bit-identical to eight rows=1 calls for every K-quant used by the CPU GEMM.
+add_executable(kraken-kquant-x8 tools/ta_kquant_x8.cpp)
+target_link_libraries(kraken-kquant-x8 PRIVATE krk_core)
+if(KRK_BUILD_TESTS)
+    add_test(NAME kraken-kquant-x8 COMMAND kraken-kquant-x8)
+endif()
+
 add_executable(kraken-gemv-q4k tools/ta_gemv_q4k.cpp)
 target_link_libraries(kraken-gemv-q4k PRIVATE krk_core)
 

@@ -202,7 +202,7 @@ void usage() {
         "  left to right: every step runs ONE bidirectional, cacheless pass over\n"
         "  prompt + --max-tokens and the whole sequence must fit in --ctx, so --chunk\n"
         "  does not apply to it.\n"
-        "  --kv-quant f16|int8|turbo3|rot4  K/V cache format (default rot4). rot4\n"
+        "  --kv-quant f16|int8|turbo3|rot4  K/V cache format (default turbo3). rot4\n"
         "                        is Q4_0 blocks in a rotated basis (3.5x smaller)\n"
         "                        row as bytes plus one f32 scale per 32 values, 1.8x\n"
         "                        smaller; both backends implement it, and on the card\n"
