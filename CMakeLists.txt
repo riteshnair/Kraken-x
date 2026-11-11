@@ -99,6 +99,7 @@ set(KRK_GPU_TARGETS "gfx1031;gfx1201"
 
 set(KRK_CORE_SOURCES
     src/common.cpp
+    src/rv32.cpp
     src/arch.cpp
     src/verdict.cpp
     src/quant.cpp
@@ -661,6 +662,9 @@ target_link_libraries(kraken-kquant-dot PRIVATE krk_core)
 
 # Chunk invariance at the arithmetic boundary: eight activation rows must be
 # bit-identical to eight rows=1 calls for every K-quant used by the CPU GEMM.
+add_executable(kraken-rv32 tools/rv32_cli.cpp)
+target_link_libraries(kraken-rv32 PRIVATE krk_core)
+
 add_executable(kraken-kquant-x8 tools/ta_kquant_x8.cpp)
 target_link_libraries(kraken-kquant-x8 PRIVATE krk_core)
 if(KRK_BUILD_TESTS)
@@ -850,6 +854,10 @@ endif()
 
 if(KRK_BUILD_TESTS)
     enable_testing()
+    add_executable(kraken-rv32-tests tools/ta_rv32.cpp)
+    target_link_libraries(kraken-rv32-tests PRIVATE krk_core)
+    add_test(NAME kraken-rv32 COMMAND kraken-rv32-tests)
+
     add_executable(kraken-tests tests/test_kraken.cpp)
     target_link_libraries(kraken-tests PRIVATE krk_core)
     # The prefill-chunk bit-exactness group spawns the CLI and has to know
