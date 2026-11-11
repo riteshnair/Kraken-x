@@ -52,6 +52,17 @@ Baseline, `C:\models\Qwen3.8-4B-Q4_K_M.gguf` (2.59 GB, dense), greedy, ctx 512:
 
 ## 3. P0 — THE KEYSTONE: x8 ↔ r1 arithmetic equality (unblocks three things)
 
+**Correctness fix landed:** the Q4_K and Q6_K public x8 entry points now run the
+same per-row floating-point chain as their r1 counterparts. This deliberately
+chooses the plan's per-row fallback over keeping the reassociated batched-min
+kernels. `kraken-kquant-x8` (`tools/ta_kquant_x8.cpp`) checks exact bits for
+Q2_K, Q3_K, Q4_K, Q6_K and Q8_0, including multiple blocks and non-power-of-two
+scales. The remaining model-level validation and deliberate hash re-recording
+still need the three target GGUFs on the Windows machine. Do not re-enable the
+old x8 K-quant kernels unless this gate remains bit-exact.
+
+### Original defect report
+
 **The CPU backend's answer currently depends on `--chunk`, for every K-quant
 model.** Verified directly on 4 short prompts — 2 of 4 differ:
 
@@ -140,6 +151,10 @@ multiple of 8, duplicate the last real row into the padding, give `dot8` an
 explicit destination base, let the tail group write to `8 × n_out` scratch, copy
 back only the real rows.
 
+**Not re-applied with the P0 fallback:** Q4_K/Q6_K x8 currently calls r1 per row,
+so padding would add work without the former shared-decode upside. Revisit this
+only together with an x8 implementation that passes `kraken-kquant-x8`.
+
 Measured on `Qwen3.8-4B-Q4_K_M`, same binary, A/B on `KRK_CPU_GEMM_TAIL8`,
 interleaved order-balanced, 4 pairs:
 
@@ -212,15 +227,16 @@ the rope boundary, which is what makes it tractable (~5.1×).
 
 ## 8. P5 — Small, contained, known
 
-- **Q8_0 has no 256-bit AVX-VNNI rung.** `tools/dispatch_audit.py` reports
-  **14 entries, 4 gaps**, all Q8_0: `dot_q8_0_q8` (the rows=1 decode entry),
-  `dot_q8_0_q8_wsc8`, `dot_q8_0_q8_x8_tier`, `dot_q8_0_q8_x8`. K-quants are
-  fully covered. ~150 lines exist uncommitted in `src/quant.cpp` from a dead
-  worker; verify then commit, or redo.
-- **`--kv-quant` help text says "default rot4"** while the actual default is
-  turbo3.
-- **`KRK_CPU_DOT_INT8` is a dead switch** — `vec_dot_int8()` returns true
-  unconditionally under AVX2.
+- ✅ **Q8_0 now has 256-bit AVX-VNNI rungs** for `dot_q8_0_q8`,
+  `dot_q8_0_q8_wsc8`, `dot_q8_0_q8_x8_tier`, and `dot_q8_0_q8_x8`. The sign-flip
+  handles -128, the scale-table path preserves per-block accumulation order,
+  and `q8_0_wsc_supported()` no longer makes the 512-bit r1xN path reachable on
+  a 256-bit-only host. `kraken-q80-dot`, `kraken-q80-odd`, `kraken-q80-tiers`,
+  and `tools/dispatch_audit.py` pass.
+- ✅ **`--kv-quant` help now names the actual turbo3 default.**
+- ✅ **`KRK_CPU_DOT_INT8` and `set_vec_dot_int8(false)` are honored.** The flag
+  still ANDs with runtime AVX2 support; the x8 regression tool covers the
+  setter.
 
 ## 9. P6 — OpenVINO (proven reachable; value limited)
 
@@ -278,7 +294,34 @@ and enumerates **CPU / GPU / NPU**, `rc=0`.
 
 ---
 
-## 12. Build / run
+## 12. Research follow-ups (not yet implementation evidence)
+
+The supplied papers mostly address drafter quality or GPU serving, so their
+speedups are not claims about this single-channel CPU. The useful, testable
+follow-ups are:
+
+- **S2-MoE** ([2608.15018](https://arxiv.org/html/2608.15018v1)) and **EVICT**
+  ([2605.00342](https://arxiv.org/html/2605.00342v2)): cap verification using
+  draft confidence plus the predicted *unique routed-expert union*, not draft
+  length alone. This is directly relevant to n-gram/MTP after P0. Keep it
+  lossless and measure accepted tokens per unique expert byte on this host.
+- **Why SD works on sparse MoE** ([2610.38981](https://arxiv.org/html/2610.38981v1)):
+  temporal routing overlap can reduce verification's unique experts. Instrument
+  that overlap in Kraken's traces; do not import the paper's H100 L2/bandwidth
+  conclusions to this CPU.
+- **SP-MoE** ([2510.10302](https://arxiv.org/html/2510.10302v1)) does NOT
+  overturn section 10's measured prefetch negative: its overlap applies to
+  offloaded CPU→GPU transfer with useful computation to hide it, whereas this
+  host pays the same single-channel copy either way.
+- **FastMTP** ([2509.18362](https://arxiv.org/html/2509.18362v1)), **MTP-D**
+  ([2603.23911](https://arxiv.org/html/2603.23911v1)), **MetaSD**
+  ([2604.05417](https://arxiv.org/html/2604.05417v1)), and **Attention Drift**
+  ([2605.09992](https://arxiv.org/html/2605.09992v1)) require trained heads,
+  multiple drafters, or architecture changes. They are drafter-quality projects,
+  not drop-in engine fixes; acceptance gains must still beat the measured
+  multi-row verification cost here.
+
+## 13. Build / run
 
 ```powershell
 cd C:\Users\rina0423\Desktop\Kraken-Xe
@@ -299,7 +342,7 @@ Useful harnesses:
 
 ---
 
-## 13. Recommended order
+## 14. Recommended order
 
 1. **P0** — x8↔r1 equality. One-time numeric change; unblocks correctness,
    speculation and the prefill win. Everything else is second-order to this.

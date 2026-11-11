@@ -2594,8 +2594,8 @@ KRK_TARGET_ATTR("avx2,fma,avxvnni") void dot_q4_K_q8_x8_d_avxvnni(
 // sub-block in a single instruction, against two for maddubs + madd.
 #if defined(KRK_DOT_AVX512)
 KRK_TARGET_ATTR("avx512f,avx512bw,avx512vl,avx512vnni")
-void dot_q4_K_q8_sx_x8_vnni_d(const u8 *w, const i8 *xq, const f32 *dx,
-                              const i32 *sx, i64 n, i64 rstride, i64 dstride,
+[[maybe_unused]] void dot_q4_K_q8_sx_x8_vnni_d(
+    const u8 *w, const i8 *xq, const f32 *dx, const i32 *sx, i64 n, i64 rstride, i64 dstride,
                               i64 sstride, f32 *out, i64 out_stride) {
     const __m256i kLo = _mm256_set1_epi8(0x0F);
     const __m256i zero = _mm256_setzero_si256();
@@ -2665,8 +2665,8 @@ void dot_q4_K_q8_sx_x8_vnni_d(const u8 *w, const i8 *xq, const f32 *dx,
 // The AVX2 twin, for hosts without VNNI: maddubs + madd instead of dpbusd.
 // Same batched min term, which is where most of the gain is.
 KRK_TARGET_ATTR("avx2,fma")
-void dot_q4_K_q8_sx_x8_avx2_d(const u8 *w, const i8 *xq, const f32 *dx,
-                              const i32 *sx, i64 n, i64 rstride, i64 dstride,
+[[maybe_unused]] void dot_q4_K_q8_sx_x8_avx2_d(
+    const u8 *w, const i8 *xq, const f32 *dx, const i32 *sx, i64 n, i64 rstride, i64 dstride,
                               i64 sstride, f32 *out, i64 out_stride) {
     const __m256i kLo = _mm256_set1_epi8(0x0F);
     const __m256i ones16 = _mm256_set1_epi16(1);
@@ -2724,7 +2724,8 @@ void dot_q4_K_q8_sx_x8_avx2_d(const u8 *w, const i8 *xq, const f32 *dx,
 }
 
 #if defined(__AVXVNNI__) || defined(KRK_DOT_AVXVNNI)
-KRK_TARGET_ATTR("avx2,fma,avxvnni") void dot_q4_K_q8_sx_x8_d_avxvnni(
+[[maybe_unused]] KRK_TARGET_ATTR("avx2,fma,avxvnni")
+void dot_q4_K_q8_sx_x8_d_avxvnni(
     const u8 *w, const i8 *xq, const f32 *dx, const i32 *sx, i64 n,
     i64 rstride, i64 dstride, i64 sstride, f32 *out, i64 out_stride) {
     const __m256i kLo = _mm256_set1_epi8(0x0F);
@@ -2911,8 +2912,8 @@ f32 dot_q6_K_q8_sq4_avx2_d(const u8 *w, const i8 *xq, const f32 *dx,
 // is the prefill shape, and without it Q6_K prefill runs at GEMV speed.
 #if defined(KRK_DOT_AVX512)
 KRK_TARGET_ATTR("avx512f,avx512bw,avx512vl,avx512vnni")
-void dot_q6_K_q8_sq4_x8_vnni_d(const u8 *w, const i8 *xq, const f32 *dx,
-                               const i32 *sq4, i64 n, i64 rstride, i64 dstride,
+[[maybe_unused]] void dot_q6_K_q8_sq4_x8_vnni_d(
+    const u8 *w, const i8 *xq, const f32 *dx, const i32 *sq4, i64 n, i64 rstride, i64 dstride,
                                i64 sstride, f32 *out, i64 out_stride) {
     const __m256i zero = _mm256_setzero_si256();
     __m256 acc[8];
@@ -2970,8 +2971,8 @@ void dot_q6_K_q8_sq4_x8_vnni_d(const u8 *w, const i8 *xq, const f32 *dx,
 #endif // KRK_DOT_AVX512
 
 KRK_TARGET_ATTR("avx2,fma")
-void dot_q6_K_q8_sq4_x8_avx2_d(const u8 *w, const i8 *xq, const f32 *dx,
-                               const i32 *sq4, i64 n, i64 rstride, i64 dstride,
+[[maybe_unused]] void dot_q6_K_q8_sq4_x8_avx2_d(
+    const u8 *w, const i8 *xq, const f32 *dx, const i32 *sq4, i64 n, i64 rstride, i64 dstride,
                                i64 sstride, f32 *out, i64 out_stride) {
     const __m256i ones16 = _mm256_set1_epi16(1);
     const __m256i zero = _mm256_setzero_si256();
@@ -3070,8 +3071,8 @@ f32 dot_q6_K_q8_sq4_d_avxvnni(const u8 *w, const i8 *xq, const f32 *dx,
 }
 
 KRK_TARGET_ATTR("avx2,fma,avxvnni")
-void dot_q6_K_q8_sq4_x8_d_avxvnni(const u8 *w, const i8 *xq, const f32 *dx,
-                                  const i32 *sq4, i64 n, i64 rstride,
+[[maybe_unused]] void dot_q6_K_q8_sq4_x8_d_avxvnni(
+    const u8 *w, const i8 *xq, const f32 *dx, const i32 *sq4, i64 n, i64 rstride,
                                   i64 dstride, i64 sstride, f32 *out,
                                   i64 out_stride) {
     const __m256i zero = _mm256_setzero_si256();
@@ -3423,7 +3424,7 @@ f32 dot_q4_K_q8_sx_d_avxvnni(const u8 *w, const i8 *xq, const f32 *dx,
 #endif
 
 std::atomic<bool> g_dot_int8{true};
-std::atomic<bool> g_dot_int8_set{true};
+std::atomic<bool> g_dot_int8_set{false};
 
 bool env_dot_int8() {
     const char *e = std::getenv("KRK_CPU_DOT_INT8");
@@ -3688,36 +3689,18 @@ f32 dot_q6_K_q8_sq4(const u8 *w, const i8 *xq, const f32 *dx, const i32 *sq4,
 void dot_q6_K_q8_sq4_x8(const u8 *w, const i8 *xq, const f32 *dx,
                         const i32 *sq4, i64 n, i64 rstride, i64 dstride,
                         i64 sstride, f32 *out, i64 out_stride) {
-    static const char *e = std::getenv("KRK_CPU_DOT_Q6SQ4");
-    const bool use = !e || e[0] != '0';
-    if (!use) {
-        for (int r = 0; r < 8; r++)
-            out[static_cast<i64>(r) * out_stride] =
-                dot_q6_K_q8(w, xq + static_cast<i64>(r) * rstride,
-                            dx + static_cast<i64>(r) * dstride, n);
-        return;
+    // Chunking is not allowed to change the arithmetic. The batched kernels
+    // below use vector min terms and a different scale association from the
+    // rows=1 entry, so even though they are algebraically equivalent their f32
+    // results are not. Use the exact rows=1 chain until an x8 kernel reproduces
+    // that chain bit for bit. This also makes speculative verification agree
+    // with ordinary decode rather than merely agreeing within a tolerance.
+    for (i32 r = 0; r < 8; r++) {
+        out[static_cast<i64>(r) * out_stride] = dot_q6_K_q8_sq4(
+            w, xq + static_cast<i64>(r) * rstride,
+            dx + static_cast<i64>(r) * dstride,
+            sq4 + static_cast<i64>(r) * sstride, n);
     }
-#if defined(KRK_DOT_AVX512)
-    if (cpu_has_vnni()) {
-        dot_q6_K_q8_sq4_x8_vnni_d(w, xq, dx, sq4, n, rstride, dstride, sstride,
-                                  out, out_stride);
-        return;
-    }
-#endif
-#if defined(KRK_DOT_AVX2)
-#if defined(__AVXVNNI__) || defined(KRK_DOT_AVXVNNI)
-    if (cpu_has_avxvnni()) {
-        dot_q6_K_q8_sq4_x8_d_avxvnni(w, xq, dx, sq4, n, rstride, dstride, sstride,
-                                    out, out_stride);
-        return;
-    }
-#endif
-    dot_q6_K_q8_sq4_x8_avx2_d(w, xq, dx, sq4, n, rstride, dstride, sstride, out,
-                              out_stride);
-#else
-    (void)w; (void)xq; (void)dx; (void)sq4; (void)n; (void)rstride;
-    (void)dstride; (void)sstride; (void)out; (void)out_stride;
-#endif
 }
 
 f32 dot_q6_K_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
@@ -3913,6 +3896,40 @@ f32 dot_q8_0_q8_vnni(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
     return _mm512_reduce_add_ps(acc) + tail;
 }
 
+#if defined(KRK_DOT_AVX2) && (defined(__AVXVNNI__) || defined(KRK_DOT_AVXVNNI))
+// 256-bit AVX-VNNI for Meteor Lake and other CPUs with VEX vpdpbusd but no
+// AVX-512. The sign-flipped magnitude is exactly the AVX2 kernel's, including
+// the -128 case; only maddubs+madd becomes one vpdpbusd.
+KRK_TARGET_ATTR("avx2,fma,avxvnni")
+f32 dot_q8_0_q8_avxvnni(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
+    const i64 nb = n / 32;
+    const __m256i zero = _mm256_setzero_si256();
+    __m256 acc = _mm256_setzero_ps();
+    for (i64 b = 0; b < nb; b++, w += 34) {
+        const f32 d = fp16_to_fp32(
+            static_cast<u16>(w[0] | (static_cast<u16>(w[1]) << 8)));
+        const __m256i wv =
+            _mm256_loadu_si256(reinterpret_cast<const __m256i *>(w + 2));
+        const __m256i sm = _mm256_cmpgt_epi8(zero, wv);
+        const __m256i mag =
+            _mm256_blendv_epi8(wv, _mm256_sub_epi8(zero, wv), sm);
+        const __m256i xv = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i *>(xq + b * 32));
+        const __m256i xb =
+            _mm256_blendv_epi8(xv, _mm256_sub_epi8(zero, xv), sm);
+        const __m256i iv = _mm256_dpbusd_epi32(zero, mag, xb);
+        acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iv),
+                              _mm256_set1_ps(d * dx[b]), acc);
+    }
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    return _mm_cvtss_f32(lo);
+}
+#endif
+
 f32 dot_q8_0_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
     // Decode's ladder, same rungs and same guards as the eight-row kernel.
     // KRK_CPU_Q80_KERNEL forces a rung for testing (r1|bw|vnni|scalar).
@@ -3932,6 +3949,10 @@ f32 dot_q8_0_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
         return dot_q8_0_q8_bw(w, xq, dx, n);
 #endif
     if (forced == -1) return dot_q8_0_q8_scalar(w, xq, dx, n);
+#if defined(KRK_DOT_AVX2) && (defined(__AVXVNNI__) || defined(KRK_DOT_AVXVNNI))
+    if ((forced == 0 || forced == 3) && cpu_has_avxvnni())
+        return dot_q8_0_q8_avxvnni(w, xq, dx, n);
+#endif
     if (forced == 3 || forced == 2) {
         // Asked for a rung this build or this CPU cannot run: fall through to
         // the best available rather than returning a wrong number.
@@ -4088,6 +4109,46 @@ void dot_q8_0_q8_x8_avx2(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
         out[static_cast<i64>(r) * out_stride] = _mm_cvtss_f32(lo);
     }
 }
+
+#if defined(KRK_DOT_AVX2) && (defined(__AVXVNNI__) || defined(KRK_DOT_AVXVNNI))
+KRK_TARGET_ATTR("avx2,fma,avxvnni")
+void dot_q8_0_q8_x8_avxvnni(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                            i64 rstride, i64 dstride, f32 *out,
+                            i64 out_stride) {
+    const i64 nb = n / 32;
+    const __m256i zero = _mm256_setzero_si256();
+    __m256 acc[8];
+    for (i32 r = 0; r < 8; r++) acc[r] = _mm256_setzero_ps();
+    for (i64 b = 0; b < nb; b++, w += 34) {
+        const f32 d = fp16_to_fp32(
+            static_cast<u16>(w[0] | (static_cast<u16>(w[1]) << 8)));
+        const __m256i wv =
+            _mm256_loadu_si256(reinterpret_cast<const __m256i *>(w + 2));
+        const __m256i sm = _mm256_cmpgt_epi8(zero, wv);
+        const __m256i mag =
+            _mm256_blendv_epi8(wv, _mm256_sub_epi8(zero, wv), sm);
+        for (i32 r = 0; r < 8; r++) {
+            const __m256i xv = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(
+                    xq + static_cast<i64>(r) * rstride + b * 32));
+            const __m256i xb =
+                _mm256_blendv_epi8(xv, _mm256_sub_epi8(zero, xv), sm);
+            const __m256i iv = _mm256_dpbusd_epi32(zero, mag, xb);
+            const f32 sc = d * dx[static_cast<i64>(r) * dstride + b];
+            acc[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iv),
+                                     _mm256_set1_ps(sc), acc[r]);
+        }
+    }
+    for (i32 r = 0; r < 8; r++) {
+        __m128 lo = _mm256_castps256_ps128(acc[r]);
+        __m128 hi = _mm256_extractf128_ps(acc[r], 1);
+        lo = _mm_add_ps(lo, hi);
+        lo = _mm_hadd_ps(lo, lo);
+        lo = _mm_hadd_ps(lo, lo);
+        out[static_cast<i64>(r) * out_stride] = _mm_cvtss_f32(lo);
+    }
+}
+#endif
 
 // The entry point the backend calls: widest kernel the host can run. An odd
 // block count falls back wholesale rather than growing a second tail path --
@@ -4315,6 +4376,52 @@ void dot_q8_0_q8_wsc8_vnni(const u8 *w, const i8 *xq, i64 n, i64 rstride,
         out[static_cast<i64>(r) * out_stride] = _mm512_reduce_add_ps(acc[r]);
 }
 
+#if defined(KRK_DOT_AVX2) && (defined(__AVXVNNI__) || defined(KRK_DOT_AVXVNNI))
+// The scale-table rung on 256-bit AVX-VNNI. A table entry describes two Q8_0
+// blocks; process its two eight-lane halves in sequence so the accumulation
+// and final reduction are identical to dot_q8_0_q8_x8_avx2().
+KRK_TARGET_ATTR("avx2,fma,avxvnni")
+void dot_q8_0_q8_wsc8_avxvnni(const u8 *w, const i8 *xq, i64 n, i64 rstride,
+                              f32 *out, i64 out_stride, const f32 *wsc,
+                              const f32 *xsc) {
+    const i64 npair = n / 64;
+    const __m256i zero = _mm256_setzero_si256();
+    __m256 acc[8];
+    for (i32 r = 0; r < 8; r++) acc[r] = _mm256_setzero_ps();
+    for (i64 p = 0; p < npair; p++, w += 68) {
+        for (i32 half = 0; half < 2; half++) {
+            const u8 *wp = w + half * 34;
+            const __m256i wv = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(wp + 2));
+            const __m256i sm = _mm256_cmpgt_epi8(zero, wv);
+            const __m256i mag =
+                _mm256_blendv_epi8(wv, _mm256_sub_epi8(zero, wv), sm);
+            const __m256 wsv = _mm256_loadu_ps(wsc + p * 16 + half * 8);
+            for (i32 r = 0; r < 8; r++) {
+                const __m256i xv = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i *>(
+                        xq + static_cast<i64>(r) * rstride + p * 64 + half * 32));
+                const __m256i xb =
+                    _mm256_blendv_epi8(xv, _mm256_sub_epi8(zero, xv), sm);
+                const __m256i iv = _mm256_dpbusd_epi32(zero, mag, xb);
+                const __m256 xsv = _mm256_loadu_ps(
+                    xsc + (static_cast<i64>(r) * npair + p) * 16 + half * 8);
+                acc[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iv),
+                                         _mm256_mul_ps(wsv, xsv), acc[r]);
+            }
+        }
+    }
+    for (i32 r = 0; r < 8; r++) {
+        __m128 lo = _mm256_castps256_ps128(acc[r]);
+        __m128 hi = _mm256_extractf128_ps(acc[r], 1);
+        lo = _mm_add_ps(lo, hi);
+        lo = _mm_hadd_ps(lo, lo);
+        lo = _mm_hadd_ps(lo, lo);
+        out[static_cast<i64>(r) * out_stride] = _mm_cvtss_f32(lo);
+    }
+}
+#endif
+
 // Falls back to the no-table kernel on any host that cannot run the VNNI form,
 // so the answer is the same everywhere.
 void dot_q8_0_q8_wsc8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
@@ -4324,6 +4431,13 @@ void dot_q8_0_q8_wsc8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
     if (wsc != nullptr && xsc != nullptr && cpu_has_vnni() &&
         ((n / 32) & 1) == 0) {
         dot_q8_0_q8_wsc8_vnni(w, xq, n, rstride, out, out_stride, wsc, xsc);
+        return;
+    }
+#endif
+#if defined(KRK_DOT_AVX2) && (defined(__AVXVNNI__) || defined(KRK_DOT_AVXVNNI))
+    if (wsc != nullptr && xsc != nullptr && cpu_has_avxvnni() &&
+        ((n / 32) & 1) == 0) {
+        dot_q8_0_q8_wsc8_avxvnni(w, xq, n, rstride, out, out_stride, wsc, xsc);
         return;
     }
 #endif
@@ -4479,7 +4593,7 @@ i32 q8_0_gemv_width(void) {
 void dot_q8_0_q8_r1xN(const u8 *w, i64 wstride, const i8 *xq, const f32 *dx,
                       i64 n, i64 dstride, f32 *out, i64 out_stride, i32 kc) {
 #if defined(KRK_DOT_AVX512)
-    if (q8_0_wsc_supported() && ((n / 32) & 1) == 0 && (n / 32) >= 2) {
+    if (cpu_has_vnni() && ((n / 32) & 1) == 0 && (n / 32) >= 2) {
         if (g_pf_ahead < 0) g_pf_ahead = pf_ahead_init();
         switch (kc) {
             case 1:
@@ -4504,7 +4618,10 @@ void dot_q8_0_q8_r1xN(const u8 *w, i64 wstride, const i8 *xq, const f32 *dx,
 // the name collision that a bare re-declaration of cpu_has_vnni() causes.
 bool q8_0_wsc_supported(void) {
 #if defined(KRK_DOT_AVX512)
-    return cpu_has_vnni();
+    if (cpu_has_vnni()) return true;
+#endif
+#if defined(KRK_DOT_AVX2) && (defined(__AVXVNNI__) || defined(KRK_DOT_AVXVNNI))
+    return cpu_has_avxvnni();
 #else
     return false;
 #endif
@@ -4531,6 +4648,12 @@ void dot_q8_0_q8_x8_tier(i32 tier, const u8 *w, const i8 *xq, const f32 *dx,
     }
 #else
     (void)even;
+#endif
+#if defined(KRK_DOT_AVX2) && (defined(__AVXVNNI__) || defined(KRK_DOT_AVXVNNI))
+    if (tier == 3 && cpu_has_avxvnni()) {
+        dot_q8_0_q8_x8_avxvnni(w, xq, dx, n, rstride, dstride, out, out_stride);
+        return;
+    }
 #endif
 #if defined(KRK_DOT_AVX2)
     if (tier == 1 && cpu_has_avx2()) {
@@ -4591,6 +4714,12 @@ void dot_q8_0_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
 #else
     (void)nb;
 #endif
+#if defined(KRK_DOT_AVX2) && (defined(__AVXVNNI__) || defined(KRK_DOT_AVXVNNI))
+    if (want(3) && cpu_has_avxvnni()) {
+        dot_q8_0_q8_x8_avxvnni(w, xq, dx, n, rstride, dstride, out, out_stride);
+        return;
+    }
+#endif
     // Previously unconditional: on a host without AVX2 this was SIGILL.
 #if defined(KRK_DOT_AVX2)
     if (want(1) && cpu_has_avx2()) {
@@ -4605,32 +4734,16 @@ void dot_q8_0_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
 void dot_q4_K_q8_sx_x8(const u8 *w, const i8 *xq, const f32 *dx, const i32 *sx,
                        i64 n, i64 rstride, i64 dstride, i64 sstride, f32 *out,
                        i64 out_stride) {
-    static const bool use_sx = env_dot_x8sx();
-    if (!use_sx) {
-        dot_q4_K_q8_x8(w, xq, dx, n, rstride, dstride, out, out_stride);
-        return;
+    // Keep every activation row on exactly the same floating-point chain as
+    // dot_q4_K_q8_sx(). The former batched-min kernels reassociated the scales
+    // and folded the min term into the vector accumulator; that made prefill
+    // disagree with its remainder rows and made output depend on --chunk.
+    for (i32 r = 0; r < 8; r++) {
+        out[static_cast<i64>(r) * out_stride] = dot_q4_K_q8_sx(
+            w, xq + static_cast<i64>(r) * rstride,
+            dx + static_cast<i64>(r) * dstride,
+            sx + static_cast<i64>(r) * sstride, n);
     }
-#if defined(KRK_DOT_AVX512)
-    if (cpu_has_vnni()) {
-        dot_q4_K_q8_sx_x8_vnni_d(w, xq, dx, sx, n, rstride, dstride, sstride,
-                                 out, out_stride);
-        return;
-    }
-#endif
-#if defined(KRK_DOT_AVX2)
-#if defined(__AVXVNNI__) || defined(KRK_DOT_AVXVNNI)
-    if (cpu_has_avxvnni()) {
-        dot_q4_K_q8_sx_x8_d_avxvnni(w, xq, dx, sx, n, rstride, dstride, sstride,
-                                    out, out_stride);
-        return;
-    }
-#endif
-    dot_q4_K_q8_sx_x8_avx2_d(w, xq, dx, sx, n, rstride, dstride, sstride, out,
-                             out_stride);
-#else
-    (void)w; (void)xq; (void)dx; (void)sx; (void)n; (void)rstride;
-    (void)dstride; (void)sstride; (void)out; (void)out_stride;
-#endif
 }
 
 void dot_q4_K_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n, i64 rstride,
@@ -4873,8 +4986,12 @@ void set_vec_dot_int8(bool on) {
 }
 
 bool vec_dot_int8() {
+    if (!g_dot_int8_set.load(std::memory_order_relaxed)) {
+        g_dot_int8.store(env_dot_int8(), std::memory_order_relaxed);
+        g_dot_int8_set.store(true, std::memory_order_relaxed);
+    }
 #if defined(KRK_DOT_AVX2)
-    return true; // AVX2 is available on this build, int8 path is always active
+    return g_dot_int8.load(std::memory_order_relaxed) && cpu_has_avx2();
 #else
     return false;
 #endif
