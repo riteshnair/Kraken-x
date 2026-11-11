@@ -4047,7 +4047,13 @@ Backend *make_intel_backend(std::string *err) {
     c.gfx = "intel-mtl";
     c.family = GfxFamily::Unknown;
     c.wave_size = 32;
-    c.cu_count = static_cast<int>(std::thread::hardware_concurrency());
+    // The width the CPU kernels actually run at, not the number of logical CPUs.
+    // These are different numbers on this class of part (8 vs 18 on a
+    // 4P+8E+2LP-E Meteor Lake) and reporting the second as "cores" is how a
+    // session ends up tuning a pool that never had that many participants: the
+    // bandwidth curve peaks at the P cluster's SMT width and is 23% lower at 18
+    // (see the width table in src/par_pool.hpp's Pool constructor).
+    c.cu_count = static_cast<int>(Pool::get().workers());
     if (c.cu_count <= 0) c.cu_count = 1;
     return new CpuBackend(c, nullptr, BackendKind::Intel,
                           "Intel Meteor Lake (AVX2/VNNI, host copy)");
