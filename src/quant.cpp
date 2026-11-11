@@ -2361,6 +2361,158 @@ KRK_TARGET_ATTR("avx2,fma,avxvnni") f32 dot_q4_K_q8_d_avxvnni(
     return _mm_cvtss_f32(lo);
 }
 
+// ---------------------------------------------------------------------------
+//  dot_q4_K_q8_tile — the rows=1 Q4_K dot with four accumulation chains.
+//
+//  WHY. The shipped kernel folds every product into ONE __m256 accumulator, so
+//  a block is a 16-deep serial FMA chain (four 64-value chunks x two terms x
+//  two halves) and the next block extends the same chain. Measured on this box
+//  with tools/ta_gemv_q4k.cpp (n_in 2048, n_out 14336, resident matrix):
+//
+//      0.95 GB/s median / 1.49 best   at 0.77% of the int8 ISA peak
+//
+//  A core here streams ~10 GB/s and the ISA can do ~218 GMAC/s, so the kernel
+//  is neither memory- nor compute-bound: it is waiting on itself. This form
+//  keeps the identical terms and the identical per-32-value grouping, but each
+//  of a block's four 64-value chunks owns an accumulator, so the chain is two
+//  FMAs deep per block instead of sixteen and the four chains issue in
+//  parallel. The eight (scale, min) pairs are also extracted once per block,
+//  outside the chain, instead of branching eight times inside it.
+//
+//  It is NOT bit-identical to the serial form -- four partial sums added at the
+//  end associate differently in the last ulp -- so the engine gates it with the
+//  KL gate (--logits-ref) and KRK_Q4K_TILE=0 restores the serial kernel.
+// ---------------------------------------------------------------------------
+#define KRK_Q4K_CHUNK(T, ACC)                                                  \
+    do {                                                                       \
+        const __m256i qb_ = _mm256_loadu_si256(                                \
+            reinterpret_cast<const __m256i *>(qs + (T) * 32));                 \
+        const __m256i ql_ = _mm256_and_si256(qb_, kLo);                        \
+        const __m256i qh_ = _mm256_and_si256(_mm256_srli_epi16(qb_, 4), kLo);  \
+        const i64 b2_ = base + (T) * 64;                                       \
+        const __m256i xl_ = _mm256_loadu_si256(                                \
+            reinterpret_cast<const __m256i *>(xq + b2_));                      \
+        const __m256i xh_ = _mm256_loadu_si256(                                \
+            reinterpret_cast<const __m256i *>(xq + b2_ + 32));                 \
+        const __m256i iI0_ = _mm256_dpbusd_epi32(zero, ql_, xl_);              \
+        const __m256i iS0_ = _mm256_dpbusd_epi32(zero, ones8, xl_);            \
+        const __m256i iI1_ = _mm256_dpbusd_epi32(zero, qh_, xh_);              \
+        const __m256i iS1_ = _mm256_dpbusd_epi32(zero, ones8, xh_);            \
+        (ACC) = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iI0_),                      \
+                                _mm256_set1_ps(sx[(T) * 2 + 0]), (ACC));       \
+        (ACC) = _mm256_fnmadd_ps(_mm256_cvtepi32_ps(iS0_),                     \
+                                 _mm256_set1_ps(sm[(T) * 2 + 0]), (ACC));      \
+        (ACC) = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iI1_),                      \
+                                _mm256_set1_ps(sx[(T) * 2 + 1]), (ACC));       \
+        (ACC) = _mm256_fnmadd_ps(_mm256_cvtepi32_ps(iS1_),                     \
+                                 _mm256_set1_ps(sm[(T) * 2 + 1]), (ACC));      \
+    } while (0)
+
+KRK_TARGET_ATTR("avx2,fma,avxvnni") f32 dot_q4_K_q8_tile_impl(
+    const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
+    const __m256i kLo = _mm256_set1_epi8(0x0F);
+    const __m256i ones8 = _mm256_set1_epi8(1);
+    const __m256i zero = _mm256_setzero_si256();
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps();
+    __m256 acc3 = _mm256_setzero_ps();
+    const i64 nblk = n / 256;
+    for (i64 nb = 0; nb < nblk; nb++, w += 144) {
+        const f32 d = fp16_to_fp32(static_cast<u16>(w[0] | (w[1] << 8)));
+        const f32 dmin = fp16_to_fp32(static_cast<u16>(w[2] | (w[3] << 8)));
+        const u8 *sc = w + 4;
+        const u8 *qs = w + 16;
+        const i64 base = nb * 256;
+        f32 sx[8], sm[8];
+        for (int k = 0; k < 8; k++) {
+            u8 s, m;
+            get_scale_min_k4(k, sc, &s, &m);
+            const f32 dxb = dx[base / 32 + k];
+            sx[k] = dxb * d * static_cast<f32>(s);
+            sm[k] = dxb * dmin * static_cast<f32>(m);
+        }
+        KRK_Q4K_CHUNK(0, acc0);
+        KRK_Q4K_CHUNK(1, acc1);
+        KRK_Q4K_CHUNK(2, acc2);
+        KRK_Q4K_CHUNK(3, acc3);
+    }
+    __m256 acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1),
+                               _mm256_add_ps(acc2, acc3));
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    return _mm_cvtss_f32(lo);
+}
+
+// The `_sx` body with the eight (scale, min) pairs hoisted out of the chunk
+// loop, one accumulator kept, so it is BIT-IDENTICAL to the shipped kernel and
+// isolates exactly one thing: what the eight branchy scalar get_scale_min_k4
+// calls cost per block when they sit inside the chain. The kernel is already
+// at ~1 instruction per cycle with its data in L2 (tools/ta_gemv_q4k: 0.3 MiB
+// and 15.8 MiB matrices time the same), so the scalar side is a candidate for
+// half of that.
+KRK_TARGET_ATTR("avx2,fma,avxvnni") f32 dot_q4_K_q8_sx_hoist_impl(
+    const u8 *w, const i8 *xq, const f32 *dx, const i32 *sx, i64 n) {
+    const __m256i kLo = _mm256_set1_epi8(0x0F);
+    const __m256i zero = _mm256_setzero_si256();
+    __m256 acc = _mm256_setzero_ps();
+    f32 macc = 0.0f;
+    for (i64 nb = 0; nb < n / 256; nb++, w += 144) {
+        const f32 d = fp16_to_fp32(static_cast<u16>(w[0] | (w[1] << 8)));
+        const f32 dmin = fp16_to_fp32(static_cast<u16>(w[2] | (w[3] << 8)));
+        const u8 *sc = w + 4;
+        const u8 *qs = w + 16;
+        const i64 base = nb * 256;
+        const i64 sb0 = base / 32;
+        // Every scale and min for this block, once, outside the dot chain. The
+        // index is a COMPILE-TIME constant at each call, which is what makes
+        // get_scale_min_k4's `j < 4` a folded branch instead of a real one --
+        // with k from a loop the branch is taken eight times per block.
+        f32 sxk[8], smk[8];
+#define KRK_Q4K_SC(K)                                                          \
+    do {                                                                       \
+        u8 s_, m_;                                                             \
+        get_scale_min_k4(K, sc, &s_, &m_);                                     \
+        sxk[K] = dx[sb0 + (K)] * d * static_cast<f32>(s_);                     \
+        smk[K] = dx[sb0 + (K)] * dmin * static_cast<f32>(m_) *                 \
+                 static_cast<f32>(sx[sb0 + (K)]);                              \
+    } while (0)
+        KRK_Q4K_SC(0); KRK_Q4K_SC(1); KRK_Q4K_SC(2); KRK_Q4K_SC(3);
+        KRK_Q4K_SC(4); KRK_Q4K_SC(5); KRK_Q4K_SC(6); KRK_Q4K_SC(7);
+#undef KRK_Q4K_SC
+        for (int j = 0; j < 256; j += 64) {
+            const int t = j / 32;
+            const __m256i qb = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(qs));
+            const __m256i q_lo = _mm256_and_si256(qb, kLo);
+            const __m256i q_hi = _mm256_and_si256(_mm256_srli_epi16(qb, 4), kLo);
+            const __m256i x_lo = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(xq + base + j));
+            const __m256i x_hi = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(xq + base + j + 32));
+            const __m256i i1 = _mm256_dpbusd_epi32(zero, q_lo, x_lo);
+            const __m256i i2 = _mm256_dpbusd_epi32(zero, q_hi, x_hi);
+            const __m256 tt = _mm256_fmadd_ps(
+                _mm256_cvtepi32_ps(i1), _mm256_set1_ps(sxk[t]),
+                _mm256_mul_ps(_mm256_cvtepi32_ps(i2),
+                              _mm256_set1_ps(sxk[t + 1])));
+            acc = _mm256_add_ps(acc, tt);
+            macc += smk[t];
+            macc += smk[t + 1];
+            qs += 32;
+        }
+    }
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    return _mm_cvtss_f32(lo) - macc;
+}
+
 KRK_TARGET_ATTR("avx2,fma,avxvnni") void dot_q4_K_q8_x8_d_avxvnni(
     const u8 *w, const i8 *xq, const f32 *dx, i64 n, i64 rstride, i64 dstride,
     f32 *out, i64 out_stride) {
@@ -3303,6 +3455,17 @@ bool env_dot_avx2() {
     if (!e || e[0] == '\0') return cpu_has_avx2();
     return e[0] != '0';
 }
+
+// The pre-hoist `_sx` body, kept reachable so the bench can still price what
+// the hoist replaced. It has to live here: the kernels it calls are in this
+// namespace, and the public wrappers below are not.
+f32 dot_q4_K_q8_sx_loop_impl(const u8 *w, const i8 *xq, const f32 *dx,
+                             const i32 *sx, i64 n) {
+#if defined(__AVXVNNI__) || defined(KRK_DOT_AVXVNNI)
+    if (cpu_has_avxvnni()) return dot_q4_K_q8_sx_d_avxvnni(w, xq, dx, sx, n);
+#endif
+    return dot_q4_K_q8_sx_avx2_d(w, xq, dx, sx, n);
+}
 } // namespace
 
 #if defined(KRK_DOT_AVX2)
@@ -3400,6 +3563,52 @@ f32 dot_q4_K_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
 #endif
 #if defined(KRK_DOT_AVX2)
 #if defined(__AVXVNNI__) || defined(KRK_DOT_AVXVNNI)
+    if (cpu_has_avxvnni()) {
+        // The four-chain form is the default: the serial kernel measured
+        // 0.77% of the int8 ISA peak at 1.49 GB/s, which is neither a compute
+        // nor a bandwidth number -- it is the 16-deep FMA chain per block
+        // waiting on itself. Read once per process; the bench compares the two
+        // kernels through dot_q4_K_q8_tile() directly rather than flipping
+        // this, because a cached switch and a per-call one are different
+        // measurements and mixing them is how an A/B ends up with two
+        // identical arms.
+        static const bool tile = !(std::getenv("KRK_Q4K_TILE") &&
+                                   std::getenv("KRK_Q4K_TILE")[0] == '0');
+        if (tile) return dot_q4_K_q8_tile_impl(w, xq, dx, n);
+        return dot_q4_K_q8_d_avxvnni(w, xq, dx, n);
+    }
+#endif
+    return dot_q4_K_q8_d(w, xq, dx, n);
+#else
+    (void)w; (void)xq; (void)dx; (void)n;
+    return 0.0f;
+#endif
+}
+
+// Public entry point for the four-chain kernel (the definition lives in the
+// anonymous namespace above, beside the other kernels).
+f32 dot_q4_K_q8_tile(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
+#if defined(KRK_DOT_AVX2)
+#if defined(__AVXVNNI__) || defined(KRK_DOT_AVXVNNI)
+    if (cpu_has_avxvnni()) return dot_q4_K_q8_tile_impl(w, xq, dx, n);
+#endif
+#endif
+    // No AVX-VNNI: the four-chain form needs vpdpbusd, so the serial kernel is
+    // the answer. Returning it (rather than a fantasy) keeps a bench honest --
+    // it will then measure both arms identical, which is the truth here.
+    return dot_q4_K_q8(w, xq, dx, n);
+}
+
+// The serial kernel by name. A bench cannot reach it through dot_q4_K_q8()
+// once that entry dispatches to the four-chain form by default, and comparing
+// the default entry against itself is exactly how an A/B reports "no
+// difference" while measuring one arm twice.
+f32 dot_q4_K_q8_serial(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
+#if defined(KRK_DOT_AVX512)
+    if (cpu_has_vnni()) return dot_q4_K_q8_vnni_d(w, xq, dx, n);
+#endif
+#if defined(KRK_DOT_AVX2)
+#if defined(__AVXVNNI__) || defined(KRK_DOT_AVXVNNI)
     if (cpu_has_avxvnni()) return dot_q4_K_q8_d_avxvnni(w, xq, dx, n);
 #endif
     return dot_q4_K_q8_d(w, xq, dx, n);
@@ -3409,6 +3618,29 @@ f32 dot_q4_K_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
 #endif
 }
 
+// The pre-hoist `_sx` body by name, so the bench can still measure what the
+// hoist replaced (dot_q4_K_q8_sx now dispatches to the hoisted form).
+f32 dot_q4_K_q8_sx_loop(const u8 *w, const i8 *xq, const f32 *dx,
+                        const i32 *sx, i64 n) {
+#if defined(KRK_DOT_AVX2)
+    return dot_q4_K_q8_sx_loop_impl(w, xq, dx, sx, n);
+#else
+    (void)w; (void)xq; (void)dx; (void)sx; (void)n;
+    return 0.0f;
+#endif
+}
+
+// The `_sx` kernel by name, plus its scale-hoisted twin.
+f32 dot_q4_K_q8_sx_hoist(const u8 *w, const i8 *xq, const f32 *dx,
+                         const i32 *sx, i64 n) {
+#if defined(KRK_DOT_AVX2)
+#if defined(__AVXVNNI__) || defined(KRK_DOT_AVXVNNI)
+    if (cpu_has_avxvnni()) return dot_q4_K_q8_sx_hoist_impl(w, xq, dx, sx, n);
+#endif
+#endif
+    return dot_q4_K_q8_sx(w, xq, dx, sx, n);
+}
+
 f32 dot_q4_K_q8_sx(const u8 *w, const i8 *xq, const f32 *dx, const i32 *sx,
                   i64 n) {
 #if defined(KRK_DOT_AVX512)
@@ -3416,9 +3648,21 @@ f32 dot_q4_K_q8_sx(const u8 *w, const i8 *xq, const f32 *dx, const i32 *sx,
 #endif
 #if defined(KRK_DOT_AVX2)
 #if defined(__AVXVNNI__) || defined(KRK_DOT_AVXVNNI)
-    if (cpu_has_avxvnni()) return dot_q4_K_q8_sx_d_avxvnni(w, xq, dx, sx, n);
+    if (cpu_has_avxvnni()) {
+        // The hoisted form is the default: it calls get_scale_min_k4 with a
+        // COMPILE-TIME index, which folds the `j < 4` branch away, and that
+        // alone is worth 15-17% of the kernel (tools/ta_gemv_q4k, n_in 2048,
+        // n_out 14336, interleaved order-balanced: 9.4-9.8 GB/s for the loop
+        // form against 10.8-11.4 for the unrolled one, four runs, same text).
+        // Bit-identical arithmetic -- same terms, same order, only the branch
+        // is gone. KRK_Q4K_HOIST=0 restores the loop-indexed body.
+        static const bool hoist = !(std::getenv("KRK_Q4K_HOIST") &&
+                                    std::getenv("KRK_Q4K_HOIST")[0] == '0');
+        if (hoist) return dot_q4_K_q8_sx_hoist_impl(w, xq, dx, sx, n);
+        return dot_q4_K_q8_sx_loop_impl(w, xq, dx, sx, n);
+    }
 #endif
-    return dot_q4_K_q8_sx_avx2_d(w, xq, dx, sx, n);
+    return dot_q4_K_q8_sx_loop_impl(w, xq, dx, sx, n);
 #else
     (void)w; (void)xq; (void)dx; (void)sx; (void)n;
     return 0.0f;

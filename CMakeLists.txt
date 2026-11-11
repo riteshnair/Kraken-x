@@ -659,6 +659,9 @@ endif()
 add_executable(kraken-kquant-dot tools/ta_kquant_dot.cpp)
 target_link_libraries(kraken-kquant-dot PRIVATE krk_core)
 
+add_executable(kraken-gemv-q4k tools/ta_gemv_q4k.cpp)
+target_link_libraries(kraken-gemv-q4k PRIVATE krk_core)
+
 add_executable(kraken-q80-tiers tools/ta_q80_tiers.cpp)
 target_link_libraries(kraken-q80-tiers PRIVATE krk_core)
 
