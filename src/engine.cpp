@@ -2741,6 +2741,16 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     // bytes that are free once the ring has taken its own.
     pin_hot_experts();
 
+    // ---- the bounded host-pool seed (CPU backend) -------------------------
+    // The two phases above are VRAM-tier work and both return early with no
+    // device memory, so on a CPU build the pool started EMPTY on every run: a
+    // measured ranking was read and blended and then never used. Measured on
+    // GLM-4.7-Flash, HOT stayed at 38.0% across two --coder runs while the
+    // index grew. This fills the bounded host pool from the ranking instead,
+    // hottest first, and STOPS at the budget -- it never reads the whole routed
+    // set, which is what the CPU warmup refuses to do.
+    fill_host_pool();
+
     // ---- the expert pool must not fill the card ---------------------------
     // Its budget is decided before the KV cache and before this engine's own
     // workspaces exist, so it can name every byte that was free at that moment
@@ -9840,7 +9850,85 @@ void Engine::merge_expert_index(const std::string &path, double retain) {
              static_cast<long long>(expert_scan_tokens_), path.c_str(), retain);
 }
 
-// True when the ranked warmup should run. Split out from warm_experts()
+// Fills the bounded HOST pool from the ranked index, hottest first, stopping at
+// the budget. The ranked warmup above is a VRAM-tier phase and returns early
+// with no device memory, which is why a measured ranking was read, blended, and
+// then never used on a CPU build: HOT stayed at 38.0% across two --coder runs
+// on GLM-4.7-Flash while the index was being updated. This is the CPU
+// equivalent, and it is deliberately BOUNDED -- it never reads the whole routed
+// set, which is what ``expert_warmup_wanted`` refuses to do on a laptop.
+void Engine::fill_host_pool() {
+    const ModelConfig &mc = model_.cfg();
+    if (!be_ || be_->has_device_memory()) return;
+    if (!mc.is_moe || mc.n_expert <= 0 || mc.n_layer <= 0) return;
+    if (cfg_.host_pool_seed == 0) return; // --expert-warmup 0 declines the seed
+    if (const char *e = std::getenv("KRK_POOL_SEED"))
+        if (e[0] == '0') return;
+    const std::vector<std::pair<i32, i32>> order = load_expert_index();
+    if (order.empty()) return;
+    std::vector<const ExpertSource *> srcs(static_cast<size_t>(mc.n_layer),
+                                           nullptr);
+    for (i32 l = 0; l < mc.n_layer; l++) {
+        const LayerWeights &L = model_.layers()[static_cast<size_t>(l)];
+        if (L.experts.present()) srcs[static_cast<size_t>(l)] = &L.experts;
+    }
+    ExpertCache &ec = model_.experts();
+    const size_t budget = ec.budget_bytes();
+    if (budget == 0) return;
+    // Seed a FRACTION, not the whole budget. Filling it entirely measured
+    // WORSE (HOT 38.0% -> 35.5%, misses 3837 -> 4359 on GLM-4.7-Flash): a
+    // one-run ranking covers part of the routing mass, so pinning all of the
+    // pool to it leaves the adaptive LFU nowhere to put the rest and every
+    // off-profile expert evicts a profile one. The same shape is recorded for
+    // the REAP tier (a tier between the set and the room misses forever).
+    // KRK_POOL_SEED_PCT overrides, 100 = seed everything.
+    // Measured, and OFF by default because it did not pay: GLM-4.7-Flash at a
+    // 3 GiB pool, 24 tokens, HOT hit rate
+    //     no seed      38.0%   (misses 3837)
+    //     seed 50%     37.2%   (4062)
+    //     seed 75%     36.8%   (4196)
+    //     seed 100%    35.5%   (4359)
+    // The LFU reaches that hot set by itself within ~30 tokens, and the ranking
+    // available here was measured over only 79 positions, so a stale prior adds
+    // churn instead of removing it. It stays because the same file, blended
+    // over many runs and applied to a cold start with a small pool, is the case
+    // it was written for -- and KRK_POOL_SEED_PCT=60 is how to try it.
+    static const i64 pct = [] {
+        const char *e = std::getenv("KRK_POOL_SEED_PCT");
+        if (e && *e) {
+            const long v = std::atol(e);
+            if (v >= 0) return static_cast<i64>(v > 100 ? 100 : v);
+        }
+        return i64(0);
+    }();
+    const size_t cap = budget * static_cast<size_t>(pct) / 100u;
+    size_t got = 0, bytes = 0, layer_n = 0;
+    std::vector<u8> seen(static_cast<size_t>(mc.n_layer), 0);
+    for (const auto &le : order) {
+        const i32 l = le.first, e = le.second;
+        if (l < 0 || l >= mc.n_layer) continue;
+        const ExpertSource *src = srcs[static_cast<size_t>(l)];
+        if (!src) continue;
+        const size_t need = src->expert_bytes();
+        if (need == 0) continue;
+        // Bounded: stop at the plan. Letting acquire() evict to make room here
+        // would turn a seed into a scan of the whole routed set.
+        if (bytes + need > cap) break;
+        if (!ec.acquire(*src, l, e)) break;
+        bytes += need;
+        got++;
+        if (!seen[static_cast<size_t>(l)]) {
+            seen[static_cast<size_t>(l)] = 1;
+            layer_n++;
+        }
+    }
+    KRK_INFO("expert pool: seeded %zu expert(s), %.0f MiB of a %.0f MiB budget, "
+             "%zu layer(s), from the ranked index",
+             got, static_cast<f64>(bytes) / 1048576.0,
+             static_cast<f64>(budget) / 1048576.0, layer_n);
+}
+
+    // True when the ranked warmup should run. Split out from warm_experts()
 // because configure_expert_cache has to know whether to leave WARM alone: the
 // two phases fill the same tier in different orders and cannot both run.
 bool Engine::expert_warmup_wanted() const {

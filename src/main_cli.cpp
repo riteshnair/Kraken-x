@@ -1758,6 +1758,7 @@ int main(int argc, char **argv) {
         a.model + (a.workload.empty() ? std::string() : ("." + a.workload)) +
         ".krakenexperts.json";
     cfg.expert_index_path = expert_index_path;
+    cfg.host_pool_seed = (a.expert_warmup == 0) ? 0 : -1;
     cfg.model_path = a.model;
     // --chat-template: a builtin name, or a path to a .jinja file. Resolved
     // here so a typo is a startup error rather than a silent ChatML prompt on

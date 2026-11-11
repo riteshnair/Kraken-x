@@ -84,6 +84,11 @@ struct EngineConfig {
     // workload tag (`--profile coder`) points it at a per-workload file so two
     // workloads never blend into one ranking.
     std::string expert_index_path;
+    // The bounded host-pool seed. -1 = on, 0 = off (--expert-warmup 0). This is
+    // NOT cfg.expert_warmup: the CPU path forces that to 0 to mean "no VRAM
+    // tier to warm", which is a different question from whether to seed the
+    // host pool, and reading it directly made the seed impossible on CPU.
+    i32 host_pool_seed = -1;
     // True when --kv-quant came from the caller. A default that a model cannot
     // use (MLA, or a run with a nextn/draft block) falls back to f16 with a
     // warning; an EXPLICIT request for a format the run cannot use is refused.
@@ -1004,6 +1009,10 @@ private:
     // KRK_EXPERT_PIN_MB=<n> sizes the ring (default: half the measured room
     // beside the VRAM floor).
     void pin_hot_experts();
+    // CPU backend: fill the bounded host pool from the ranked index, hottest
+    // first, stopping at the budget (see the definition for why the ranked
+    // warmup above does not do this on a build with no device memory).
+    void fill_host_pool();
     // Publishes the device dispatch table (ExpertCache::publish_dispatch_table)
     // when the whole routed set is device-resident, so a layer can pick its
     // experts' matrices without a host pointer per expert. Called at the end of
