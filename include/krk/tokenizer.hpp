@@ -60,6 +60,11 @@ public:
 private:
     int encode_bpe(const std::string &text, i32 *out, int max_out) const;
     int encode_spm(const std::string &text, i32 *out, int max_out) const;
+    // BPE whose merges run over raw UTF-8 with U+2581 as the space marker
+    // (`tokenizer.ggml.model = gemma4` / llama.cpp's PRE_TYPE_GEMMA4). Its own
+    // encoder because the GPT-2 byte permutation does not appear in such a
+    // vocabulary's merge table at all -- see the definition.
+    int encode_spm_bpe(const std::string &text, i32 *out, int max_out) const;
 
     // Whole-word tokens (chat-template markers, control tokens) that are
     // emitted as a single id instead of being split by the backend encoder.
@@ -77,6 +82,10 @@ private:
     i32 bos_ = -1, eos_ = -1, pad_ = -1;
     bool add_bos_ = false;
     bool byte_fallback_ = false;
+    // SPM-style BPE (gemma4): raw-UTF-8 merges, U+2581 is the space marker.
+    // Decided from the vocab's model string, never from `pre` -- this family's
+    // files do not carry `tokenizer.ggml.pre` at all.
+    bool spm_bpe_ = false;
     bool spm_leading_space_ = true;
 
     std::vector<SpecialToken> specials_;   // sorted by piece length, desc

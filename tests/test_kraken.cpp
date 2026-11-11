@@ -10072,6 +10072,125 @@ static void test_tokenizer_spm_and_bpe() {
 }
 
 // ---------------------------------------------------------------------------
+// gemma4's tokenizer: an SPM-style BPE
+// ---------------------------------------------------------------------------
+//
+// gemma-4-E4B's vocabulary ships `merges` -- it IS a BPE -- but its pieces are
+// RAW UTF-8 with U+2581 as the space marker, and its merges run over the whole
+// text with no word-level pre-split. That is a pre-type of its own in the
+// reference (llama.cpp `LLAMA_VOCAB_PRE_TYPE_GEMMA4`: "spaces are replaced with
+// U+2581 by the normalizer, then BPE merges run on the whole text without
+// word-level pre-splitting", `byte_encode = false`), selected by the vocab's
+// model string.
+//
+// Running it through the GPT-2 byte permutation is not a near miss. The codec
+// maps the space to U+0120, which such a vocabulary's merge table never names
+// -- the real file has 137,542 pieces containing U+2581 and exactly ONE
+// containing U+0120 -- so every word boundary fell out as that lone piece and
+// the model was handed a token it never saw for every space in the prompt.
+// Measured against llama.cpp's own tokenizer on gemma-4-E4B-it-Q4_K_M:
+// "The capital of France is" is `[2, 818, 5279, 529, 7001, 563]` there and was
+// `[2, 818, 245237, 41626, 245237, 1340, ...]` here, and the model answered
+// `  is is is isisisis` instead of ` Paris.`.
+//
+// The `gpt2` arm is the control that keeps the pin honest: the same bytes and
+// the same merges under the GPT-2 pre-type must NOT produce the gemma4 answer.
+static bool build_gemma4_tokenizer_model(const std::string &path, const char *model) {
+    const std::string sp = "\xE2\x96\x81";  // U+2581
+    std::vector<std::string> tokens = {
+        "<unk>", "<bos>", sp, "The", sp + "the", "cat", sp + "cat",
+        "T", "h", "e", "c", "a", "t", "Th", "ca",
+    };
+    for (int i = 0; i < 256; i++) {
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "<0x%02X>", i);
+        tokens.emplace_back(buf);
+    }
+    // Rank order is the merge order the greedy loop follows; "▁ cat" is last so
+    // the two words are built character by character first.
+    std::vector<std::string> merges = {
+        "T h", "Th e", "c a", "ca t", sp + " cat", sp + " the",
+    };
+    GgufBuilder b;
+    b.meta_str("general.architecture", "gemma4");
+    b.meta_str("general.name", "kraken-gemma4-tokenizer");
+    b.meta_u32("general.alignment", 32);
+    b.meta_str("tokenizer.ggml.model", model);
+    b.meta_str_array("tokenizer.ggml.tokens", tokens);
+    b.meta_str_array("tokenizer.ggml.merges", merges);
+    b.meta_u32("tokenizer.ggml.bos_token_id", 1);
+    b.meta_u32("tokenizer.ggml.eos_token_id", 0);
+    b.meta_bool("tokenizer.ggml.add_bos_token", true);
+    return b.write(path);
+}
+
+static void test_gemma4_tokenizer() {
+    const std::string sp = "\xE2\x96\x81";
+    {
+        const std::string path = "kraken-gemma4-tok.gguf";
+        CHECK(build_gemma4_tokenizer_model(path, "gemma4"),
+              "wrote the gemma4 tokenizer fixture");
+        Gguf g;
+        std::string err;
+        CHECK(g.load(path, &err), "reload for the gemma4 tokenizer");
+        Tokenizer tok;
+        CHECK(tok.load(g, &err), "gemma4 tokenizer loads");
+        CHECK(tok.model() == TokModel::Bpe,
+              "gemma4 is still a BPE -- it ships merges, and SPM would drop them");
+        const i32 the = tok.piece_id("The"), cat = tok.piece_id(sp + "cat");
+        const i32 marker = tok.piece_id(sp);
+        CHECK(the >= 0 && cat >= 0 && marker >= 0,
+              "the fixture carries The / the space marker / the merged word");
+        // The whole point: a space is the MARKER, and the merge crosses it, so
+        // "The cat" is two pieces and not `The`, `<0x20>`, `cat`.
+        std::vector<i32> ids;
+        CHECK(tok.encode("The cat", ids, false) == 2,
+              "a space is U+2581 and the merge crosses it: two pieces");
+        CHECK(ids.size() == 2 && ids[0] == the && ids[1] == cat,
+              "encoding is The | U+2581cat");
+        const std::string back = tok.decode(ids.data(), static_cast<int>(ids.size()));
+        CHECK(back == "The cat", "U+2581 decodes back to a space");
+        std::vector<i32> with_bos;
+        CHECK(tok.encode("The cat", with_bos, true) == 3 && with_bos[0] == 1,
+              "add_special still prepends BOS on this path");
+        // No space in the text, so no marker: the merge table's `c a t` chain
+        // still builds the word.
+        std::vector<i32> bare;
+        CHECK(tok.encode("cat", bare, false) == 1 && bare[0] == tok.piece_id("cat"),
+              "a bare word merges without the marker");
+        // Raw UTF-8: a piece the vocabulary does not carry comes apart BYTE by
+        // byte (raw-UTF-8 vocabularies have no codepoint mapping to fall back
+        // through), which is U+00E9 = C3 A9 = two pieces.
+        std::vector<i32> accent;
+        CHECK(tok.encode("\xC3\xA9", accent, false) == 2 &&
+                  accent[0] == tok.piece_id("<0xC3>") &&
+                  accent[1] == tok.piece_id("<0xA9>"),
+              "an unknown piece falls back per raw byte");
+        std::remove(path.c_str());
+    }
+    {
+        // Control. Same tokens, same merges, GPT-2 pre-type: the space becomes
+        // U+0120, no merge crosses it, and the codepoint falls out as a byte
+        // piece. A fixture that answered the gemma4 way for BOTH pre-types
+        // would be measuring the fixture, not the tokenizer.
+        const std::string path = "kraken-gemma4-tok-gpt2.gguf";
+        CHECK(build_gemma4_tokenizer_model(path, "gpt2"),
+              "wrote the same bytes under the GPT-2 pre-type");
+        Gguf g;
+        std::string err;
+        CHECK(g.load(path, &err), "reload for the GPT-2 control");
+        Tokenizer tok;
+        CHECK(tok.load(g, &err), "the GPT-2 control loads");
+        std::vector<i32> ids;
+        CHECK(tok.encode("The cat", ids, false) == 3,
+              "the GPT-2 pre-type does NOT cross the space (control)");
+        CHECK(ids.size() == 3 && ids[1] == tok.piece_id("<0x20>"),
+              "the control puts a <0x20> byte piece at the boundary");
+        std::remove(path.c_str());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // sampler determinism
 // ---------------------------------------------------------------------------
 
@@ -31961,6 +32080,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_load_verdict)
     TEST_GROUP(test_gguf_roundtrip)
     TEST_GROUP(test_tokenizer_spm_and_bpe)
+    TEST_GROUP(test_gemma4_tokenizer)
     TEST_GROUP(test_sampler_determinism)
     TEST_GROUP(test_spec_sampling)
     TEST_GROUP(test_logit_softcap)

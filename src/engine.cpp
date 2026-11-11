@@ -2444,7 +2444,26 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
                 if (hd > 0 && (hd & (hd - 1)) != 0) { hd_ok = false; break; }
             }
         }
-        if (!be_ok || !attn_shape_ok || !draft_ok || !hd_ok) {
+        // A family with NO pre-attention scaling (gemma4 states
+        // `attention.scale = 1.0`, where every other family passes
+        // 1/sqrt(head_dim)) normalizes q and k per head and then dots them
+        // unscaled, so its logits are +-sqrt(head_dim) -- +-16 to +-23 here, i.e.
+        // e^16 -- and its softmax is very nearly one-hot. The rotated 3/4-bit
+        // cache spreads its quantization error over the whole head, which moves
+        // those logits by more than the gap between the top two keys.
+        //
+        // Measured on gemma-4-E4B-it-Q4_K_M, same command, one switch apart:
+        // `f16` answers ` Paris.` (the reference text), `int8` answers it too,
+        // `turbo3` -- the default -- answers ` EringerskJotice:course:CLUChar`
+        // and `rot4` ` to thek k to the process on it on taking on`. Both head
+        // widths on this family (512 global, 256 windowed) are powers of two, so
+        // the Hadamard above is exact and `hd_ok` is true: this is the 4-bit
+        // cache's precision, not a rotated-basis defect. int8 stays available
+        // because it costs 1.8x instead of 3.5x and reproduces the text.
+        const bool logit_ok =
+            (kvq != KvQuant::Turbo3 && kvq != KvQuant::Rot4) ||
+            model_.cfg().attn_scale < 1.0f;
+        if (!be_ok || !attn_shape_ok || !draft_ok || !hd_ok || !logit_ok) {
             const char *why =
                 !be_ok
                     ? "this backend has no reader for that cache layout"
@@ -2453,8 +2472,14 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
                             "read/write path"
                           : !draft_ok
                                 ? "the head-set drafter has no packed-cache reader"
-                                : "this model's head width is not a power of two, "
-                                  "which the rotated formats do not support yet";
+                                : !logit_ok
+                                      ? "this family applies no pre-attention "
+                                        "scaling, so its logits are "
+                                        "+-sqrt(head_dim) and a 4-bit key cache "
+                                        "moves the argmax of its near-one-hot "
+                                        "softmax"
+                                      : "this model's head width is not a power of two, "
+                                        "which the rotated formats do not support yet";
             if (cfg_.kv_quant_explicit) {
                 *err = format("kv-quant %s: %s; run it with --kv-quant f16",
                               qname, why);
@@ -4930,8 +4955,17 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
             // file carries no tensor, so a family that declares it must run it
             // here, before the row reaches the cache -- normalizing on read
             // would cost a pass per attended key instead of one per token.
+            //
+            // PER HEAD, not over the whole KV row: the reference's Vcur is
+            // [n_embd_head, n_head_kv, n_tokens] and ggml_rms_norm reduces dim
+            // 0, which is one head. The 2 KB row of a 2-KV-head layer is two
+            // independent normals, and a single reduction over both rescales
+            // one head against the other -- a different vector, not a rounding
+            // difference (measured on gemma-4-E4B layer 0 against an
+            // independent numpy forward of the same graph: relL2 7.2e-2,
+            // cos 0.9974, and every stage after it inherits the error).
             if (mc.v_norm_weightless && L.wv.present())
-                be_->rmsnorm(ws_v_, ws_v_, nullptr, n, lkv, mc.rms_eps);
+                be_->rmsnorm(ws_v_, ws_v_, nullptr, n * lkvh, d.hd, mc.rms_eps);
             // Post-norm, pre-rope: the row the rotation consumes. The
             // fused arm's copy of it lives in registers and never lands
             // in this buffer, so this row covers the separate chain only.
