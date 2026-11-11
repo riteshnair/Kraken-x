@@ -7,6 +7,7 @@
 //    GET  /v1/models            model metadata (OpenAI list shape)
 //    POST /v1/completions       text completion (SSE when "stream": true)
 //    POST /v1/chat/completions  chat completion over the ChatML template
+//    POST /v1/tools/rv32        checked int32 expressions on the RV32 coprocessor
 //
 //  Extracted into a header so the deterministic test suite can drive the
 //  exact same request-handling code the server binary runs — the suite

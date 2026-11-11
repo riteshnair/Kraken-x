@@ -1,9 +1,11 @@
 // Conformance and lockstep gates for the engine-native RV32 coprocessor.
+#include <climits>
 #include <cstdio>
 #include <cstring>
 #include <vector>
 
 #include "krk/rv32.hpp"
+#include "krk/rv32_calc.hpp"
 
 using namespace krk;
 
@@ -159,6 +161,33 @@ static void test_tensor_differential() {
     }
 }
 
+static void test_calculator() {
+    const struct { const char *expression; i32 value; } valid[] = {
+        {"1+2*3", 7}, {"(1+2)*3", 9}, {"100 + 2*3 - 4/2", 104},
+        {"20/(3-1) + 20%(3-1)", 10}, {"-2147483648", INT32_MIN},
+        {"-2147483648 % -1", 0}, {"--5 + +7", 12},
+        {"2*(3+4*(5+6))-100", -6}, {"1+(2*(3+4))", 15},
+        {"(1+2)*(3+4)-(5+6)*(7+8)", -144},
+    };
+    for (const auto &test : valid) {
+        Rv32CalcResult a, b;
+        std::string err;
+        CHECK(rv32_calculate(test.expression, &a, &err), err.c_str());
+        CHECK(a.value == test.value, "checked expression result");
+        CHECK(rv32_calculate(test.expression, &b, &err), "repeat calculation");
+        CHECK(a.state_hash == b.state_hash && a.instructions == b.instructions,
+              "calculator is deterministic");
+    }
+    const char *invalid[] = {"", "1+", "1/0", "1%(1-1)", "2147483647+1",
+        "-2147483648/-1", "2147483648", "1 2", "(1+2", "2^3", "999999999999999999999"};
+    for (const char *expression : invalid) {
+        Rv32CalcResult r;
+        std::string err;
+        CHECK(!rv32_calculate(expression, &r, &err) && !err.empty(),
+              "invalid/overflowing expression is refused");
+    }
+}
+
 static void test_lockstep_and_faults() {
     std::vector<u32> p;
     addi(p, 1, 0, 123);
@@ -209,6 +238,7 @@ int main() {
     test_control_flow_and_output();
     test_tensor_instructions();
     test_tensor_differential();
+    test_calculator();
     test_lockstep_and_faults();
     std::printf("RV32 coprocessor: %d/%d checks passed\n", checks - failures, checks);
     return failures ? 1 : 0;

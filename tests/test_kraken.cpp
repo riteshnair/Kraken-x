@@ -18215,6 +18215,25 @@ static void test_http_server() {
               "http: /health reports ok");
     }
 
+    // RV32 tool: exact arithmetic does not enter or mutate the generation path.
+    CHECK(http_request(port, "POST", "/v1/tools/rv32",
+                       "{\"expression\":\"100+2*3-4/2\"}", &status, &body) && status == 200,
+          "http: RV32 expression returns 200");
+    {
+        JsonValue j;
+        std::string e;
+        const std::string payload = body.substr(body.find("\r\n\r\n") + 4);
+        CHECK(json_parse(payload, &j, &e) && j.get_int("result") == 104 &&
+                  j.get_int("instructions") > 0,
+              "http: RV32 expression has the exact result and execution count");
+    }
+    CHECK(http_request(port, "POST", "/v1/tools/rv32",
+                       "{\"expression\":\"2147483647+1\"}", &status, &body) && status == 400,
+          "http: RV32 overflow is refused");
+    CHECK(http_request(port, "POST", "/v1/tools/rv32",
+                       "{\"expression\":\"1/0\"}", &status, &body) && status == 400,
+          "http: RV32 division by zero is refused");
+
     // models
     CHECK(http_request(port, "GET", "/v1/models", "", &status, &body) && status == 200,
           "http: /v1/models returns 200");
