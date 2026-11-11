@@ -26,6 +26,7 @@ static inline int krk_win_unsetenv(const char *name) { return _putenv_s(name, ""
 #include "krk/host_time.hpp"
 #include "krk/kernel_time.hpp"
 #include "krk/quant.hpp"
+#include "krk/rv32_calc.hpp"
 #include "krk/trace.hpp"
 
 #if defined(_WIN32)
@@ -2272,6 +2273,15 @@ int main(int argc, char **argv) {
             if (!std::getline(std::cin, line)) break;
             if (line == "/quit" || line == "/exit") break;
             if (line.empty()) continue;
+            if (line.rfind("/rv32 ", 0) == 0) {
+                Rv32CalcResult calculated;
+                std::string error;
+                if (rv32_calculate(line.substr(6), &calculated, &error))
+                    std::printf("%d\n", calculated.value);
+                else
+                    std::fprintf(stderr, "rv32: %s\n", error.c_str());
+                continue;
+            }
             sink.hold.clear();
             if (!generate_once(a.chat ? render_turn(engine, a.system, line) : line)) {
                 rc = 1;

@@ -100,6 +100,7 @@ set(KRK_GPU_TARGETS "gfx1031;gfx1201"
 set(KRK_CORE_SOURCES
     src/common.cpp
     src/rv32.cpp
+    src/rv32_calc.cpp
     src/arch.cpp
     src/verdict.cpp
     src/quant.cpp

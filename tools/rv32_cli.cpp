@@ -7,12 +7,14 @@
 #include <vector>
 
 #include "krk/rv32.hpp"
+#include "krk/rv32_calc.hpp"
 
 using namespace krk;
 
 static void usage() {
     std::fprintf(stderr,
         "usage: kraken-rv32 PROGRAM.bin [options]\n"
+        "       kraken-rv32 --calc 'checked int32 expression'\n"
         "  --entry N        load and entry address (default 0)\n"
         "  --memory N       byte RAM size (default 65536)\n"
         "  --max-steps N    instruction limit (default 1000000)\n"
@@ -39,6 +41,19 @@ static bool number(const char *text, u64 *out) {
 
 int main(int argc, char **argv) {
     if (argc < 2) { usage(); return 2; }
+    if (argc == 3 && std::string(argv[1]) == "--calc") {
+        Rv32CalcResult result;
+        std::string error;
+        if (!rv32_calculate(argv[2], &result, &error)) {
+            std::fprintf(stderr, "kraken-rv32: %s\n", error.c_str());
+            return 1;
+        }
+        std::printf("%d\n", result.value);
+        std::fprintf(stderr, "kraken-rv32: exact instructions=%llu state=%016llx\n",
+                     static_cast<unsigned long long>(result.instructions),
+                     static_cast<unsigned long long>(result.state_hash));
+        return 0;
+    }
     std::string program, weights, trace;
     u64 entry = 0, memory = Rv32::kDefaultMemoryBytes, steps = 1000000;
     for (int i = 1; i < argc; i++) {
