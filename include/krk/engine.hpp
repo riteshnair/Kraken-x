@@ -1121,6 +1121,13 @@ private:
     bool generate_speculative(const GenerateParams &p, GenerateResult *res,
                               const std::vector<i32> &ids, f64 *prefill_ms,
                               f64 *decode_ms, i64 *decode_steps);
+    // The same round with no drafter at all: proposals are the tokens that
+    // followed the last n tokens the last time that n-gram appeared in this
+    // context. Greedy only, and the text must be byte-identical to plain
+    // decode because verification decides every token. KRK_NGRAM=1 selects it.
+    bool generate_ngram(const GenerateParams &p, GenerateResult *res,
+                        const std::vector<i32> &ids, f64 *prefill_ms,
+                        f64 *decode_ms, i64 *decode_steps);
     // The DFlash variant: the drafter is a head set, not an engine, so the
     // proposals come from a masked block instead of a second model's decode
     // loop, and the target's captured activations are what feed it.

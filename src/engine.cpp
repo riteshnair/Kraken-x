@@ -14349,6 +14349,274 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
     return true;
 }
 
+// ---------------------------------------------------------------------------
+//  N-gram (prompt-lookup) speculation.
+//
+//  Why this exists: a decode step on this box is a BANDWIDTH limit, not a
+//  compute one. Qwen3.8-4B-Q4_K reads 2.51 GB of weights per token, the machine
+//  measures 26.5 GB/s of achievable read bandwidth, and 8 threads already reach
+//  10.4 tok/s = 26.1 GB/s. The kernel is 70-93% of the single-core wall. Nothing
+//  instruction-level is left. The one way past a bytes-per-token wall without
+//  changing the weight format is to make a single read of the weights serve
+//  several tokens, which is what a verified multi-token round does.
+//
+//  Every other speculative path here needs a DRAFTER -- a second model, a nextn
+//  block, a DFlash head set, an EAGLE head -- and on this box they are either
+//  absent for a given file or broken (measured self-draft acceptance 27.8%).
+//  This one needs nothing: it proposes the tokens that followed the last `n`
+//  tokens the last time that same n-gram appeared in this context. Text that
+//  copies itself -- code, edits, RAG answers, structured output -- is most of
+//  the continuation; free prose simply proposes nothing and the round costs one
+//  plain decode step.
+//
+//  Correctness is absolute and cheap to check, and it is the gate this ships on:
+//  greedy verification emits exactly what plain decode would emit, so the text
+//  must be BYTE-IDENTICAL to `generate` on the same prompt and seed.
+//
+//  Round shape (target only -- there is no draft KV to keep aligned):
+//    propose   the n-gram continuation, up to k tokens
+//    pre-check proposal[0] against the target's own argmax. A miss costs one
+//              plain decode step and the block never runs.
+//    verify    ONE batched forward of the proposals, one device argmax per row
+//    accept    the longest prefix whose rows agree, plus the bonus token
+//    reject    kv_rollback to the accepted prefix
+// ---------------------------------------------------------------------------
+bool Engine::generate_ngram(const GenerateParams &p, GenerateResult *res,
+                            const std::vector<i32> &ids, f64 *prefill_ms,
+                            f64 *decode_ms, i64 *decode_steps) {
+    // Read once per request, not per round: a getenv inside the decode loop
+    // would be a per-token cost in the thing this change exists to shorten.
+    const i64 n = [] {
+        const char *e = std::getenv("KRK_NGRAM_N");
+        const long v = e ? std::atol(e) : 0;
+        return v > 0 ? static_cast<i64>(v) : 3;
+    }();
+    const i32 k = [] {
+        const char *e = std::getenv("KRK_NGRAM_K");
+        const int v = e ? std::atoi(e) : 0;
+        return v > 0 ? v : 4;
+    }();
+
+    expert_phase(ExpertCache::PhasePrefill);
+    const Timer prefill_timer;
+    for (i64 i = 0; i < static_cast<i64>(ids.size()); i += chunk_) {
+        if (cancel_requested(p)) {
+            mark_cancelled(p, res, i);
+            *prefill_ms = prefill_timer.ms();
+            return true;
+        }
+        const i32 nf = static_cast<i32>(
+            std::min<i64>(chunk_, static_cast<i64>(ids.size()) - i));
+        const bool last = (i + nf) == static_cast<i64>(ids.size());
+        if (!forward(ids.data() + i, nf, static_cast<i32>(i), last)) {
+            res->error = forward_failure_error();
+            res->finish = FinishError;
+            return false;
+        }
+    }
+    fetch_logits();
+    *prefill_ms = prefill_timer.ms();
+    expert_phase(ExpertCache::PhaseDecode);
+
+    Sampler sampler;
+    sampler.reset(p.sampler);
+    sampler.accept(ids.data(), static_cast<int>(ids.size()));
+    TokenEmitter emit(p, tok_, sampler, res, ids);
+
+    const Timer decode_timer;
+    i64 timed_decode_steps = 0;
+    auto finish_run = [&](Finish f) {
+        res->finish = f;
+        *decode_ms = decode_timer.ms();
+        *decode_steps = timed_decode_steps;
+        emit.finish(f == FinishStop);
+    };
+
+    i64 pos = static_cast<i64>(ids.size());
+    std::vector<i32> prop(static_cast<size_t>(k), 0);
+    std::vector<f32> rows(static_cast<size_t>(k) * static_cast<size_t>(n_vocab_));
+
+    // The proposal. History is [0, pos) -- prompt followed by generated -- and
+    // the search runs BACKWARD so the most recent occurrence of the n-gram wins.
+    // A recent repeat is what a copying task actually continues; the first
+    // occurrence in a long prompt is usually a different phrase entirely.
+    const i64 n_prompt = static_cast<i64>(ids.size());
+    auto hist = [&](i64 i) -> i32 {
+        return (i < n_prompt) ? ids[static_cast<size_t>(i)]
+                              : res->tokens[static_cast<size_t>(i - n_prompt)];
+    };
+    auto propose = [&](i64 at_pos) -> i32 {
+        const i64 total = at_pos;
+        if (total < n + 1) return 0;
+        for (i64 q = total - n - 1; q >= 0; q--) {
+            bool hit = true;
+            for (i64 j = 0; j < n; j++) {
+                if (hist(q + j) != hist(total - n + j)) {
+                    hit = false;
+                    break;
+                }
+            }
+            if (!hit) continue;
+            i32 d = 0;
+            while (d < k && q + n + d < total) {
+                prop[static_cast<size_t>(d)] = hist(q + n + d);
+                d++;
+            }
+            return d;
+        }
+        return 0;
+    };
+
+    // Invariant at the top of every round: the target KV holds [0, pos) and
+    // logits_host_ predicts position pos. Identical to plain decode, so the
+    // pre-check IS the plain decode step.
+    while (res->generated < p.max_tokens && pos < kv_cap_) {
+        KRK_TIME_HOST("spec.round");
+        if (p.debug_topk > 0)
+            dump_topk(p.debug_topk, res->generated, pos, logits_host_, n_vocab_);
+        const i32 first = argmax_of(logits_host_, n_vocab_);
+
+        // ---- propose -------------------------------------------------------
+        i32 d = propose(pos);
+        while (d > 0 && pos + d > kv_cap_) d--;
+        draft_proposed_ += static_cast<u64>(d);
+        spec_steps_++;
+        timed_decode_steps++;
+
+        // ---- pre-check: does the target agree with the first proposal? -----
+        // A miss costs exactly one plain decode step (the block never runs), so
+        // a bad n-gram is cheaper here than in every drafter that has to build a
+        // proposal first.
+        if (d == 0 || first != prop[0]) {
+            if (first == tok_.eos()) {
+                finish_run(FinishEos);
+                return true;
+            }
+            emit.accept(first);
+            if (pos + 1 >= kv_cap_) {
+                finish_run(FinishContext);
+                return true;
+            }
+            if (!forward(&first, 1, static_cast<i32>(pos), true)) {
+                res->error = forward_failure_error();
+                finish_run(FinishError);
+                return false;
+            }
+            pos++;
+            fetch_logits();
+            continue;
+        }
+
+        // ---- verify: one batched forward of the proposals ------------------
+        i32 d_eff = d;
+        while (d_eff > 0 && pos + d_eff > kv_cap_) d_eff--;
+        if (d_eff <= 0) {
+            finish_run(FinishContext);
+            return true;
+        }
+        if (!forward_core(prop.data(), d_eff, static_cast<i32>(pos), LogitsNone)) {
+            res->error = forward_failure_error();
+            finish_run(FinishError);
+            return false;
+        }
+        kv_pos_ = pos + d_eff;
+        // One argmax per verified row, on the device where there is one. The
+        // whole-row download is the CPU-backend path and is why rows[] exists.
+        std::vector<i32> row_ids(static_cast<size_t>(d_eff), 0);
+        for (i32 j = 0; j < d_eff; j++) {
+            head_compute(j);
+            i32 id = 0;
+            if (!topk_argmax(&id)) {
+                be_->sync();
+                be_->download_f32(rows.data() + static_cast<size_t>(j) * n_vocab_,
+                                  ws_logits_, n_vocab_);
+                id = argmax_of(rows.data() + static_cast<size_t>(j) * n_vocab_,
+                               n_vocab_);
+            }
+            row_ids[static_cast<size_t>(j)] = id;
+        }
+        auto row_pred = [&](i32 j) {  // argmax of block row j (1-based)
+            return row_ids[static_cast<size_t>(j - 1)];
+        };
+
+        // ---- accept the longest greedy-matching prefix ---------------------
+        i32 a = 1;  // prop[0] passed the pre-check
+        while (a < d_eff && row_pred(a) == prop[static_cast<size_t>(a)]) a++;
+        const bool full = (a == d_eff);
+
+        bool stop_hit = false;
+        i32 emitted = 0;
+        for (i32 j = 0; j < a; j++) {
+            if (res->generated >= p.max_tokens) break;
+            const i32 t = prop[static_cast<size_t>(j)];
+            // An accepted proposal is still a generated token, and the plain
+            // loop tests the end token BEFORE emitting it.
+            if (t == tok_.eos()) {
+                kv_rollback(pos + emitted);
+                finish_run(FinishEos);
+                return true;
+            }
+            draft_accepted_++;
+            stop_hit = emit.accept(t);
+            emitted++;
+            if (stop_hit) break;
+        }
+        if (stop_hit) {
+            kv_rollback(pos + emitted);
+            finish_run(FinishStop);
+            return true;
+        }
+
+        if (full && res->generated < p.max_tokens) {
+            // Full match: row d predicts the bonus token for pos+d.
+            const i32 bonus = row_pred(d_eff);
+            if (bonus == tok_.eos()) {
+                kv_rollback(pos + emitted);
+                finish_run(FinishEos);
+                return true;
+            }
+            emit.accept(bonus);
+            emitted++;
+            if (pos + emitted < kv_cap_ && res->generated < p.max_tokens) {
+                const i32 b = res->tokens.back();
+                if (!forward(&b, 1, static_cast<i32>(pos + emitted - 1), true)) {
+                    res->error = forward_failure_error();
+                    finish_run(FinishError);
+                    return false;
+                }
+                fetch_logits();
+            }
+        }
+        if (full && res->generated >= p.max_tokens) kv_rollback(pos + emitted);
+        // A partial accept leaves rows for rejected proposals in the cache; the
+        // next round would attend to them.
+        if (!full) kv_rollback(pos + emitted);
+        pos += emitted;
+
+        if (res->generated >= p.max_tokens) {
+            finish_run(FinishLength);
+            return true;
+        }
+        if (pos + 1 >= kv_cap_) {
+            finish_run(FinishContext);
+            return true;
+        }
+
+        // The target's logits must predict pos again. After a partial accept
+        // that is block row `emitted` (1-based), which is no longer in rows[]
+        // once the argmax is taken on the device -- one head gemm and one
+        // download, exactly as the draft round does it.
+        if (!full && emitted >= 1) {
+            head_compute(emitted - 1);
+            if (spec_row_sync()) be_->sync();
+            be_->download_f32(logits_host_, ws_logits_, n_vocab_);
+        }
+    }
+
+    finish_run(res->generated >= p.max_tokens ? FinishLength : FinishContext);
+    return true;
+}
+
 // The DFlash round. Same shape as generate_speculative -- greedy-only, one
 // batched verification per round, longest matching prefix kept -- with the
 // proposal side replaced. A DFlash drafter cannot be asked "what comes next":
@@ -15035,6 +15303,32 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
                  "not positive, which is the greedy limit, and greedy with a head "
                  "is taken by the branch above");
     }
+
+    // N-gram (prompt-lookup) speculation needs no drafter at all, so it goes
+    // ahead of the paths that need one: proposals are the tokens that followed
+    // this n-gram the last time it appeared. Greedy only (verification is a
+    // prefix match), and refused on a delta-rule recurrent target because a
+    // partial rewind has no inverse there -- the same rule kv_rollback
+    // enforces. A file that cannot speculate decodes plainly rather than
+    // warning: that is not a misconfiguration, it is the ceiling.
+    {
+        const char *ng = std::getenv("KRK_NGRAM");
+        if (ng && ng[0] == '1' && p.sampler.greedy &&
+            !(model_.is_recurrent() && !model_.has_lfm_conv())) {
+            f64 prefill_ms = 0, decode_ms = 0;
+            i64 decode_steps = 0;
+            const bool ok = generate_ngram(p, res, ids, &prefill_ms, &decode_ms,
+                                           &decode_steps);
+            res->prefill_ms = prefill_ms;
+            res->decode_ms = decode_ms;
+            res->decode_steps = decode_steps;
+            return ok;
+        }
+    }
+    if (const char *ng = std::getenv("KRK_NGRAM"))
+        if (ng[0] == '1' && model_.is_recurrent() && !model_.has_lfm_conv())
+            KRK_WARN("n-gram speculation needs a reversible cache and a "
+                     "delta-rule recurrent target has none; decoding plainly");
 
     // Greedy-only fast path: with a draft loaded and argmax sampling requested,
     // speculative decoding produces bit-identical output to the plain loop, so
