@@ -79,7 +79,15 @@ struct EngineConfig {
     // with one f32 scale per 32 values, see KvQuant in backend.hpp. The CPU
     // reference implements both; a backend that cannot read the layout refuses
     // the run by name instead of running f16 kernels over int8 bytes.
-    i32 kv_quant = 0;
+    i32 kv_quant = 2; // 0 = f16, 1 = int8, 2 = turbo3 (default), 3 = rot4 (experimental)
+    // Expert index path. Empty means `<model_path>.krakenexperts.json`; a
+    // workload tag (`--profile coder`) points it at a per-workload file so two
+    // workloads never blend into one ranking.
+    std::string expert_index_path;
+    // True when --kv-quant came from the caller. A default that a model cannot
+    // use (MLA, or a run with a nextn/draft block) falls back to f16 with a
+    // warning; an EXPLICIT request for a format the run cannot use is refused.
+    bool kv_quant_explicit = false;
 
     // Dense weight budget in MiB. 0 (the default) is automatic: weights stay
     // resident while they fit, and whole layers are streamed from the file once
@@ -1250,6 +1258,10 @@ private:
     size_t mtp_rec_snap_bytes_ = 0;
     size_t mtp_conv_snap_bytes_ = 0;
     i64 mtp_kv_dim_ = 0;
+    // Bytes per cached position for the nextn block's K and V planes. Equals
+    // mtp_kv_dim_ * act_size for an f16 cache and the packed row size for
+    // turbo3/rot4/int8, so the block's append and read agree with the sizing.
+    i64 mtp_kv_row_ = 0;
     void *mtp_kv_k_ = nullptr;
     void *mtp_kv_v_ = nullptr;
     void *mtp_hidden_ = nullptr; // [kv_cap, n_embd] pre-final-norm rows

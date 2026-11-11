@@ -9,13 +9,17 @@
 // type instead of assuming f16.
 #include "krk/backend.hpp"
 #include "krk/kernel_time.hpp"
+#include "krk/turbo_kv.hpp"
 #include "krk/hc.hpp"
 #include "krk/vram_guard.hpp"
 #include "npu/npu_offload.hpp"
 #include "par_pool.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cfloat>
+#include <cstring>
+#include <memory>
 #include <mutex>
 #include <unordered_map> // FLT_MAX bounding the SIMT/CPU rsqrt and the clamp paths
 #include <cmath>
@@ -68,14 +72,55 @@ inline const char *dtype_tag_rn(DType t, i64 n_in) {
 // (~57 MFLOP) and attention at context length do not. The pool's
 // spin-then-park wake policy makes the round trip nearly free when
 // ops arrive back to back, so the floor can stay low.
-constexpr f64 kParFlopFloor = 1.0e5;
-
 // The gated delta net's short convolution is a fixed 4-tap FIR in the shipped
 // checkpoints; 16 is a generous ceiling that still keeps the rolling window on
 // the stack.
 constexpr i64 kMaxConvKernel = 16;
 
 inline f32 silu_scalar(f32 x) { return x / (1.0f + std::exp(-x)); }
+
+// Below this many estimated flops, the pool round trip costs more
+// than the computation, so ops stay serial. Decode's elementwise ops
+// (RMSNorm over one 576-wide row, RoPE over 9 heads, silu_mul over
+// 1536 lanes) fall under the floor; every GEMM, the head GEMV
+// (~57 MFLOP) and attention at context length do not. The pool's
+// spin-then-park wake policy makes the round trip nearly free when
+// ops arrive back to back, so the floor can stay low.
+constexpr f64 kParFlopFloor = 1.0e5;
+
+// Above this much work a call is worth every core on the box; below it the
+// participant count is capped to the PHYSICAL performance-core count.
+//
+// A decode step is a chain of par_for barriers, so every region waits for its
+// slowest participant. On a 4P+8E+2LP-E Meteor Lake the logical P width is 8
+// (four cores plus their SMT siblings) and the full width is 14-18, so a wide
+// split puts an SMT sibling of a busy core, or an E-core at half the clock, on
+// the critical path of every layer. Measured on GLM-4.7-Flash, decode:
+//   4 participants (one per physical P core)  713 ms/step
+//   8 participants (P + HT, the old default)  816 ms/step
+//  14 participants (+ E cores)               1435 ms/step
+// while PREFILL measured the opposite (14 threads 7.7 s against 12.1 s on the
+// 35B), because a chunk's GEMMs are big enough to amortise the barrier. Hence
+// a width that depends on the size of the work, not one global thread count.
+// KRK_CPU_SMALL_WIDTH overrides the cap for an A/B (0 = no cap).
+constexpr f64 kParSmallFloor = 1.0e8;
+
+inline i64 par_small_width() {
+    static const i64 v = [] {
+        if (const char *e = std::getenv("KRK_CPU_SMALL_WIDTH")) {
+            const long n = std::atol(e);
+            if (n >= 0) return static_cast<i64>(n);
+        }
+        // OFF by default, and that is a measurement rather than caution: an
+        // interleaved order-balanced A/B of 5 pairs on GLM-4.7-Flash read
+        // 1271 ms/step capped to the physical P count against 1058 uncapped --
+        // the cap is 20% SLOWER. The earlier single-run evidence that suggested
+        // otherwise (4 -> 713, 8 -> 816, 14 -> 1435) was page-cache noise: the
+        // same configuration has since produced 713 and 1435 ms/step.
+        return i64(0);
+    }();
+    return v;
+}
 
 // Parallel-for over disjoint index ranges. `est_flops` gates pool use;
 // the serial fallback skips std::function construction entirely.
@@ -87,7 +132,8 @@ inline void par_for(i64 n, i64 grain, f64 est_flops, F &&body) {
     // differently, and this backend's whole contract is that its numbers do
     // not depend on how the work was scheduled).
     const bool split = est_flops >= kParFlopFloor && grain >= 1;
-    Pool::get().run(n, grain, split, std::forward<F>(body));
+    const i64 cap = est_flops < kParSmallFloor ? par_small_width() : 0;
+    Pool::get().run(n, grain, split, std::forward<F>(body), cap);
 }
 
 #if defined(KRK_DOT_AVX2)
@@ -524,8 +570,12 @@ public:
     // backend, and null for the plain reference backend. Only the GEMM path
     // consults it -- see npu_offload.hpp for why that is the whole of the
     // hand-over and not the first slice of a larger one.
-    explicit CpuBackend(const DeviceCaps &c, npu::Offload *npu = nullptr)
-        : caps_(c), npu_(npu) {}
+    explicit CpuBackend(const DeviceCaps &c, npu::Offload *npu = nullptr,
+                        BackendKind kind_override = BackendKind::CPU,
+                        std::string desc = {})
+        : caps_(c), npu_(npu), kind_(kind_override), desc_(std::move(desc)) {
+        if (npu_) kind_ = BackendKind::NPU;
+    }
     ~CpuBackend() override {
         if (npu_) npu::destroy(npu_);
     }
@@ -542,8 +592,28 @@ public:
         if (npu_) npu::flush(npu_);
     }
 
-    BackendKind kind() const override {
-        return npu_ ? BackendKind::NPU : BackendKind::CPU;
+    BackendKind kind() const override { return kind_; }
+    std::string describe() const override {
+        std::string base;
+        if (!desc_.empty()) base = desc_;
+        else if (kind_ == BackendKind::NPU) base = caps_.name;
+        else if (kind_ == BackendKind::Intel) base = "Intel Meteor Lake (AVX2/VNNI, host copy)";
+        else base = "CPU (scalar reference)";
+
+        const auto &topo = Pool::get().topology();
+        const i64 active = Pool::get().workers();
+        std::string ts = format("%lld", static_cast<long long>(active));
+        if (static_cast<i64>(topo.order.size()) != active && !topo.order.empty())
+            ts += format("/%lld", static_cast<long long>(topo.order.size()));
+        ts += " threads";
+        if (topo.hybrid)
+            ts += format(" (%lldP+%lldE)", static_cast<long long>(topo.n_fast),
+                         static_cast<long long>(topo.n_slow));
+        ts += topo.pinned ? ", pinned" : ", unpinned";
+        if (kind_ == BackendKind::NPU && npu_)
+            return format("CPU (scalar reference) + %s, %s, %s",
+                          npu::describe(npu_).c_str(), caps_.gfx.c_str(), ts.c_str());
+        return format("%s, %s, %s", base.c_str(), caps_.gfx.c_str(), ts.c_str());
     }
     const DeviceCaps &caps() const override { return caps_; }
     // The device computes in place on the memory it is handed, so there is no
@@ -551,6 +621,122 @@ public:
     // streaming to plan against.
     bool has_device_memory() const override { return false; }
     bool host_load_supported() const override { return true; }
+    // The host is the compute device, so the file's mapping IS the weight
+    // buffer. The VNPU split reads host pointers too, so it inherits this.
+    // Only the plain reference/Intel host path qualifies: a backend that ever
+    // gains a real device tier must answer false.
+    bool weights_in_place() const override { return true; }
+
+    // ---- weight pull: read() instead of faulting the mapping ----------------
+    //
+    // A cold expert is three slices of ~0.6 MiB. Copying them straight out of
+    // the mapping faults those pages into THIS PROCESS'S working set, and
+    // Windows does not trim an actively-read read-only mapping while the run
+    // keeps touching it. Measured on Qwen3.5-35B-A3B (1.5 GiB expert budget):
+    // every cold miss added a private slot AND a resident mapping page, and
+    // the process working set read 8.03 GiB beside a 4.42 GiB private heap.
+    //
+    // A ReadFile into the slot copies through the system file cache instead:
+    // the destination is memory the process already owned, so the working set
+    // gains nothing, and the file's pages are reclaimable cache no process is
+    // charged for. Same bytes, same answer -- one copy less, and the missing
+    // copy is the difference between a bounded run and one that looks like it
+    // is eating the machine.
+    //
+    // `KRK_WARM_READ=memcpy` restores the old path for an A/B.
+    void set_weight_sources(const std::vector<WeightSource> &sources) override {
+        std::lock_guard<std::mutex> g(read_mu_);
+        sources_ = sources;
+    }
+    // One reader handle per (thread, path). No lock, and two threads never
+    // share a HANDLE -- on Windows a handle serialises concurrent ReadFile
+    // calls, which is why the load pipeline gives each reader its own.
+    struct ThreadReaders {
+        std::vector<std::pair<std::string, std::unique_ptr<FileReader>>> by_path;
+        FileReader *get(const std::string &path) {
+            for (auto &kv : by_path)
+                if (kv.first == path) return kv.second.get();
+            auto up = std::make_unique<FileReader>();
+            if (!up->open(path)) return nullptr;
+            by_path.emplace_back(path, std::move(up));
+            return by_path.back().second.get();
+        }
+    };
+    static ThreadReaders &thread_readers() {
+        static thread_local ThreadReaders t;
+        return t;
+    }
+    bool read_host(void *dst, const void *mapped_src, size_t bytes) override {
+        if (!dst || !mapped_src || bytes == 0) return true;
+        static const bool pull = [] {
+            const char *e = std::getenv("KRK_WARM_READ");
+            if (e && std::strcmp(e, "memcpy") == 0) return false;
+            return true;
+        }();
+        if (!pull) {
+            std::memcpy(dst, mapped_src, bytes);
+            return false;
+        }
+        const size_t src = source_index(mapped_src);
+        if (src == static_cast<size_t>(-1)) {
+            std::memcpy(dst, mapped_src, bytes);
+            return false;
+        }
+        const WeightSource &s = sources_[src];
+        const size_t off = static_cast<const u8 *>(mapped_src) - s.map_base;
+        FileReader *r = thread_readers().get(s.path);
+        if (!r || !r->at(off, dst, bytes)) {
+            ++read_fail_;
+            std::memcpy(dst, mapped_src, bytes);
+            return false;
+        }
+        return true;
+    }
+
+    // A batch is issued CONCURRENTLY. One expert is three slices and one layer
+    // routes to four experts, so a serial read leaves the memory controller
+    // idle for most of a 20 ms layer. Measured on GLM-4.7-Flash with the serial
+    // path: the expert loop took 19.9 ms of every layer for ~21 MB of weight
+    // traffic (~1 GB/s), with the read making up ~60% of the step, while the
+    // router GEMM it surrounds was 0.135 ms. The destination ranges are disjoint
+    // by contract, so the reads are independent; each runs on its own thread
+    // with its own handle, and none takes a lock.
+    // KRK_READ_THREADS caps the width (default 4, 0 = serial).
+    void read_host_batch(const ReadReq *reqs, int n) override {
+        if (!reqs || n <= 0) return;
+        static const int cap = [] {
+            const char *e = std::getenv("KRK_READ_THREADS");
+            if (e && *e) {
+                const long v = std::atol(e);
+                return v >= 0 ? static_cast<int>(v) : 4;
+            }
+            return 4;
+        }();
+        const int width = cap < 1 ? 1 : (n < cap ? n : cap);
+        if (n == 1 || width <= 1) {
+            for (int i = 0; i < n; i++)
+                if (reqs[i].bytes)
+                    read_host(reqs[i].dst, reqs[i].mapped_src, reqs[i].bytes);
+            return;
+        }
+        // Static hand-out via an atomic index: the requests are all the same
+        // size class, and a work queue would cost more than the imbalance it
+        // removes. The calling thread takes part rather than idling.
+        std::atomic<int> next{0};
+        auto drain = [&] {
+            for (;;) {
+                const int i = next.fetch_add(1, std::memory_order_relaxed);
+                if (i >= n) break;
+                if (reqs[i].bytes)
+                    read_host(reqs[i].dst, reqs[i].mapped_src, reqs[i].bytes);
+            }
+        };
+        std::vector<std::thread> th;
+        th.reserve(static_cast<size_t>(width - 1));
+        for (int w = 1; w < width; w++) th.emplace_back(drain);
+        drain();
+        for (auto &t : th) t.join();
+    }
     DType act_type() const override { return DType::F32; }
     size_t act_size() const override { return 4; }
 
@@ -574,6 +760,23 @@ public:
     size_t pool_free_bytes_ = 0, pool_reuse_ = 0, pool_alloc_ = 0, pool_free_n_ = 0,
            pool_drop_ = 0;
     std::atomic<size_t> pool_budget_{0};
+
+    // ---- weight-pull state (see read_host) --------------------------------
+    size_t source_index(const void *p) const {
+        if (sources_.empty()) return static_cast<size_t>(-1);
+        const u8 *q = static_cast<const u8 *>(p);
+        for (size_t i = 0; i < sources_.size(); i++) {
+            const u8 *lo = sources_[i].map_base;
+            if (lo && q >= lo && q < lo + sources_[i].map_size) return i;
+        }
+        return static_cast<size_t>(-1);
+    }
+    mutable std::mutex read_mu_;
+    std::vector<WeightSource> sources_;
+    std::vector<std::unique_ptr<FileReader>> readers_;
+    std::mutex slot_mu_[4];
+    std::atomic<size_t> rr_{0};
+    mutable std::atomic<size_t> read_fail_{0};
 
     void *alloc(size_t bytes) override { return host_alloc(bytes); }
     void release(void *p) override { npu_flush_(); host_free(p); }
@@ -654,7 +857,18 @@ public:
     }
     void upload(void *dst, const void *src, size_t bytes, size_t off) override {
         npu_flush_();
-        std::memcpy(static_cast<char *>(dst) + off, src, bytes);
+        void *d = static_cast<char *>(dst) + off;
+        // A copy OUT OF THE WEIGHT MAPPING is the cold-expert path, and doing it
+        // with memcpy faults those pages into this process's working set. On the
+        // 35B MoE at a 1.5 GiB expert budget that was ~4 GiB of mapping pages
+        // beside a 2 GiB heap. read_host() turns it into a ReadFile through the
+        // system file cache, which the process is not charged for. Every other
+        // caller passes an ordinary heap/activation pointer and keeps memcpy.
+        if (bytes && src && source_index(src) != static_cast<size_t>(-1)) {
+            read_host(d, src, bytes);
+            return;
+        }
+        std::memcpy(d, src, bytes);
     }
     void download(void *dst, const void *src, size_t bytes, size_t off) override {
         npu_flush_();
@@ -694,27 +908,6 @@ public:
     }
     bool preparing() const override { return npu_ && npu::preparing(npu_); }
 
-    std::string describe() const override {
-        // Report placement and the active thread count: on a hybrid host this
-        // line is the difference between "why is it slow" and "it is on the E
-        // cores", and the active count matters because the topology can be
-        // larger than the pool (P-cluster default on hybrid).
-        const auto &topo = Pool::get().topology();
-        const i64 active = Pool::get().workers();
-        std::string ts = format("%lld", static_cast<long long>(active));
-        if (static_cast<i64>(topo.order.size()) != active && !topo.order.empty())
-            ts += format("/%lld", static_cast<long long>(topo.order.size()));
-        ts += " threads";
-        if (topo.hybrid)
-            ts += format(" (%lldP+%lldE)", static_cast<long long>(topo.n_fast),
-                         static_cast<long long>(topo.n_slow));
-        ts += topo.pinned ? ", pinned" : ", unpinned";
-        const std::string place = ts;
-        if (npu_)
-            return format("CPU (scalar reference) + %s, %s, %s",
-                          npu::describe(npu_).c_str(), caps_.gfx.c_str(), place.c_str());
-        return format("CPU (scalar reference), %s, %s", caps_.gfx.c_str(), place.c_str());
-    }
     // No card here, so the memory policy has nothing to measure and would take
     // its "cannot say" path for every run. `KRK_VRAM_TOTAL_MB` says "behave as if
     // the card were N MiB", which is what lets the expert-budget refusal be
@@ -1663,11 +1856,21 @@ public:
     // chunk it arrived in: that is what keeps a chunked prefill and a decode
     // step agreeing on a quantized cache.
     bool kv_quant_supported(KvQuant q) const override {
-        return q == KvQuant::F16 || q == KvQuant::Int8;
+        return q == KvQuant::F16 || q == KvQuant::Int8 ||
+               q == KvQuant::Turbo3 || q == KvQuant::Rot4;
     }
 
-    size_t kv_row_bytes(i64 kv_dim, KvQuant q) const override {
-        if (q == KvQuant::F16) return static_cast<size_t>(kv_dim) * sizeof(f32);
+    size_t kv_row_bytes(i64 kv_dim, KvQuant q, i64 hd = 0) const override {
+        if (q == KvQuant::F16) return static_cast<size_t>(kv_dim) * 2;
+        if (q == KvQuant::Turbo3 || q == KvQuant::Rot4) {
+            // Per kv head: turbo3 is ceil(hd/8)*3 code bytes + one f32 scale,
+            // rot4 is (hd/32)*18 (16 nibble bytes + one f16 scale per block).
+            const i64 per = hd > 0 ? hd : (kv_dim > 0 ? kv_dim : 1);
+            const i64 heads = per > 0 ? (kv_dim + per - 1) / per : 1;
+            const krk::KvPack kind = q == KvQuant::Rot4 ? krk::KvPack::Rot4
+                                                        : krk::KvPack::Turbo3;
+            return static_cast<size_t>(heads) * krk::pk_row_bytes(per, kind);
+        }
         const size_t blocks = static_cast<size_t>((kv_dim + 31) / 32);
         return static_cast<size_t>(kv_dim) + blocks * sizeof(f32);
     }
@@ -1676,6 +1879,74 @@ public:
                    const AttnDesc &d) override {
         KRK_KTIME("kv_append");
         npu_flush_();
+        if (d.kv_turbo || d.kv_rot4) {
+            // Packed cache in the ROTATED basis: turbo3 (one row scale) or
+            // rot4 (a Q4_0 block scale per 32 values). One body for both -- the
+            // rotation, the address arithmetic and the seed are identical; only
+            // the quantizer differs, and KvPack selects it.
+            const krk::KvPack kind =
+                d.kv_rot4 ? krk::KvPack::Rot4 : krk::KvPack::Turbo3;
+            const i64 hd = d.hd;
+            const i64 rowb = static_cast<i64>(krk::pk_row_bytes(hd, kind));
+            const i64 kv_dim = d.n_kv * hd;
+            u8 *kc = static_cast<u8 *>(kcache) + d.layer * d.layer_stride;
+            u8 *vc = static_cast<u8 *>(vcache) + d.layer * d.layer_stride;
+            const f32 *ks = static_cast<const f32 *>(k);
+            const f32 *vs = static_cast<const f32 *>(v);
+            par_for(2 * d.n_tok * d.n_kv, 1,
+                    4.0 * static_cast<f64>(d.n_tok * d.n_kv) *
+                        static_cast<f64>(hd),
+                    [&](i64 b, i64 e) {
+                        std::vector<f32> rot(static_cast<size_t>(hd));
+                        for (i64 u = b; u < e; u++) {
+                            const bool is_v = u >= d.n_tok * d.n_kv;
+                            const i64 r = is_v ? u - d.n_tok * d.n_kv : u;
+                            const i64 t = r / d.n_kv;
+                            const i64 h = r - t * d.n_kv;
+                            const f32 *src = (is_v ? vs : ks) +
+                                             t * kv_dim + h * hd;
+                            u8 *row = (is_v ? vc : kc) + attn_kv_base(d, t) +
+                                      attn_pos(d, t) * d.pos_stride + h * rowb;
+                            krk::pk_quant_row(
+                                src, hd,
+                                krk::turbo_seed(static_cast<i32>(d.layer),
+                                                static_cast<i32>(h)),
+                                kind, row, rot.data());
+                            // KRK_KV_PROBE=1: read the row straight back, undo
+                            // the rotation and compare with the vector that
+                            // went in. This is the only check that exercises the
+                            // engine's own addressing (pos_stride, head stride,
+                            // rowb) rather than the kernel in isolation, and a
+                            // stride that is one byte short reads as "the first
+                            // token is right and later ones drift".
+                            if (std::getenv("KRK_KV_PROBE")) {
+                                static std::atomic<int> probes{0};
+                                if (probes.fetch_add(1) < 6) {
+                                    std::vector<f32> chk(static_cast<size_t>(hd));
+                                    std::vector<f32> back(static_cast<size_t>(hd));
+                                    krk::pk_decode_row(row, hd, kind, chk.data());
+                                    krk::turbo_unrotate(chk.data(), back.data(), hd,
+                                                        krk::turbo_seed(
+                                                            static_cast<i32>(d.layer),
+                                                            static_cast<i32>(h)));
+                                    f32 mx = 0.0f, den = 0.0f;
+                                    for (i64 i = 0; i < hd; i++) {
+                                        mx = std::max(mx, std::fabs(back[i] - src[i]));
+                                        den = std::max(den, std::fabs(src[i]));
+                                    }
+                                    KRK_INFO("kv probe: L%d t=%lld h=%lld kind=%d "
+                                             "pos_stride=%lld rowb=%lld rel=%.5f",
+                                             (int)d.layer, (long long)t,
+                                             (long long)h, (int)kind,
+                                             (long long)d.pos_stride,
+                                             (long long)rowb,
+                                             den > 0 ? (double)(mx / den) : 0.0);
+                                }
+                            }
+                        }
+                    });
+            return;
+        }
         if (d.kv_int8) {
             const i64 kv_dim = d.n_kv * d.hd;
             u8 *kc = static_cast<u8 *>(kcache) + d.layer * d.layer_stride;
@@ -1877,9 +2148,10 @@ public:
         // densely. An int8 cache is a different layout altogether and is
         // refused rather than reinterpreted.
         if (d.key_runs != nullptr && d.n_key_runs > 0) {
-            if (d.kv_int8) {
-                KRK_WARN("block-sparse attention with an int8 cache is not "
-                         "implemented; refusing rather than attending densely");
+            if (d.kv_int8 || d.kv_turbo || d.kv_rot4) {
+                KRK_WARN("block-sparse attention with a packed KV cache (int8 or "
+                         "turbo3) is not implemented; refusing rather than "
+                         "attending densely");
                 std::memset(out, 0, static_cast<size_t>(d.n_tok) * d.n_head * d.hd * 4);
                 return;
             }
@@ -1914,6 +2186,115 @@ public:
             if (npu::attention(npu_, c)) return;
         }
         const i64 n_rep = d.n_kv > 0 ? d.n_head / d.n_kv : 1;
+        if (d.kv_turbo || d.kv_rot4) {
+            // Packed cache in the ROTATED basis. turbo3 stores one scale per
+            // row, rot4 stores one per 32-value Q4_0 block; the arithmetic
+            // around them is identical. Because H is orthogonal the query is
+            // rotated once per (token, kv head) and no key is ever rotated on
+            // the way out; the value sum accumulates in the same basis and is
+            // rotated back ONCE per (token, head), since
+            // sum(p_i * H v_i) = H sum(p_i * v_i).
+            const krk::KvPack kind =
+                d.kv_rot4 ? krk::KvPack::Rot4 : krk::KvPack::Turbo3;
+            if (std::getenv("KRK_KV_PROBE")) {
+                static std::atomic<int> rd{0};
+                if (rd.fetch_add(1) < 4)
+                    KRK_INFO("kv read: L%d kind=%d turbo=%d rot4=%d int8=%d "
+                             "pos_stride=%lld rowb=%lld n_kv=%lld hd=%lld",
+                             (int)d.layer, (int)kind, (int)d.kv_turbo,
+                             (int)d.kv_rot4, (int)d.kv_int8,
+                             (long long)d.pos_stride,
+                             (long long)krk::pk_row_bytes(d.hd, kind),
+                             (long long)d.n_kv, (long long)d.hd);
+            }
+            const i64 hd = d.hd;
+            const i64 rowb = static_cast<i64>(krk::pk_row_bytes(hd, kind));
+            const f32 *qf = static_cast<const f32 *>(q);
+            const u8 *kc =
+                static_cast<const u8 *>(kcache) + d.layer * d.layer_stride;
+            const u8 *vc =
+                static_cast<const u8 *>(vcache) + d.layer * d.layer_stride;
+            f32 *of = static_cast<f32 *>(out);
+            const i64 units = d.n_tok * d.n_head;
+            par_for(units, 1,
+                    4.0 * static_cast<f64>(units) * (d.pos0 + d.n_tok) * hd,
+                    [&](i64 b, i64 e) {
+                        std::vector<f32> scores;
+                        std::vector<f32> qr(static_cast<size_t>(hd));
+                        std::vector<f32> acc(static_cast<size_t>(hd));
+                        std::vector<f32> vrow(static_cast<size_t>(hd));
+                        for (i64 u = b; u < e; u++) {
+                            const i64 t = u / d.n_head;
+                            const i64 h = u - t * d.n_head;
+                            const i64 pos = attn_pos(d, t);
+                            const i64 kvb = attn_kv_base(d, t);
+                            const i64 n_keys = pos + 1;
+                            const i64 j_lo = d.window > 0
+                                                 ? std::max<i64>(0, n_keys - d.window)
+                                                 : 0;
+                            const i64 n_vis = n_keys - j_lo;
+                            const bool skip = d.skip_from >= 0 && pos >= d.skip_from;
+                            const i64 s_lo = skip ? std::max<i64>(j_lo, d.skip_from) : 0;
+                            const i64 s_hi = skip ? std::min<i64>(pos, n_keys) : 0;
+                            scores.resize(static_cast<size_t>(n_vis));
+                            const i64 hkv = n_rep > 0 ? h / n_rep : 0;
+                            const uint32_t seed = krk::turbo_seed(
+                                static_cast<i32>(d.layer), static_cast<i32>(hkv));
+                            const bool alibi = d.alibi_max_bias > 0.0f;
+                            const f32 slope =
+                                alibi ? alibi_slope_impl(h, d.n_head,
+                                                         d.alibi_max_bias)
+                                      : 0.0f;
+                            const f32 *qh = qf + t * (d.n_head * hd) + h * hd;
+                            krk::turbo_rotate(qh, qr.data(), hd, seed);
+                            for (i64 j = 0; j < n_vis; j++) {
+                                if (s_hi > s_lo && j_lo + j >= s_lo &&
+                                    j_lo + j < s_hi) {
+                                    scores[static_cast<size_t>(j)] = -FLT_MAX;
+                                    continue;
+                                }
+                                const u8 *row = kc + kvb +
+                                                (j_lo + j) * d.pos_stride +
+                                                hkv * rowb;
+                                f32 sv = krk::pk_dot(qr.data(), row, hd, kind) * d.scale;
+                                if (d.softcap > 0.0f)
+                                    sv = d.softcap * std::tanh(sv / d.softcap);
+                                if (alibi)
+                                    sv -= slope * static_cast<f32>(pos - (j_lo + j));
+                                scores[static_cast<size_t>(j)] = sv;
+                            }
+                            f32 mx = scores[0];
+                            for (i64 j = 1; j < n_vis; j++)
+                                mx = std::max(mx, scores[static_cast<size_t>(j)]);
+                            f32 sum = 0.0f;
+                            for (i64 j = 0; j < n_vis; j++) {
+                                const f32 ex =
+                                    std::exp(scores[static_cast<size_t>(j)] - mx);
+                                scores[static_cast<size_t>(j)] = ex;
+                                sum += ex;
+                            }
+                            const f32 sink_logit = d.sinks ? d.sinks[h] : 0.0f;
+                            if (sink_logit != 0.0f) sum += std::exp(sink_logit - mx);
+                            const f32 inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+                            for (i64 i = 0; i < hd; i++)
+                                acc[static_cast<size_t>(i)] = 0.0f;
+                            for (i64 j = 0; j < n_vis; j++) {
+                                const f32 p = scores[static_cast<size_t>(j)] * inv;
+                                if (p == 0.0f) continue;
+                                const u8 *row = vc + kvb +
+                                                (j_lo + j) * d.pos_stride +
+                                                hkv * rowb;
+                                krk::pk_decode_row(row, hd, kind, vrow.data());
+                                for (i64 i = 0; i < hd; i++)
+                                    acc[static_cast<size_t>(i)] +=
+                                        p * vrow[static_cast<size_t>(i)];
+                            }
+                            f32 *oh = of + t * (d.n_head * hd) + h * hd;
+                            krk::turbo_unrotate(acc.data(), oh, hd, seed);
+                        }
+                    });
+            return;
+        }
         if (d.kv_int8) {
             // Same formulation as the f32 path, reading (signed byte x scale)
             // instead of a float. The dequantised value is what the dot and the
@@ -2657,7 +3038,7 @@ public:
         const f32 *g = static_cast<const f32 *>(gate);
         const f32 *u = static_cast<const f32 *>(up);
 #if defined(KRK_DOT_AVX2)
-        if (vec_dot_wide() && cpu_has_avx2()) {
+        if (vec_dot_wide()) {
             // Grain 4096 rather than 8192: these blocks are now cheap enough
             // that 8192 leaves one thread holding most of a 4096-wide row.
             par_for(n, 2048, 2.0 * static_cast<f64>(n),
@@ -3627,6 +4008,8 @@ private:
 
     DeviceCaps caps_;
     npu::Offload *npu_ = nullptr;
+    BackendKind kind_ = BackendKind::CPU;
+    std::string desc_;
 };
 
 Backend *make_cpu_backend() {
@@ -3655,6 +4038,19 @@ Backend *make_npu_backend(int device_index, bool whole_graph, std::string *err) 
     c.wave_size = 1; // one command at a time per stream, not lockstep lanes
     c.cu_count = 1;
     return new CpuBackend(c, o);
+}
+
+Backend *make_intel_backend(std::string *err) {
+    (void)err;
+    DeviceCaps c;
+    c.name = "Intel Meteor Lake";
+    c.gfx = "intel-mtl";
+    c.family = GfxFamily::Unknown;
+    c.wave_size = 32;
+    c.cu_count = static_cast<int>(std::thread::hardware_concurrency());
+    if (c.cu_count <= 0) c.cu_count = 1;
+    return new CpuBackend(c, nullptr, BackendKind::Intel,
+                          "Intel Meteor Lake (AVX2/VNNI, host copy)");
 }
 
 bool npu_available() { return npu::available(); }

@@ -111,6 +111,15 @@ struct CpuTopology {
     i64 max_khz = 0;
     bool hybrid = false;
     bool pinned = false;
+    // LOGICAL is not PHYSICAL: n_fast counts SMT siblings as threads (8 on a
+    // 4P+8E+2LP-E Meteor Lake), while a memory-bound decode step wants one
+    // participant per physical P core (4). A step is a chain of barriers, and
+    // each barrier waits for its slowest participant, so an SMT sibling of a
+    // busy core, or an E-core at half the clock, makes the WHOLE step slower.
+    // Measured on GLM-4.7-Flash: 4 -> 713 ms/step, 8 (P+HT) -> 816,
+    // 14 (+E) -> 1435. 0 means the OS could not tell us, and then no cap is
+    // applied anywhere.
+    i64 n_fast_phys = 0;
 
     std::string summary() const {
         if (order.empty()) return "cpu topology unknown";
@@ -169,11 +178,13 @@ inline bool detect_cpu_topology_win(CpuTopology &t, i64 hc) {
 
     struct Lp { int id; BYTE eff; };
     std::vector<Lp> lps;
+    std::vector<BYTE> core_eff;  // one entry per PHYSICAL core
     lps.reserve(static_cast<size_t>(hc));
     for (unsigned char *p = buf.data(); p < buf.data() + len; ) {
         auto *e = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *>(p);
         if (e->Relationship == RelationProcessorCore) {
             const BYTE eff = e->Processor.EfficiencyClass;
+            core_eff.push_back(eff);
             for (WORD g = 0; g < e->Processor.GroupCount; g++) {
                 const auto &gm = e->Processor.GroupMask[g];
                 KAFFINITY mask = gm.Mask;
@@ -202,6 +213,11 @@ inline bool detect_cpu_topology_win(CpuTopology &t, i64 hc) {
         if (lp.eff == max_eff) t.n_fast++; else t.n_slow++;
     }
     t.hybrid = max_eff != min_eff;
+    // One RelationProcessorCore entry per PHYSICAL core, so the count of
+    // top-class entries is the physical P-core count, not the LP count.
+    t.n_fast_phys = 0;
+    for (BYTE e : core_eff)
+        if (e == max_eff) t.n_fast_phys++;
     // If the OS reports more logical CPUs than we enumerated (multi-group box
     // we don't fully map), keep the enumeration as the preferred prefix and do
     // not claim a complete topology.
@@ -241,9 +257,15 @@ inline CpuTopology detect_cpu_topology(i64 hc) {
             else t.n_slow++;
         }
         t.hybrid = t.n_slow > 0;
+        // No per-core view on this path, so the logical count is the only
+        // answer available; treating it as physical would cap every small op at
+        // the P+HT width, which is what the engine already did. Leave 0 (no
+        // cap) so an un-inspectable box keeps its previous behaviour.
+        t.n_fast_phys = 0;
     } else {
         for (i64 i = 0; i < hc; i++) t.order.push_back(i);
         t.n_fast = hc;
+        t.n_fast_phys = 0;
     }
     return t;
 }
@@ -296,6 +318,10 @@ public:
     // Which core each participant landed on. Settled at construction and
     // re-settled by set_workers(), so it is safe to read any time.
     const CpuTopology &topology() const { return topo_; }
+    // Physical performance-core count, when the OS reported one. This is the
+    // width at which a decode-shaped op stops waiting on an SMT sibling or an
+    // E-core. 0 means unknown -> callers apply no cap.
+    i64 physical_fast() const { return topo_.n_fast_phys; }
 
     // Pin the total participant count (workers = n - 1). Retires the
     // current worker generation and spawns a new one; a no-op while a
@@ -344,7 +370,7 @@ public:
     // trampoline for both paths makes the serial case and the pooled case the
     // same machine code, so the floor can be tuned without moving a number.
     template <class F>
-    void run(i64 n, i64 grain, bool split, F &&body) {
+    void run(i64 n, i64 grain, bool split, F &&body, i64 max_parts = 0) {
         if (n <= 0) return;
         using G = typename std::remove_reference<F>::type;
         void (*const invoke)(void *, i64, i64) = [](void *ctx, i64 b, i64 e) {
@@ -356,6 +382,11 @@ public:
         i64 participants = all;
         const i64 cap = active_cap_.load(std::memory_order_acquire);
         if (cap > 0 && cap < participants) participants = cap;
+        // Per-call ceiling (see par_for's kParSmallFloor): a small op that is
+        // split wider than the physical performance cores spends its time
+        // waiting for participants that are slower than the ones it already
+        // has. `max_parts == 0` means no ceiling.
+        if (max_parts > 0 && max_parts < participants) participants = max_parts;
         if (!split || blocks <= 1 || participants <= 1) {
             invoke(&body, 0, n);
             return;

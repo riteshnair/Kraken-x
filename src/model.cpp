@@ -305,6 +305,11 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
     if (const std::vector<i32> *swa_pat =
             gguf_.get_i32_array(key(".attention.sliding_window_pattern"))) {
         cfg_.swa_pattern = *swa_pat;
+    } else {
+        std::vector<i64> swa_pat64;
+        if (gguf_.get_i64_array(key(".attention.sliding_window_pattern"), &swa_pat64)) {
+            cfg_.swa_pattern.assign(swa_pat64.begin(), swa_pat64.end());
+        }
     }
     cfg_.n_ctx_train =
         static_cast<i32>(gguf_.get_i64(key(".context_length"), 2048));
@@ -877,13 +882,15 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             if (v > mx) mx = v;
         if (mx > 0) cfg_.n_ff_exp = mx;
     }
-    // `feed_forward_length` is per-block in the same files (0 on the Mamba-2
-    // blocks, 2048/1536 on the MoE ones). Nothing routes by a dense width per
-    // layer here, so the maximum is the only safe reading: it bounds every
-    // workspace that a dense FFN block could ask for.
+    // `feed_forward_length` may be per-block (e.g. gemma4/Firefly: 6144 on
+    // early layers, 12288 on later ones; nemotron_h_moe: 0 on Mamba-2 blocks).
+    // Keep the whole vector when present so dense FFN validation and execution
+    // can use the layer's own width; cfg_.n_ff remains the maximum for workspace
+    // sizing.
     if (const std::vector<i32> *ffl =
             gguf_.get_i32_array(key(".feed_forward_length"))) {
-        i32 mx = 0;
+        cfg_.n_ff_layer = *ffl;
+        i32 mx = cfg_.n_ff;
         for (i32 v : *ffl)
             if (v > mx) mx = v;
         if (mx > 0) cfg_.n_ff = mx;
@@ -1690,6 +1697,22 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         return t;
     };
 
+    // A backend whose weights already live in host memory (the CPU reference /
+    // Intel path) reads them out of the file mapping instead of copying them.
+    // This is not a micro-optimisation: the copy doubles the trunk, and on a
+    // 20.7 GB MoE whose dense part is 2.44 GiB it costs 2.44 GiB of PRIVATE
+    // memory that a capped run cannot spare -- measured on the Qwen3.5-35B-A3B
+    // at a 4 GiB cap, the copied trunk left 512 MiB for the expert cache (3% of
+    // the routed set, 10.8% HOT) and the same bytes pointed at the mapping buy
+    // back the whole tier. The mapping is owned by `gguf_` and outlives every
+    // tensor, and every kernel only reads weights, so the pointer is as valid
+    // as an owned one. `KRK_WEIGHT_INPLACE=0` restores the copy for an A/B.
+    const bool in_place_weights = [&] {
+        if (!be.weights_in_place()) return false;
+        const char *e = std::getenv("KRK_WEIGHT_INPLACE");
+        return !(e && e[0] == '0' && e[1] == '\0');
+    }();
+
     // Uploads a tensor verbatim (quantized blocks stay packed).
     auto upload_raw = [&](const GgufTensor *t, DType as) -> QuantTensor {
         QuantTensor q;
@@ -1708,6 +1731,20 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             stream_[static_cast<size_t>(stream_layer_index_)].push_back(
                 StreamEntry{t, q.data, t->n_bytes});
             stream_bytes_total_ += t->n_bytes;
+            q.type = as;
+            q.n_in = static_cast<i64>(t->ne[0]);
+            q.n_out = t->n_dims >= 2 ? static_cast<i64>(t->ne[1]) : 1;
+            if (t->n_dims > 2) q.n_out = t->n_elements / std::max<i64>(1, q.n_in);
+            weight_bytes_ += static_cast<i64>(t->n_bytes);
+            return q;
+        }
+        // In-place host weights: the tensor's own bytes in the mapping ARE the
+        // weight buffer. No slab, no allocation, no copy -- see the note above
+        // `in_place_weights`. `data` is const in the mapping, so the cast is the
+        // same one the streaming path already makes for its ring slot; nothing
+        // in the engine writes a weight.
+        if (in_place_weights && t->data && t->n_bytes) {
+            q.data = const_cast<u8 *>(t->data);
             q.type = as;
             q.n_in = static_cast<i64>(t->ne[0]);
             q.n_out = t->n_dims >= 2 ? static_cast<i64>(t->ne[1]) : 1;
@@ -2025,15 +2062,23 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         if (has_ver) {
             HadamardPlan plan;
             const i64 ver = gguf_.get_i64("prism.hadamard.version", 0);
-            // Version 2 is the tied-output variant (the head reads the
-            // rotated embedding table); version 1 requires output.weight to
-            // be present and forbids tying.
-            if (ver != 1)
+            // Version 1: output.weight is present (not tied) and is folded.
+            // Version 2: tied-output variant (the head reads the rotated
+            // embedding table); output.weight is absent and tied to
+            // token_embd.weight. The embedding is stored rotated (inverse)
+            // and the head_folded transform is applied to the activation
+            // going into the (tied) output head.
+            if (ver != 1 && ver != 2)
                 return fail("prism.hadamard.version " + std::to_string(ver) +
-                            " is not implemented (this engine folds version 1;"
-                            " version 2 is the tied-output variant)");
-            if (gguf_.get_bool("prism.hadamard.tied_output", false))
-                return fail("prism.hadamard.tied_output is not implemented");
+                            " is not implemented (this engine folds version 1 "
+                            "and version 2, the tied-output variant)");
+            if (ver == 1 && gguf_.get_bool("prism.hadamard.tied_output", false))
+                return fail("prism.hadamard.tied_output is not implemented "
+                            "for version 1");
+            if (ver == 2 && !cfg_.tied_embeddings)
+                return fail("prism.hadamard version 2 requires a tied output "
+                            "(output.weight absent), but this file has a "
+                            "separate output.weight");
             const i64 block = gguf_.get_i64("prism.hadamard.block_size", 0);
             if (block < 64 || block > 4096 || (block & (block - 1)) != 0)
                 return fail("prism.hadamard.block_size " +
@@ -2154,10 +2199,17 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                     plan.embd_inverse = true;
                 }
             }
-            if (plan.embd_inverse && cfg_.tied_embeddings)
+            if (plan.embd_inverse && cfg_.tied_embeddings && ver == 1)
                 return fail("a latent token embedding on a TIED output needs "
                             "prism.hadamard version 2, which is not "
                             "implemented");
+
+            // Version 2 (tied output): the head reads the rotated embedding
+            // table, so the activation going into the output head must be
+            // transformed (head_folded), mirroring the folded output.weight
+            // of version 1.
+            if (ver == 2 && plan.embd_inverse)
+                plan.head_folded = true;
 
             // Sign vectors: parsed and validated against the host copy first,
             // uploaded only once nothing below can still fail.
@@ -2963,13 +3015,21 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                            std::to_string(cfg_.n_embd) + " wide";
                 return false;
             }
-            if (L.ffn_sub_norm && tf && tf->n_elements != cfg_.n_ff) {
-                if (err)
-                    *err = "layer " + std::to_string(l) + " ffn_sub_norm has " +
-                           std::to_string(tf->n_elements) +
-                           " elements; the FFN intermediate is " +
-                           std::to_string(cfg_.n_ff) + " wide";
-                return false;
+            if (L.ffn_sub_norm && tf) {
+                const i64 want_ff =
+                    (l >= 0 && l < static_cast<i32>(cfg_.n_ff_layer.size()) &&
+                     cfg_.n_ff_layer[static_cast<size_t>(l)] > 0)
+                        ? cfg_.n_ff_layer[static_cast<size_t>(l)]
+                        : cfg_.n_ff;
+                if (tf->n_elements != want_ff) {
+                    if (err)
+                        *err = "layer " + std::to_string(l) +
+                               " ffn_sub_norm has " +
+                               std::to_string(tf->n_elements) +
+                               " elements; the FFN intermediate is " +
+                               std::to_string(want_ff) + " wide";
+                    return false;
+                }
             }
         }
 
@@ -4069,7 +4129,12 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                 // flag is missed -- halves the intermediate width and gates the
                 // wrong operand, which is a wrong answer rather than a failure.
                 L.wup_fused = need(blk_key("blk.%d.ffn_up.weight", l));
-                const i64 want = 2 * static_cast<i64>(cfg_.n_ff);
+                const i64 lff =
+                    (l >= 0 && l < static_cast<i32>(cfg_.n_ff_layer.size()) &&
+                     cfg_.n_ff_layer[static_cast<size_t>(l)] > 0)
+                        ? cfg_.n_ff_layer[static_cast<size_t>(l)]
+                        : cfg_.n_ff;
+                const i64 want = 2 * lff;
                 if (L.wup_fused.n_out != want) {
                     if (err)
                         *err = "layer " + std::to_string(l) + " ffn_up is " +
@@ -4468,17 +4533,24 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         // tensor: gpt2 has ffn_up alone, every split family has ffn_gate beside
         // it, and Phi-3 has neither -- its gate and up are the two halves of
         // ffn_up, which the load above already checked is 2*n_ff wide.
+        const i64 lff =
+            (l >= 0 && l < static_cast<i32>(cfg_.n_ff_layer.size()) &&
+             cfg_.n_ff_layer[static_cast<size_t>(l)] > 0)
+                ? cfg_.n_ff_layer[static_cast<size_t>(l)]
+                : cfg_.n_ff;
         const bool ffn_width_ok =
             L.wup_fused.present()
-                ? (L.wup_fused.n_out == 2 * static_cast<i64>(cfg_.n_ff) &&
-                   L.wdown.n_in == cfg_.n_ff)
+                ? (L.wup_fused.n_out == 2 * lff && L.wdown.n_in == lff)
                 : cfg_.no_gate_ffn
-                      ? (L.wup.n_out == cfg_.n_ff && L.wdown.n_in == cfg_.n_ff)
-                      : (L.wgate.n_out == cfg_.n_ff &&
-                         L.wdown.n_in == cfg_.n_ff);
+                      ? (L.wup.n_out == lff && L.wdown.n_in == lff)
+                      : (L.wgate.n_out == L.wup.n_out &&
+                         L.wgate.n_out == lff &&
+                         L.wdown.n_in == L.wgate.n_out);
         if (!L.moe && has_dense_ffn && !ffn_width_ok) {
             if (err)
-                *err = "layer " + std::to_string(l) + " FFN tensors disagree with n_ff";
+                *err = "layer " + std::to_string(l) +
+                       " FFN tensors disagree with n_ff (expected " +
+                       std::to_string(lff) + ")";
             return false;
         }
         if (L.moe) {
@@ -4675,7 +4747,7 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
         // (1024-wide key norm against a 4096-wide embedding) with an error that
         // read like a corrupt file.
         if (cfg_.qk_norm && cfg_.head_dim > 0) {
-            const i64 per_head = cfg_.head_dim;
+            const i64 per_head = head_dim_at(l);
             const i64 q_row = static_cast<i64>(cfg_.n_head) * cfg_.head_dim;
             const i64 k_row = static_cast<i64>(cfg_.n_head_kv) * cfg_.head_dim;
             bool wide[2] = {false, false};
@@ -6265,6 +6337,18 @@ void Model::unload() {
     }
     // The expert cache owns backend allocations too; drop them first.
     experts_.clear();
+    // In-place weights point into the file mapping, which `gguf_` owns and
+    // frees on its own. Releasing an interior mapping pointer is a double free
+    // the moment the mapping goes away, so the check is the same shape as the
+    // ring / slab / promoted guards below.
+    auto in_map = [&](const void *p) {
+        for (const auto &sh : gguf_.shards()) {
+            if (!sh.file) continue;
+            const u8 *lo = sh.file->data();
+            if (lo && p >= lo && p < lo + sh.file->size()) return true;
+        }
+        return false;
+    };
     for (auto &L : layers_) {
         if (L.attn_norm) be_->release(L.attn_norm);
         if (L.attn_post_norm) be_->release(L.attn_post_norm);
@@ -6326,7 +6410,7 @@ void Model::unload() {
         };
         for (QuantTensor *q : qt_fields(L))
             if (q->present() && !in_ring(q->data) && !in_promoted(q->data) &&
-                !in_slab(q->data))
+                !in_slab(q->data) && !in_map(q->data))
                 be_->release(q->data);
         if (L.ssm_d) be_->release(L.ssm_d);
     }
@@ -6335,8 +6419,9 @@ void Model::unload() {
         if (sg.second) be_->release(sg.second);
     had_signs_.clear();
     had_ = HadamardPlan{};
-    if (tok_embd_.present()) be_->release(tok_embd_.data);
-    if (!cfg_.tied_embeddings && out_head_.present()) be_->release(out_head_.data);
+    if (tok_embd_.present() && !in_map(tok_embd_.data)) be_->release(tok_embd_.data);
+    if (!cfg_.tied_embeddings && out_head_.present() && !in_map(out_head_.data))
+        be_->release(out_head_.data);
     if (out_norm_) be_->release(out_norm_);
     if (prefetch_host_) be_->release_host(prefetch_host_);
     prefetch_host_ = nullptr;

@@ -361,6 +361,8 @@ ModelVerdict assess_model(const Gguf &g) {
     // table's Partial/No verdicts hold for a checkpoint whose arch string is
     // correct but whose tensors are from a variant nobody listed.
     for (const GgufTensor &t : g.tensors()) {
+        // QwenPU program/data blobs are not model tensors; they are ignored.
+        if (t.name.compare(0, 7, "qwenpu.") == 0) continue;
         if (const char *gap = arch_tensor_gap(t.name, shape, v.arch)) {
             add_unique(v.blockers,
                        "uses " + std::string(gap) +
@@ -373,6 +375,9 @@ ModelVerdict assess_model(const Gguf &g) {
     std::vector<std::string> bad_formats;
     std::string ms_i2s;   // first I2_S tensor from the ms converter, if any
     for (const GgufTensor &t : g.tensors()) {
+        // QwenPU program/data blobs (qwenpu.forward.*) are not weights and
+        // carry their own format (often I8/I32); they are not dequantized.
+        if (t.name.compare(0, 7, "qwenpu.") == 0) continue;
         if (!dtype_supported(t.type)) {
             const std::string name = named_dtype(t);
             if (std::find(bad_formats.begin(), bad_formats.end(), name) ==

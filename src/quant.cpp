@@ -2082,6 +2082,16 @@ bool cpu_has_vnni() {
                           __builtin_cpu_supports("avx512vnni") != 0;
     return v;
 }
+
+// 256-bit AVX-VNNI (VEX-encoded vpdpbusd, _mm256_dpbusd_epi32): available on
+// Meteor Lake, Alder Lake, Zen 4+. Distinct from avx512vnni above - the
+// encodings differ and a host may have one without the other.
+bool cpu_has_avxvnni() {
+    static const bool v = !(std::getenv("KRK_CPU_NO_AVXVNNI") &&
+                            std::getenv("KRK_CPU_NO_AVXVNNI")[0] == '1') &&
+                          __builtin_cpu_supports("avxvnni") != 0;
+    return v;
+}
 #endif // KRK_DOT_AVX2
 
 // ---------------------------------------------------------------------------
@@ -2297,6 +2307,119 @@ KRK_TARGET_ATTR("avx2,fma") void dot_q4_K_q8_x8_d(
     }
 }
 
+#if defined(__AVXVNNI__) || defined(KRK_DOT_AVXVNNI)
+// 256-bit AVX-VNNI variants: replace maddubs+madd with a single
+// vpdpbusd (u8*s8 dot, 4 products accumulated into i32) per 32-byte chunk.
+// Available on Meteor Lake, Alder Lake, Zen 4+.
+KRK_TARGET_ATTR("avx2,fma,avxvnni") f32 dot_q4_K_q8_d_avxvnni(
+    const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
+    const __m256i kLo = _mm256_set1_epi8(0x0F);
+    const __m256i ones8 = _mm256_set1_epi8(1);
+    const __m256i zero = _mm256_setzero_si256();
+    __m256 acc = _mm256_setzero_ps();
+    for (i64 nb = 0; nb < n / 256; nb++, w += 144) {
+        const f32 d = fp16_to_fp32(static_cast<u16>(w[0] | (w[1] << 8)));
+        const f32 dmin = fp16_to_fp32(static_cast<u16>(w[2] | (w[3] << 8)));
+        const u8 *sc = w + 4;
+        const u8 *qs = w + 16;
+        for (int j = 0; j < 256; j += 64) {
+            const __m256i qb = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(qs));
+            const __m256i q_lo = _mm256_and_si256(qb, kLo);
+            const __m256i q_hi = _mm256_and_si256(_mm256_srli_epi16(qb, 4), kLo);
+            const i64 base = (nb * 256) + j;
+            const __m256i x_lo = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(xq + base));
+            const __m256i x_hi = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(xq + base + 32));
+            u8 s1, m1, s2, m2;
+            get_scale_min_k4(static_cast<int>(j / 32) + 0, sc, &s1, &m1);
+            get_scale_min_k4(static_cast<int>(j / 32) + 1, sc, &s2, &m2);
+            const auto accumulate = [&](__m256i qn, __m256i xv, f32 sxk,
+                                        f32 smk) -> void {
+                const __m256i iI = _mm256_dpbusd_epi32(zero, qn, xv);
+                const __m256i iS = _mm256_dpbusd_epi32(zero, ones8, xv);
+                const __m256 fI = _mm256_cvtepi32_ps(iI);
+                const __m256 fS = _mm256_cvtepi32_ps(iS);
+                acc = _mm256_fmadd_ps(fI, _mm256_set1_ps(sxk), acc);
+                acc = _mm256_fnmadd_ps(fS, _mm256_set1_ps(smk), acc);
+            };
+            const f32 dx1 = dx[base / 32];
+            const f32 dx2 = dx[(base + 32) / 32];
+            accumulate(q_lo, x_lo, dx1 * d * static_cast<f32>(s1),
+                       dx1 * dmin * static_cast<f32>(m1));
+            accumulate(q_hi, x_hi, dx2 * d * static_cast<f32>(s2),
+                       dx2 * dmin * static_cast<f32>(m2));
+            qs += 32;
+        }
+    }
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    return _mm_cvtss_f32(lo);
+}
+
+KRK_TARGET_ATTR("avx2,fma,avxvnni") void dot_q4_K_q8_x8_d_avxvnni(
+    const u8 *w, const i8 *xq, const f32 *dx, i64 n, i64 rstride, i64 dstride,
+    f32 *out, i64 out_stride) {
+    const __m256i kLo = _mm256_set1_epi8(0x0F);
+    const __m256i ones8 = _mm256_set1_epi8(1);
+    const __m256i zero = _mm256_setzero_si256();
+    __m256 acc[8];
+    for (int r = 0; r < 8; r++) acc[r] = _mm256_setzero_ps();
+    for (i64 nb = 0; nb < n / 256; nb++, w += 144) {
+        const f32 d = fp16_to_fp32(static_cast<u16>(w[0] | (w[1] << 8)));
+        const f32 dmin = fp16_to_fp32(static_cast<u16>(w[2] | (w[3] << 8)));
+        const u8 *sc = w + 4;
+        const u8 *qs = w + 16;
+        for (int j = 0; j < 256; j += 64) {
+            const __m256i qb = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(qs));
+            const __m256i q_lo = _mm256_and_si256(qb, kLo);
+            const __m256i q_hi = _mm256_and_si256(_mm256_srli_epi16(qb, 4), kLo);
+            const i64 base = (nb * 256) + j;
+            u8 s1, m1, s2, m2;
+            get_scale_min_k4(static_cast<int>(j / 32) + 0, sc, &s1, &m1);
+            get_scale_min_k4(static_cast<int>(j / 32) + 1, sc, &s2, &m2);
+            for (i64 r = 0; r < 8; r++) {
+                const i8 *xr = xq + r * rstride;
+                const f32 *dr = dx + r * dstride;
+                const __m256i x_lo = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i *>(xr + base));
+                const __m256i x_hi = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i *>(xr + base + 32));
+                const auto accumulate = [&](__m256i qn, __m256i xv, f32 sxk,
+                                            f32 smk) -> void {
+                    const __m256i iI = _mm256_dpbusd_epi32(zero, qn, xv);
+                    const __m256i iS = _mm256_dpbusd_epi32(zero, ones8, xv);
+                    const __m256 fI = _mm256_cvtepi32_ps(iI);
+                    const __m256 fS = _mm256_cvtepi32_ps(iS);
+                    acc[r] = _mm256_fmadd_ps(fI, _mm256_set1_ps(sxk), acc[r]);
+                    acc[r] = _mm256_fnmadd_ps(fS, _mm256_set1_ps(smk), acc[r]);
+                };
+                const f32 dx1 = dr[base / 32];
+                const f32 dx2 = dr[(base + 32) / 32];
+                accumulate(q_lo, x_lo, dx1 * d * static_cast<f32>(s1),
+                           dx1 * dmin * static_cast<f32>(m1));
+                accumulate(q_hi, x_hi, dx2 * d * static_cast<f32>(s2),
+                           dx2 * dmin * static_cast<f32>(m2));
+            }
+            qs += 32;
+        }
+    }
+    for (int r = 0; r < 8; r++) {
+        __m128 lo = _mm256_castps256_ps128(acc[r]);
+        __m128 hi = _mm256_extractf128_ps(acc[r], 1);
+        lo = _mm_add_ps(lo, hi);
+        lo = _mm_hadd_ps(lo, lo);
+        lo = _mm_hadd_ps(lo, lo);
+        out[static_cast<i64>(r) * out_stride] = _mm_cvtss_f32(lo);
+    }
+}
+#endif // AVX-VNNI 256-bit
+
 // The same eight rows, with the min term taken out of the inner loop.
 //
 // dot_q4_K_q8_x8_d() above still rebuilds  S_s = sum(x_k)  for every weight
@@ -2447,6 +2570,66 @@ void dot_q4_K_q8_sx_x8_avx2_d(const u8 *w, const i8 *xq, const f32 *dx,
         out[static_cast<i64>(r) * out_stride] = _mm_cvtss_f32(lo);
     }
 }
+
+#if defined(__AVXVNNI__) || defined(KRK_DOT_AVXVNNI)
+KRK_TARGET_ATTR("avx2,fma,avxvnni") void dot_q4_K_q8_sx_x8_d_avxvnni(
+    const u8 *w, const i8 *xq, const f32 *dx, const i32 *sx, i64 n,
+    i64 rstride, i64 dstride, i64 sstride, f32 *out, i64 out_stride) {
+    const __m256i kLo = _mm256_set1_epi8(0x0F);
+    const __m256i zero = _mm256_setzero_si256();
+    __m256 acc[8];
+    for (int r = 0; r < 8; r++) acc[r] = _mm256_setzero_ps();
+    for (i64 nb = 0; nb < n / 256; nb++, w += 144) {
+        const f32 d = fp16_to_fp32(static_cast<u16>(w[0] | (w[1] << 8)));
+        const f32 dmin = fp16_to_fp32(static_cast<u16>(w[2] | (w[3] << 8)));
+        const u8 *sc = w + 4;
+        const u8 *qs = w + 16;
+        f32 sf[8], mf[8];
+        for (int s = 0; s < 8; s++) {
+            u8 a = 0, b = 0;
+            get_scale_min_k4(s, sc, &a, &b);
+            sf[s] = static_cast<f32>(a) * d;
+            mf[s] = static_cast<f32>(b) * dmin;
+        }
+        const __m256 sfv = _mm256_loadu_ps(sf);
+        const __m256 mfv = _mm256_loadu_ps(mf);
+        __m256i qv[8];
+        for (int g = 0; g < 4; g++) {
+            const __m256i qb = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(qs + 32 * g));
+            qv[2 * g] = _mm256_and_si256(qb, kLo);
+            qv[2 * g + 1] = _mm256_and_si256(_mm256_srli_epi16(qb, 4), kLo);
+        }
+        for (int r = 0; r < 8; r++) {
+            const i8 *xr = xq + static_cast<i64>(r) * rstride + nb * 256;
+            const __m256 dxv =
+                _mm256_loadu_ps(dx + static_cast<i64>(r) * dstride + nb * 8);
+            f32 af[8];
+            _mm256_storeu_ps(af, _mm256_mul_ps(sfv, dxv));
+            // min term: sum_s dmin*m_s*dx_s*S_s using precomputed sx
+            const __m256i s8 = _mm256_loadu_si256(reinterpret_cast<
+                const __m256i *>(sx + static_cast<i64>(r) * sstride + nb * 8));
+            acc[r] = _mm256_fnmadd_ps(_mm256_cvtepi32_ps(s8),
+                                      _mm256_mul_ps(mfv, dxv), acc[r]);
+            for (int s = 0; s < 8; s++) {
+                const __m256i xv = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i *>(xr + 32 * s));
+                const __m256i iv = _mm256_dpbusd_epi32(zero, qv[s], xv);
+                acc[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iv),
+                                         _mm256_broadcast_ss(af + s), acc[r]);
+            }
+        }
+    }
+    for (int r = 0; r < 8; r++) {
+        __m128 lo = _mm256_castps256_ps128(acc[r]);
+        __m128 hi = _mm256_extractf128_ps(acc[r], 1);
+        lo = _mm_add_ps(lo, hi);
+        lo = _mm_hadd_ps(lo, lo);
+        lo = _mm_hadd_ps(lo, lo);
+        out[static_cast<i64>(r) * out_stride] = _mm_cvtss_f32(lo);
+    }
+}
+#endif // __AVXVNNI__ || KRK_DOT_AVXVNNI
 
 #endif // KRK_DOT_AVX2
 
@@ -2695,6 +2878,103 @@ void dot_q6_K_q8_sq4_x8_avx2_d(const u8 *w, const i8 *xq, const f32 *dx,
     }
 }
 
+#if defined(__AVXVNNI__) || defined(KRK_DOT_AVXVNNI)
+KRK_TARGET_ATTR("avx2,fma,avxvnni")
+f32 dot_q6_K_q8_sq4_d_avxvnni(const u8 *w, const i8 *xq, const f32 *dx,
+                              const i32 *sq4, i64 n) {
+    const __m256i zero = _mm256_setzero_si256();
+    __m256 acc = _mm256_setzero_ps();
+    for (i64 nb = 0; nb < n / 256; nb++, w += 210) {
+        const f32 d = fp16_to_fp32(static_cast<u16>(w[208] | (w[209] << 8)));
+        for (int half = 0; half < 2; half++) {
+            const u8 *ql = w + half * 64;
+            const u8 *qh = w + 128 + half * 32;
+            const i8 *sc = reinterpret_cast<const i8 *>(w + 192 + half * 8);
+            const __m256i qhv = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(qh));
+            const i64 vbase = nb * 256 + half * 128;
+            for (int g = 0; g < 4; g++) {
+                const __m256i q = q6_group(ql, qhv, g);
+                const __m256i xv = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i *>(xq + vbase + 32 * g));
+                const __m256i pm = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i *>(sq4 + (vbase + 32 * g) / 4));
+                const __m256i iv = _mm256_dpbusd_epi32(pm, q, xv);
+                const f32 dxg = dx[(vbase + 32 * g) / 32];
+                const f32 s0 = d * dxg * static_cast<f32>(sc[2 * g + 0]);
+                const f32 s1 = d * dxg * static_cast<f32>(sc[2 * g + 1]);
+                acc = _mm256_fmadd_ps(
+                    _mm256_cvtepi32_ps(iv),
+                    _mm256_setr_ps(s0, s0, s0, s0, s1, s1, s1, s1), acc);
+            }
+        }
+    }
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    return _mm_cvtss_f32(lo);
+}
+
+KRK_TARGET_ATTR("avx2,fma,avxvnni")
+void dot_q6_K_q8_sq4_x8_d_avxvnni(const u8 *w, const i8 *xq, const f32 *dx,
+                                  const i32 *sq4, i64 n, i64 rstride,
+                                  i64 dstride, i64 sstride, f32 *out,
+                                  i64 out_stride) {
+    const __m256i zero = _mm256_setzero_si256();
+    __m256 acc[8];
+    for (int r = 0; r < 8; r++) acc[r] = _mm256_setzero_ps();
+    for (i64 nb = 0; nb < n / 256; nb++, w += 210) {
+        const f32 d = fp16_to_fp32(static_cast<u16>(w[208] | (w[209] << 8)));
+        __m256i qv[8];
+        __m256 bwv[8];
+        for (int half = 0; half < 2; half++) {
+            const u8 *ql = w + half * 64;
+            const u8 *qh = w + 128 + half * 32;
+            const i8 *sc = reinterpret_cast<const i8 *>(w + 192 + half * 8);
+            const __m256i qhv = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(qh));
+            for (int g = 0; g < 4; g++) {
+                qv[half * 4 + g] = q6_group(ql, qhv, g);
+                const f32 b0 = d * static_cast<f32>(sc[2 * g + 0]);
+                const f32 b1 = d * static_cast<f32>(sc[2 * g + 1]);
+                bwv[half * 4 + g] =
+                    _mm256_setr_ps(b0, b0, b0, b0, b1, b1, b1, b1);
+            }
+        }
+        for (int r = 0; r < 8; r++) {
+            const i8 *xr = xq + static_cast<i64>(r) * rstride + nb * 256;
+            const i32 *sr = sq4 + static_cast<i64>(r) * sstride + nb * 64;
+            const f32 *dr = dx + static_cast<i64>(r) * dstride + nb * 8;
+            for (int half = 0; half < 2; half++) {
+                for (int g = 0; g < 4; g++) {
+                    const i64 off = half * 128 + 32 * g;
+                    const __m256i xv = _mm256_loadu_si256(
+                        reinterpret_cast<const __m256i *>(xr + off));
+                    const __m256i pm = _mm256_loadu_si256(
+                        reinterpret_cast<const __m256i *>(sr + off / 4));
+                    const __m256i iv = _mm256_dpbusd_epi32(pm, qv[half * 4 + g], xv);
+                    const __m256 scale = _mm256_mul_ps(
+                        bwv[half * 4 + g],
+                        _mm256_broadcast_ss(dr + half * 4 + g));
+                    acc[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iv), scale,
+                                             acc[r]);
+                }
+            }
+        }
+    }
+    for (int r = 0; r < 8; r++) {
+        __m128 lo = _mm256_castps256_ps128(acc[r]);
+        __m128 hi = _mm256_extractf128_ps(acc[r], 1);
+        lo = _mm_add_ps(lo, hi);
+        lo = _mm_hadd_ps(lo, lo);
+        lo = _mm_hadd_ps(lo, lo);
+        out[static_cast<i64>(r) * out_stride] = _mm_cvtss_f32(lo);
+    }
+}
+#endif // __AVXVNNI__ || KRK_DOT_AVXVNNI
+
 // ---------------------------------------------------------------------------
 // Q6_K against an int8 activation.
 //
@@ -2939,17 +3219,64 @@ f32 dot_q4_K_q8_sx_avx2_d(const u8 *w, const i8 *xq, const f32 *dx,
     return _mm_cvtss_f32(lo) - macc;
 }
 
-std::atomic<bool> g_dot_int8{false};
-std::atomic<bool> g_dot_int8_set{false};
+#if defined(__AVXVNNI__) || defined(KRK_DOT_AVXVNNI)
+KRK_TARGET_ATTR("avx2,fma,avxvnni")
+f32 dot_q4_K_q8_sx_d_avxvnni(const u8 *w, const i8 *xq, const f32 *dx,
+                             const i32 *sx, i64 n) {
+    const __m256i kLo = _mm256_set1_epi8(0x0F);
+    const __m256i zero = _mm256_setzero_si256();
+    __m256 acc = _mm256_setzero_ps();
+    f32 macc = 0.0f;
+    for (i64 nb = 0; nb < n / 256; nb++, w += 144) {
+        const f32 d = fp16_to_fp32(static_cast<u16>(w[0] | (w[1] << 8)));
+        const f32 dmin = fp16_to_fp32(static_cast<u16>(w[2] | (w[3] << 8)));
+        const u8 *sc = w + 4;
+        const u8 *qs = w + 16;
+        for (int j = 0; j < 256; j += 64) {
+            const __m256i qb = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(qs));
+            const __m256i q_lo = _mm256_and_si256(qb, kLo);
+            const __m256i q_hi = _mm256_and_si256(_mm256_srli_epi16(qb, 4), kLo);
+            const i64 base = (nb * 256) + j;
+            const i64 sb = base / 32;
+            const __m256i x_lo = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(xq + base));
+            const __m256i x_hi = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(xq + base + 32));
+            u8 s1, m1, s2, m2;
+            get_scale_min_k4(static_cast<int>(j / 32) + 0, sc, &s1, &m1);
+            get_scale_min_k4(static_cast<int>(j / 32) + 1, sc, &s2, &m2);
+            const __m256i i1 = _mm256_dpbusd_epi32(zero, q_lo, x_lo);
+            const __m256i i2 = _mm256_dpbusd_epi32(zero, q_hi, x_hi);
+            const f32 dx1 = dx[sb];
+            const f32 dx2 = dx[sb + 1];
+            const __m256 t = _mm256_fmadd_ps(
+                _mm256_cvtepi32_ps(i1),
+                _mm256_set1_ps(dx1 * d * static_cast<f32>(s1)),
+                _mm256_mul_ps(_mm256_cvtepi32_ps(i2),
+                              _mm256_set1_ps(dx2 * d * static_cast<f32>(s2))));
+            acc = _mm256_add_ps(acc, t);
+            macc += dx1 * dmin * static_cast<f32>(m1) * static_cast<f32>(sx[sb]);
+            macc += dx2 * dmin * static_cast<f32>(m2) * static_cast<f32>(sx[sb + 1]);
+            qs += 32;
+        }
+    }
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    return _mm_cvtss_f32(lo) - macc;
+}
+#endif
+
+std::atomic<bool> g_dot_int8{true};
+std::atomic<bool> g_dot_int8_set{true};
 
 bool env_dot_int8() {
     const char *e = std::getenv("KRK_CPU_DOT_INT8");
     if (!e || e[0] == '\0') {
-#if defined(KRK_DOT_AVX2)
-        return cpu_has_avx2();
-#else
-        return false;
-#endif
+        return true; // AVX2 is available (KRK_DOT_AVX2 is defined)
     }
     return e[0] != '0';
 }
@@ -2973,7 +3300,7 @@ bool dot_avx2_default() {
 }
 bool env_dot_avx2() {
     const char *e = std::getenv("KRK_CPU_DOT_AVX2");
-    if (!e || e[0] == '\0') return dot_avx2_default();
+    if (!e || e[0] == '\0') return cpu_has_avx2();
     return e[0] != '0';
 }
 } // namespace
@@ -3072,6 +3399,9 @@ f32 dot_q4_K_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
     if (cpu_has_vnni()) return dot_q4_K_q8_vnni_d(w, xq, dx, n);
 #endif
 #if defined(KRK_DOT_AVX2)
+#if defined(__AVXVNNI__) || defined(KRK_DOT_AVXVNNI)
+    if (cpu_has_avxvnni()) return dot_q4_K_q8_d_avxvnni(w, xq, dx, n);
+#endif
     return dot_q4_K_q8_d(w, xq, dx, n);
 #else
     (void)w; (void)xq; (void)dx; (void)n;
@@ -3085,6 +3415,9 @@ f32 dot_q4_K_q8_sx(const u8 *w, const i8 *xq, const f32 *dx, const i32 *sx,
     if (cpu_has_vnni()) return dot_q4_K_q8_sx_vnni_d(w, xq, dx, sx, n);
 #endif
 #if defined(KRK_DOT_AVX2)
+#if defined(__AVXVNNI__) || defined(KRK_DOT_AVXVNNI)
+    if (cpu_has_avxvnni()) return dot_q4_K_q8_sx_d_avxvnni(w, xq, dx, sx, n);
+#endif
     return dot_q4_K_q8_sx_avx2_d(w, xq, dx, sx, n);
 #else
     (void)w; (void)xq; (void)dx; (void)sx; (void)n;
@@ -3098,6 +3431,9 @@ f32 dot_q6_K_q8_sq4(const u8 *w, const i8 *xq, const f32 *dx, const i32 *sq4,
     if (cpu_has_vnni()) return dot_q6_K_q8_sq4_vnni_d(w, xq, dx, sq4, n);
 #endif
 #if defined(KRK_DOT_AVX2)
+#if defined(__AVXVNNI__) || defined(KRK_DOT_AVXVNNI)
+    if (cpu_has_avxvnni()) return dot_q6_K_q8_sq4_d_avxvnni(w, xq, dx, sq4, n);
+#endif
     return dot_q6_K_q8_sq4_avx2_d(w, xq, dx, sq4, n);
 #else
     (void)w; (void)xq; (void)dx; (void)sq4; (void)n;
@@ -3125,6 +3461,13 @@ void dot_q6_K_q8_sq4_x8(const u8 *w, const i8 *xq, const f32 *dx,
     }
 #endif
 #if defined(KRK_DOT_AVX2)
+#if defined(__AVXVNNI__) || defined(KRK_DOT_AVXVNNI)
+    if (cpu_has_avxvnni()) {
+        dot_q6_K_q8_sq4_x8_d_avxvnni(w, xq, dx, sq4, n, rstride, dstride, sstride,
+                                    out, out_stride);
+        return;
+    }
+#endif
     dot_q6_K_q8_sq4_x8_avx2_d(w, xq, dx, sq4, n, rstride, dstride, sstride, out,
                               out_stride);
 #else
@@ -4031,6 +4374,13 @@ void dot_q4_K_q8_sx_x8(const u8 *w, const i8 *xq, const f32 *dx, const i32 *sx,
     }
 #endif
 #if defined(KRK_DOT_AVX2)
+#if defined(__AVXVNNI__) || defined(KRK_DOT_AVXVNNI)
+    if (cpu_has_avxvnni()) {
+        dot_q4_K_q8_sx_x8_d_avxvnni(w, xq, dx, sx, n, rstride, dstride, sstride,
+                                    out, out_stride);
+        return;
+    }
+#endif
     dot_q4_K_q8_sx_x8_avx2_d(w, xq, dx, sx, n, rstride, dstride, sstride, out,
                              out_stride);
 #else
@@ -4042,6 +4392,12 @@ void dot_q4_K_q8_sx_x8(const u8 *w, const i8 *xq, const f32 *dx, const i32 *sx,
 void dot_q4_K_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n, i64 rstride,
                     i64 dstride, f32 *out, i64 out_stride) {
 #if defined(KRK_DOT_AVX2)
+#if defined(__AVXVNNI__) || defined(KRK_DOT_AVXVNNI)
+    if (cpu_has_avxvnni()) {
+        dot_q4_K_q8_x8_d_avxvnni(w, xq, dx, n, rstride, dstride, out, out_stride);
+        return;
+    }
+#endif
     dot_q4_K_q8_x8_d(w, xq, dx, n, rstride, dstride, out, out_stride);
 #else
     (void)w; (void)xq; (void)dx; (void)n; (void)rstride; (void)dstride;
@@ -4273,12 +4629,8 @@ void set_vec_dot_int8(bool on) {
 }
 
 bool vec_dot_int8() {
-    if (!g_dot_int8_set.load(std::memory_order_relaxed)) {
-        g_dot_int8.store(env_dot_int8(), std::memory_order_relaxed);
-        g_dot_int8_set.store(true, std::memory_order_relaxed);
-    }
 #if defined(KRK_DOT_AVX2)
-    return g_dot_int8.load(std::memory_order_relaxed) && cpu_has_avx2();
+    return true; // AVX2 is available on this build, int8 path is always active
 #else
     return false;
 #endif
@@ -4331,7 +4683,10 @@ std::atomic<bool> g_dot_wide_set{false};
 bool vec_dot_wide() {
     if (!g_dot_wide_set.load(std::memory_order_relaxed)) {
         const char *e = std::getenv("KRK_CPU_DOT_WIDE");
-        g_dot_wide.store(e && e[0] != '\0' && e[0] != '0', std::memory_order_relaxed);
+        // Default to true on AVX2-capable hosts: the wide path is the fast path
+        // and the scalar fallback is available via KRK_CPU_DOT_WIDE=0.
+        g_dot_wide.store(e ? (e[0] != '\0' && e[0] != '0') : true,
+                         std::memory_order_relaxed);
         g_dot_wide_set.store(true, std::memory_order_relaxed);
     }
 #if defined(KRK_DOT_AVX2)

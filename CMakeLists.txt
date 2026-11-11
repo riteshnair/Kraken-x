@@ -212,6 +212,12 @@ else()
                                              -Wno-unused-parameter)
     if(KRK_NATIVE_CPU)
         target_compile_options(krk_core PRIVATE -march=native)
+        # AVX2 dot-product kernels on by default for native builds.
+        target_compile_definitions(krk_core PRIVATE KRK_DOT_AVX2=1)
+        # AVX-VNNI (_mm256_dpbusd_epi32, 256-bit VEX) is available on Meteor
+        # Lake and Zen 4+; march=native enables it but we define this so
+        # guarded 256-bit VNNI paths can be compiled in.
+        target_compile_definitions(krk_core PRIVATE KRK_DOT_AVXVNNI=1)
     endif()
 endif()
 
@@ -550,7 +556,8 @@ endif()
 if(WIN32)
     # `kraken --bench` reports which GPU engine actually ran the work by
     # sampling the per-process "GPU Engine" performance counters (PDH).
-    target_link_libraries(kraken PRIVATE pdh)
+    # psapi: peak working set / memory counters in the run stats.
+    target_link_libraries(kraken PRIVATE pdh psapi)
 endif()
 
 add_executable(kraken-server src/main_server.cpp)

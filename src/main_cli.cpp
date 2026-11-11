@@ -28,6 +28,14 @@ static inline int krk_win_unsetenv(const char *name) { return _putenv_s(name, ""
 #include "krk/quant.hpp"
 #include "krk/trace.hpp"
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <psapi.h>
+#endif
+
 #if !defined(_WIN32)
 #include <unistd.h>
 #endif
@@ -67,7 +75,8 @@ struct Args {
     // (--prefill-hash, the exact rung), and 24 greedy tokens at 256 and 512 are
     // the same bytes. The cost is workspace VRAM, 88 MiB -> 113 MiB.
     int chunk = 512;
-    int kv_quant = 0; // 0 = f16 KV, 1 = int8 (see EngineConfig::kv_quant)
+    int kv_quant = 2; // 0 = f16, 1 = int8, 2 = turbo3 (default), 3 = rot4 (experimental)
+bool kv_quant_explicit = false; // --kv-quant was given, so a refusal is a refusal
     int device = 0;
     int threads = 0;
     int expert_cache_mb = 0;    // MoE expert residency budget (MiB), 0 = auto
@@ -78,6 +87,7 @@ struct Args {
     int expert_warm_mb = -1;     // MoE WARM tier in pageable host RAM (MiB): <0 auto, 0 off
     int expert_pin_mb = -1;      // pinned prefix of that tier (MiB): <0 no override
     f32 router_resident = -1.0f; // router near-tie margin toward resident experts
+    f32 cache_prior = -1.0f;     // cache-prior lambda (0 = off)
     int weight_vram_mb = 0;      // dense weight VRAM budget, MiB: 0 auto, <0 off
     int kv_hot_mb = 0;           // KV HOT (VRAM) budget, MiB: 0 auto
     int kv_warm_mb = -1;         // KV WARM (host RAM) budget, MiB: <0 auto, 0 off
@@ -123,11 +133,30 @@ struct Args {
     bool cpu = false;
     bool npu = false;
     bool npu_cpu = false;
+    bool intel = false;
     bool greedy = false;
     bool tokenize = false;
     // Print one hash of the prompt's last-position logits and exit (see
     // --prefill-hash): the chunk-invariance gate's one observable.
     bool prefill_hash = false;
+    // KV-quality gate: dump the final logits row to a file (first run) or
+    // compare against it (later runs) and judge the shift by KL, not by text.
+    // Default thresholds are calibrated for a 3-bit packed cache: measured KL
+    // against f16 on Qwen3.8-4B is 2e-5..7e-4 for int8, 1.5e-3..1.1e-2 for
+    // turbo3 and 8.8e-4..1.8e-2 for rot4, across three prompts. A KL of 0.01
+    // is about a 1% perplexity increase, which is the band the literature
+    // reports for 3-bit KV. `--logits-kl-max 0.0005 --logits-dmax 0.5` is the
+    // near-exact class int8 sits in.
+    std::string logits_ref;
+    f32 logits_kl_max = 0.02f;
+    f32 logits_dmax = 2.0f;
+    // Decode steps to run before capturing the row (see the gate block).
+    i32 logits_steps = 0;
+    // Workload profile tag: one expert index per workload, so a coding session
+    // and a chat session refine their own hot set instead of averaging into one
+    // ranking that describes neither.
+    std::string workload;
+    f32 workload_retain = -1.0f; // -1 = KRK_EXPERT_RETAIN / default
     bool chat = false;
     bool info = false;
     bool bench = false;
@@ -173,7 +202,8 @@ void usage() {
         "  left to right: every step runs ONE bidirectional, cacheless pass over\n"
         "  prompt + --max-tokens and the whole sequence must fit in --ctx, so --chunk\n"
         "  does not apply to it.\n"
-        "  --kv-quant f16|int8   K/V cache format (default f16). int8 stores each\n"
+        "  --kv-quant f16|int8|turbo3|rot4  K/V cache format (default rot4). rot4\n"
+        "                        is Q4_0 blocks in a rotated basis (3.5x smaller)\n"
         "                        row as bytes plus one f32 scale per 32 values, 1.8x\n"
         "                        smaller; both backends implement it, and on the card\n"
         "                        decode and prefill agree bit for bit (MLA and the\n"
@@ -201,6 +231,9 @@ void usage() {
         "                        gemma, phi3, deepseek, glm4) or a .jinja file, used\n"
         "                        instead of the model's own tokenizer.chat_template\n"
         "  --cpu                 use the scalar reference backend\n"
+        "  --intel               use the Intel Meteor Lake backend (AVX2/VNNI host\n"
+        "                        copy, tuned for Core Ultra); falls back to --cpu\n"
+        "                        if unavailable\n"
         "                        KRK_CPU_DOT_FAST=1 replaces the block-format\n"
         "                        (q4_0/q8_0/q5/q6...) dot product's single\n"
         "                        accumulator with four, which is 2x-3x the\n"
@@ -314,6 +347,10 @@ void usage() {
         "                        5%%) goes to the expert already in VRAM, then to\n"
         "                        the one in WARM. Fewer promotions per token at the\n"
         "                        cost of a near-tie; 0 or absent is off.\n"
+        "  --cache-prior L        Cache-Prior routing (arxiv 2412.00099): bias the\n"
+        "                        router selection toward cached experts by L*delta,\n"
+        "                        where delta is the router's score range. L in [0,1].\n"
+        "                        0 = off (default). Improves cache hit rate.\n"
         "  --expert-cache-slots N  cap resident (layer, expert) slots (0 = auto)\n"
         "  --expert-warm-mb N     WARM expert cache in host RAM. Cold reads land\n"
         "                        here before VRAM, VRAM evictions stay here, and\n"
@@ -522,10 +559,13 @@ bool parse(int argc, char **argv, Args *a) {
         else if (f == "--ctx" || f == "-c") a->ctx = next_i("--ctx");
         else if (f == "--kv-quant") {
             const std::string v = next("--kv-quant");
+            a->kv_quant_explicit = true;
             if (v == "int8") a->kv_quant = 1;
+            else if (v == "turbo3" || v == "turbo" || v == "tq3") a->kv_quant = 2;
+            else if (v == "rot4" || v == "q4" || v == "q4_0") a->kv_quant = 3;
             else if (v == "f16") a->kv_quant = 0;
             else {
-                std::fprintf(stderr, "kraken: --kv-quant needs f16|int8, got '%s'\n", v.c_str());
+                std::fprintf(stderr, "kraken: --kv-quant needs f16|int8|turbo3|rot4, got '%s'\n", v.c_str());
                 // parse() is a BOOL: `return 2` converts to true and the caller
                 // reads it as "parsed fine", so a typo here ran the default f16
                 // cache instead of refusing. main() turns false into exit 2.
@@ -595,6 +635,8 @@ bool parse(int argc, char **argv, Args *a) {
             a->expert_pin_mb = next_i("--expert-pin-mb");
         else if (f == "--router-resident")
             a->router_resident = next_f("--router-resident");
+        else if (f == "--cache-prior")
+            a->cache_prior = next_f("--cache-prior");
         else if (f == "--expert-warm-prefetch")
             a->expert_warm_prefetch = next_i("--expert-warm-prefetch") != 0;
         else if (f == "--expert-warmup")
@@ -635,8 +677,15 @@ bool parse(int argc, char **argv, Args *a) {
         else if (f == "--greedy") a->greedy = true;
         else if (f == "--tokenize") a->tokenize = true;
         else if (f == "--prefill-hash") a->prefill_hash = true;
-        else if (f == "--chat") a->chat = true;
+        else if (f == "--logits-ref") a->logits_ref = next("--logits-ref");
+        else if (f == "--logits-kl-max") a->logits_kl_max = static_cast<f32>(next_f("--logits-kl-max"));
+        else if (f == "--logits-dmax") a->logits_dmax = static_cast<f32>(next_f("--logits-dmax"));
+        else if (f == "--logits-steps") a->logits_steps = next_i("--logits-steps");
+        else if (f == "--workload") a->workload = next("--workload");
+        else if (f == "--coder") a->workload = "coder";
+        else if (f == "--workload-retain") a->workload_retain = static_cast<f32>(next_f("--workload-retain"));        else if (f == "--chat") a->chat = true;
         else if (f == "--cpu") a->cpu = true;
+        else if (f == "--intel") a->intel = true;
         else if (f == "--npu") a->npu = true;
         else if (f == "--npu-cpu") a->npu_cpu = true;
         else if (f == "--info") a->info = true;
@@ -862,6 +911,22 @@ static int range_exit_code(unsigned long long silu, unsigned long long sum,
     return range_violated(silu, sum, resid, rexp_max) ? 2 : 0;
 }
 
+static void print_peak_memory(FILE *out) {
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS_EX pmc;
+    if (GetProcessMemoryInfo(GetCurrentProcess(),
+                             reinterpret_cast<PROCESS_MEMORY_COUNTERS *>(&pmc),
+                             sizeof(pmc))) {
+        const double peak_mb = static_cast<double>(pmc.PeakWorkingSetSize) / (1024.0 * 1024.0);
+        const double ws_mb = static_cast<double>(pmc.WorkingSetSize) / (1024.0 * 1024.0);
+        const double priv_mb = static_cast<double>(pmc.PrivateUsage) / (1024.0 * 1024.0);
+        std::fprintf(out,
+                     "[stats ] memory    peak working set %.1f MiB, working set %.1f MiB, private %.1f MiB\n",
+                     peak_mb, ws_mb, priv_mb);
+    }
+#endif
+}
+
 static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
                             f64 load_ms, size_t dev_free, size_t dev_total,
                             unsigned long long sat_silu, unsigned long long sat_sum,
@@ -1024,6 +1089,7 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
     // the host, and the host is where a launch-bound step's time actually goes.
     if (!mc.is_moe) {
         krk::HostTime::get().report(out);
+        print_peak_memory(out);
         return;
     }
     const ExpertCache &ec = m.experts();
@@ -1371,6 +1437,7 @@ static void print_run_stats(FILE *out, Engine &engine, const GenerateResult &r,
                  static_cast<unsigned long long>(ec.decay_events()),
                  static_cast<unsigned long long>(ec.warm_pinned_bytes() / 1048576u));
     krk::HostTime::get().report(out);
+    print_peak_memory(out);
 }
 
 int run_bench(Engine &engine, Backend *be, const Args &a, f64 load_ms,
@@ -1606,10 +1673,11 @@ int main(int argc, char **argv) {
 
     std::string err;
     Backend *be = nullptr;
-    if (a.cpu && (a.npu || a.npu_cpu)) {
-        KRK_WARN("--cpu and --npu/--npu-cpu both given; the reference backend wins");
+    if (a.cpu && (a.npu || a.npu_cpu || a.intel)) {
+        KRK_WARN("--cpu given with --npu/--npu-cpu/--intel; the reference backend wins");
         a.npu = false;
         a.npu_cpu = false;
+        a.intel = false;
     }
     if (a.npu && a.npu_cpu) {
         KRK_WARN("--npu and --npu-cpu both given; --npu-cpu (the whole graph) wins");
@@ -1617,6 +1685,13 @@ int main(int argc, char **argv) {
     }
     if (a.npu || a.npu_cpu) {
         be = make_npu_backend(a.device, a.npu_cpu, &err);
+        if (!be) {
+            KRK_WARN("%s", err.c_str());
+            KRK_WARN("falling back to the CPU reference backend");
+            be = make_cpu_backend();
+        }
+    } else if (a.intel) {
+        be = make_intel_backend(&err);
         if (!be) {
             KRK_WARN("%s", err.c_str());
             KRK_WARN("falling back to the CPU reference backend");
@@ -1675,6 +1750,14 @@ int main(int argc, char **argv) {
     }
 
     EngineConfig cfg;
+    // One index per workload tag: `--profile coder` reads and writes
+    // <model>.coder.krakenexperts.json, so a coding session and a chat session
+    // refine their own hot set instead of averaging into a ranking that
+    // describes neither.
+    const std::string expert_index_path =
+        a.model + (a.workload.empty() ? std::string() : ("." + a.workload)) +
+        ".krakenexperts.json";
+    cfg.expert_index_path = expert_index_path;
     cfg.model_path = a.model;
     // --chat-template: a builtin name, or a path to a .jinja file. Resolved
     // here so a typo is a startup error rather than a silent ChatML prompt on
@@ -1699,6 +1782,7 @@ int main(int argc, char **argv) {
     cfg.n_ctx = a.ctx;
     cfg.prefill_chunk = a.chunk;
     cfg.kv_quant = a.kv_quant;
+    cfg.kv_quant_explicit = a.kv_quant_explicit;
     cfg.trace_hash = a.prefill_hash;
     cfg.threads = a.threads;
     cfg.seed = a.seed;
@@ -1711,6 +1795,11 @@ int main(int argc, char **argv) {
     cfg.expert_warm_mb = a.expert_warm_mb;
     cfg.expert_pin_mb = a.expert_pin_mb;
     cfg.router_tie_margin = a.router_resident;
+    if (a.cache_prior >= 0.0f) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%g", static_cast<double>(a.cache_prior));
+        setenv("KRK_CACHE_PRIOR", buf, 1);
+    }
     cfg.draft_head = a.draft_head;
     cfg.draft_head_prime = a.draft_head_prime;
     cfg.weight_vram_mb = a.weight_vram_mb;
@@ -1738,6 +1827,10 @@ int main(int argc, char **argv) {
     ph.mark("backend create");
     Engine engine;
     engine.set_expert_scan(a.expert_scan, a.expert_stub);
+    // A profile implies adaptation: the tag names a workload the caller wants
+    // refined across runs, and --expert-adapt is the machinery that folds each
+    // run's observed routing into the file with a retain factor.
+    if (!a.workload.empty() && !a.expert_scan) a.expert_adapt = true;
     if (a.expert_adapt) engine.set_expert_track(true);
     const f64 load_t0 = PhaseClock::now();
     if (!engine.init(be, cfg, &err)) {
@@ -1883,10 +1976,12 @@ int main(int argc, char **argv) {
         // scan's positions came from the bench's own prefill and decode, so
         // this is the same index a --prompt run would have written, just never
         // written. `--expert-scan --bench` was a no-op that looked like a pass.
-        if (a.expert_scan) engine.write_expert_index(a.model + ".krakenexperts.json");
+        if (a.expert_scan) engine.write_expert_index(expert_index_path);
         if (a.expert_adapt)
-            engine.merge_expert_index(a.model + ".krakenexperts.json",
-                                      adapt_retain());
+            engine.merge_expert_index(expert_index_path,
+                                      a.workload_retain >= 0.0f
+                                          ? static_cast<double>(a.workload_retain)
+                                          : adapt_retain());
         engine.shutdown();
         ph.mark("engine.shutdown");
         delete be;
@@ -1926,6 +2021,110 @@ int main(int argc, char **argv) {
     // that is not the prompt's last -- the shape the old tiled kernel's
     // reduction order produced. The second is `logits`: the last position's
     // whole logits row, which is what the text depends on. Both cover the
+    // ---- KV-quality gate ------------------------------------------------
+    //
+    // Compares the FINAL LOGITS ROW of this run against a reference row and
+    // judges the difference by KL divergence, not by generated text. Text is
+    // chaotic: one flipped argmax changes the whole continuation, so a text
+    // comparison calls a 1e-4 logit shift a failure and a 0.3 shift a pass
+    // depending on luck. The logits row is the model's actual answer to the
+    // prompt, so a KV format that damages attention shows up there first.
+    //
+    // The first run writes the reference, every later run scores against it:
+    //   kraken ... --kv-quant f16  --logits-ref ref.bin   (writes)
+    //   kraken ... --kv-quant rot4 --logits-ref ref.bin   (compares; exits 1 on fail)
+    if (!a.logits_ref.empty()) {
+        GenerateParams p;
+        p.prompt = a.prompt_given
+                       ? (a.chat ? render_turn(engine, a.system, a.prompt) : a.prompt)
+                       : std::string();
+        p.max_tokens = 1;
+        // --logits-steps N moves the comparison N decode steps down the
+        // trajectory. The row at the prompt's last position is NOT enough: a
+        // change that only affects decode (a routing-order shift, for one)
+        // leaves it bit-identical and then derails the text a few tokens later.
+        // Measured exactly that with --router-resident 0.1 on GLM-4.7-Flash:
+        // KL 0.0000000 at step 0, and the text fell into a repetition loop.
+        if (a.logits_steps > 0) p.max_tokens = a.logits_steps + 1;
+        p.sampler.greedy = true;
+        p.sampler.temp = 0.0f;
+        p.sample_host = true;
+        GenerateResult r;
+        if (!engine.generate(p, &r)) {
+            std::fprintf(stderr, "kraken: logits-ref prefill failed: %s\n",
+                         r.error.empty() ? "generation returned false"
+                                         : r.error.c_str());
+            std::exit(1);
+        }
+        const i64 n = engine.model().cfg().n_vocab;
+        const f32 *row = engine.last_logits();
+        if (!row || n <= 0) {
+            std::fprintf(stderr, "kraken: no host logits row to compare\n");
+            std::exit(1);
+        }
+        std::vector<f32> ref;
+        bool have = false;
+        if (FILE *f = std::fopen(a.logits_ref.c_str(), "rb")) {
+            i64 rn = 0;
+            if (std::fread(&rn, sizeof(rn), 1, f) == 1 && rn == n) {
+                ref.resize(static_cast<size_t>(n));
+                have = std::fread(ref.data(), sizeof(f32), static_cast<size_t>(n), f) ==
+                       static_cast<size_t>(n);
+            }
+            std::fclose(f);
+        }
+        if (!have) {
+            FILE *f = std::fopen(a.logits_ref.c_str(), "wb");
+            if (!f) {
+                std::fprintf(stderr, "kraken: cannot write %s\n", a.logits_ref.c_str());
+                std::exit(1);
+            }
+            std::fwrite(&n, sizeof(n), 1, f);
+            std::fwrite(row, sizeof(f32), static_cast<size_t>(n), f);
+            std::fclose(f);
+            std::printf("logits-ref wrote %lld floats to %s\n",
+                        static_cast<long long>(n), a.logits_ref.c_str());
+            engine.shutdown();
+            delete be;
+            return 0;
+        }
+        auto lse = [&](const f32 *v) {
+            f32 m = v[0];
+            for (i64 i = 1; i < n; i++) m = std::max(m, v[i]);
+            double s = 0.0;
+            for (i64 i = 0; i < n; i++) s += std::exp(static_cast<double>(v[i] - m));
+            return static_cast<double>(m) + std::log(s);
+        };
+        auto amax = [&](const f32 *v) {
+            i64 b = 0;
+            for (i64 i = 1; i < n; i++)
+                if (v[i] > v[b]) b = i;
+            return b;
+        };
+        const double lr = lse(ref.data()), lc = lse(row);
+        double kl = 0.0, dmax = 0.0, d2 = 0.0;
+        for (i64 i = 0; i < n; i++) {
+            const double pr = std::exp(static_cast<double>(ref[i]) - lr);
+            const double pc = std::exp(static_cast<double>(row[i]) - lc);
+            const double d = static_cast<double>(row[i]) - ref[i];
+            dmax = std::max(dmax, std::fabs(d));
+            d2 += d * d;
+            if (pr > 0.0) kl += pr * std::log(pr / std::max(pc, 1e-300));
+        }
+        const double rms = std::sqrt(d2 / static_cast<double>(n));
+        const i64 ar = amax(ref.data()), ac = amax(row);
+        const bool same = ar == ac;
+        const bool bad = kl > static_cast<double>(a.logits_kl_max) ||
+                         dmax > static_cast<double>(a.logits_dmax) || !same;
+        std::printf(
+            "logits-diff max=%.5f rms=%.5f kl=%.7f argmax=%lld/%lld same=%d %s\n",
+            dmax, rms, kl, static_cast<long long>(ar),
+            static_cast<long long>(ac), same ? 1 : 0, bad ? "FAIL" : "ok");
+        engine.shutdown();
+        delete be;
+        return bad ? 1 : 0;
+    }
+
     // WHOLE row, never the sampled token: hashing the text would let a drift
     // survive whenever the argmax happened not to move.
     if (a.prefill_hash) {
@@ -2088,14 +2287,14 @@ int main(int argc, char **argv) {
         // experts deserve VRAM depends on the card (6 GB and 12 GB are both
         // targets) and on the free host tier, so the choice belongs at load
         // time, not here.
-        engine.write_expert_index(a.model + ".krakenexperts.json");
+        engine.write_expert_index(expert_index_path);
     }
     if (a.expert_adapt) {
         // After the run, beside the model: the tier plan this run's traffic
         // implies, blended with whatever the last measurement wrote. Best
         // effort -- a failed merge must not turn a good generation into an
         // error code, and merge_expert_index already says why it refused.
-        engine.merge_expert_index(a.model + ".krakenexperts.json",
+        engine.merge_expert_index(expert_index_path,
                                   adapt_retain());
     }
 

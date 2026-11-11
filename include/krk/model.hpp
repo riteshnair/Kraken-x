@@ -685,6 +685,11 @@ struct ModelConfig {
     // n_head_kv holding the maximum, which is what a shared workspace and one
     // KV slot are measured against.
     std::vector<i32> n_head_kv_layer;
+
+    // Per-layer dense FFN width. Some families (e.g. gemma4/Firefly) declare
+    // different feed_forward_length per block; cfg_.n_ff is the stack maximum
+    // for workspace sizing, and n_ff_at() is the layer's own width.
+    std::vector<i32> n_ff_layer;
     // Per-head softplus output gate (laguna `attn_gate.weight`): one scalar per
     // query head, projected from the *same* hidden state q/k/v read, then
     // softplus'd and multiplied into the attention result before wo. Distinct
@@ -1218,6 +1223,15 @@ public:
         if (layer < 0 || layer >= static_cast<i32>(cfg_.n_head_kv_layer.size()))
             return cfg_.n_head_kv;
         return cfg_.n_head_kv_layer[static_cast<size_t>(layer)];
+    }
+
+    // The layer's own dense FFN width (see cfg_.n_ff_layer).
+    i32 n_ff_at(i32 layer) const {
+        if (layer >= 0 && layer < static_cast<i32>(cfg_.n_ff_layer.size())) {
+            const i32 v = cfg_.n_ff_layer[static_cast<size_t>(layer)];
+            if (v > 0) return v;
+        }
+        return cfg_.n_ff;
     }
     // True when this layer runs multi-head latent attention.
     bool layer_is_mla(i32 layer) const {
