@@ -9594,11 +9594,18 @@ void Engine::write_expert_index_rows(const std::string &path,
         KRK_WARN("expert scan: cannot write %s", path.c_str());
         return;
     }
+    // The path is a Windows path with single backslashes, which is NOT legal
+    // inside a JSON string ("\m" is an invalid escape). Emitted raw, this
+    // writer produced a file its own reader could not parse -- json_parse
+    // failed and expert_index_parse returned empty with no message, which read
+    // as "does not describe this model" and silently disabled the profile.
+    std::string src_path_json;
+    krk::json_escape_to(src_path_json, cfg_.model_path);
     std::fprintf(f,
                  "{\n  \"version\": 1,\n"
                  "  \"kind\": \"kraken-expert-index\",\n"
                  "  \"mode\": \"%s\",\n"
-                 "  \"source_path\": \"%s\",\n"
+                 "  \"source_path\": %s,\n"
                  "  \"source_size\": %llu,\n"
                  "  \"source_mtime\": %llu,\n"
                  "  \"arch\": \"%s\",\n"
@@ -9608,7 +9615,7 @@ void Engine::write_expert_index_rows(const std::string &path,
                  "  \"positions_scanned\": %lld,\n"
                  "  \"layers\": [\n",
                  mode,
-                 cfg_.model_path.c_str(),
+                 src_path_json.c_str(),
                  src_size, src_mtime,
                  mc.arch.c_str(), mc.n_layer, ne, mc.n_expert_used,
                  static_cast<unsigned long long>(one),
@@ -9651,27 +9658,65 @@ ExpertIndexRows expert_index_parse(const std::string &text, i32 n_layer,
                                    unsigned long long src_size) {
     ExpertIndexRows out;
     if (n_layer <= 0 || n_expert <= 0) return out;
+    static const bool dbg = [] {
+        const char *e = std::getenv("KRK_EXPERT_DEBUG");
+        return e && e[0] == '1';
+    }();
     const size_t cells = static_cast<size_t>(n_layer) *
                          static_cast<size_t>(n_expert);
     JsonValue root;
     std::string err;
-    if (!json_parse(text, &root, &err) || !root.is_object()) return out;
+    if (!json_parse(text, &root, &err) || !root.is_object()) {
+        // LOUD, because this is the failure that is easiest to misread: an
+        // unparseable file looked exactly like a file about another model, and
+        // the only visible symptom was a warmup and an adapt that did nothing.
+        if (dbg)
+            KRK_WARN("expert index: unparseable JSON (%s) -- %zu bytes read",
+                     err.empty() ? "no detail" : err.c_str(), text.size());
+        return out;
+    }
     std::string kind;
     root.get_string("kind", &kind);
-    if (kind != "kraken-expert-index" || root.get_int("version", 0) != 1)
+    // KRK_EXPERT_DEBUG=1 names the field that failed. A validation that only
+    // says "does not describe this model" cost a debugging session: the file
+    // this same build had just written was rejected and nothing said why.
+    auto reject = [&](const char *why, const char *have, const char *want) {
+        if (dbg)
+            KRK_WARN("expert index: refusing -- %s (file '%s', expected '%s')",
+                     why, have, want);
         return out;
-    if (root.get_int("n_layer", -1) != n_layer ||
-        root.get_int("n_expert", -1) != n_expert)
-        return out;
+    };
+    if (dbg) {
+        std::string fa;
+        root.get_string("arch", &fa);
+        KRK_INFO("expert index: kind='%s' version=%lld layers=%lld experts=%lld "
+                 "arch='%s' size=%lld tokens=%lld (expected kind ok, version 1, "
+                 "%d layers, %d experts, arch '%s', size %llu)",
+                 kind.c_str(),
+                 (long long)root.get_int("version", 0),
+                 (long long)root.get_int("n_layer", -1),
+                 (long long)root.get_int("n_expert", -1), fa.c_str(),
+                 (long long)root.get_int("source_size", -1),
+                 (long long)root.get_int("positions_scanned", -1), n_layer,
+                 n_expert, arch.c_str(), src_size);
+    }
+    if (kind != "kraken-expert-index")
+        return reject("kind", kind.c_str(), "kraken-expert-index");
+    if (root.get_int("version", 0) != 1) return reject("version", "?", "1");
+    if (root.get_int("n_layer", -1) != n_layer)
+        return reject("n_layer", "?", "n_layer");
+    if (root.get_int("n_expert", -1) != n_expert)
+        return reject("n_expert", "?", "n_expert");
     std::string file_arch;
     root.get_string("arch", &file_arch);
-    if (!file_arch.empty() && file_arch != arch) return out;
+    if (!file_arch.empty() && file_arch != arch)
+        return reject("arch", file_arch.c_str(), arch.c_str());
     const i64 isz = root.get_int("source_size", -1);
     // A zero on either side means "unknown" rather than "different": the
     // 64-bit probe is what knows the size, and a fixture has no model file.
     if (isz > 0 && src_size > 0 &&
         static_cast<unsigned long long>(isz) != src_size)
-        return out;
+        return reject("source_size", "?", "the model's size");
     // `positions_scanned` 0 (or absent, which reads as 0) means the file
     // records no measurement at all -- a scan that died before its first
     // position. Its per-layer order is then whatever the one partial forward
