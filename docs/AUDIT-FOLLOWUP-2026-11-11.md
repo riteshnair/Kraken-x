@@ -90,40 +90,52 @@ in both directions, allowing the same fixture to test refusal and publication.
 
 Validation: `test_expert_dispatch_host_backed` passes in the full suite.
 
+## Final numerical and teardown fixes
+
+The shared GEMM, prefill, LFM2, and DSV4 mismatch had one root cause:
+`vec_dot_wide()` defaulted to its eight-lane or sixteen-lane reduction on AVX2.
+That reassociation is not bit-identical to the four-lane `vec_dot` oracle. The
+exact reduction is now the default. `KRK_CPU_DOT_WIDE=1` retains wide reduction
+as an explicit experimental opt-in.
+
+The Qwen4Exp CLI comparison now explicitly selects `--cpu --kv-quant f16`, which
+matches its in-process graph. This fixes the comparison without changing the
+CLI or server production default.
+
+| Group | Final result |
+| --- | ---: |
+| `test_gemm_batched_bit_identical` | 102/102 |
+| `test_prefill_chunk_bitexact` | 27/27 |
+| `test_lfm2_shortconv` | 34/34 |
+| `test_qwen4exp_whole_graph` | 22/22 |
+| `test_dsv4_whole_graph` | 35/35 |
+
+No numerical assertions were weakened or removed.
+
+Engine shutdown now releases every directly allocated workspace member. The
+previous list omitted 16 buffers across MLA, QSA, shortconv, fused QKV, MTP,
+and perplexity paths. `CpuBackend` also frees retained expert-pool entries in
+its destructor after engines return their resident cells.
+
+The original batch-decode ASan reproducer changed from 86/86 checks plus
+132,736 leaked bytes in 17 allocations to **86/86 checks, no LeakSanitizer
+report, exit status 0**, with `ASAN_OPTIONS=detect_leaks=1:halt_on_error=1`.
+
 ## Final observed suite result
 
-Command: release CPU build, `kraken-tests --workers 2 --report /tmp/remain-final-report.json`.
+Command: release CPU build, `kraken-tests` with its default two workers.
 
-Result: **7537/7579 checks passed, 0 crashed groups, 5 failed groups**.
+Result: **7579/7579 checks passed**, no failed or crashed groups. Check totals
+increased from the audited baseline because corrected fixtures reach assertions
+that previously crashed or refused initialization.
 
-This improved from the audited starting point of 7383/7468 checks, 5 crashed
-groups, and 20 failed groups. Check totals changed because corrected fixtures
-now reach assertions that previously crashed or refused initialization.
-
-The baseline comparator reports five newly broken groups against its recorded
-green revision. They remain open:
-
-| Group | Observed | Open contract |
-| --- | ---: | --- |
-| `test_gemm_batched_bit_identical` | 70/102 | Tiled GEMM does not always reproduce `vec_dot` bit for bit |
-| `test_prefill_chunk_bitexact` | 24/27 | Two-row and eight-row prefill differ from single-row reference |
-| `test_lfm2_shortconv` | 30/34 | Shortconv state remains chunk-dependent |
-| `test_qwen4exp_whole_graph` | 20/22 | Chunk and CLI reference hashes differ |
-| `test_dsv4_whole_graph` | 34/35 | Chunk-one row differs from chunk-eight row |
-
-No assertions in these groups were weakened or removed. These are numerical
-correctness failures, not documentation issues.
-
-## Remaining sanitizer finding
-
-LeakSanitizer reports allocations retained after some test fixtures complete,
-including CountingBackend and expert-pool paths. The focused ASan runs show the
-cache overflows are fixed, but teardown ownership is not fully clean. Leak
-detection was disabled only for the two final MTP focused reruns after their
-buffer checks passed. It was not disabled for the initial diagnosis.
-
-A follow-up should trace engine shutdown and test-wrapper ownership, then run
-ASan with leak detection enabled without suppressions.
+A separate complete Debug ASan sweep with leak detection enabled is not green:
+7324/7331 checks, 49 failed groups, and one group that aborted before checks.
+Its findings include an AVX-512 Q8 test buffer overflow, additional fixture
+leaks, and an expert-cache eviction use-after-free in batch throughput. These
+are distinct from the documented batch teardown leaks above and remain open.
+The release and focused teardown results must not be presented as a fully
+sanitizer-clean suite.
 
 ## Audit task status
 
@@ -131,11 +143,12 @@ ASan with leak detection enabled without suppressions.
 | --- | --- |
 | Linux CLI and server build/help consistency | Complete |
 | Windows build/help consistency | Blocked, Windows unavailable |
-| Full test and baseline gate | Executed, five numerical failures remain |
+| Full test and baseline gate | Complete, release suite 7579/7579 |
 | Native Zen 3 and Core Ultra benchmarks | Blocked, target hardware unavailable |
 | Real 1.5 GiB expert-tier model measurement | Blocked, real model and target workload unavailable |
-| Remaining HIP graph audit | Not exhaustive, five CPU numerical groups above take priority |
+| Remaining HIP graph audit | Not exhaustive |
 | Primary-document typography check | Complete |
-| Leak-free ASan teardown | Open |
+| Documented batch teardown leaks | Complete, focused ASan clean |
+| Complete ASan suite | Open, additional unrelated memory findings recorded above |
 
 No external issues or task records were created.

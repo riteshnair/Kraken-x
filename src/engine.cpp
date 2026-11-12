@@ -2992,10 +2992,12 @@ void Engine::shutdown() {
         &ws_xg_, &ws_gateg_, &ws_upg_, &ws_plan_, &ws_alpha_,
                      &ws_scale_, &ws_ebatch_, &ws_edown_, &ws_ebscale_,
                      &ws_qkv_, &ws_z_, &ws_h_, &ws_ssm_, &ws_beta_, &ws_agate_,
-                     &ws_m2in_,
+                     &ws_m2in_, &ws_mla_, &ws_xlat_, &ws_xlat_out_, &ws_ffn_lat_,
+                     &ws_qkv_fused_, &ws_qsa_q_, &ws_qsa_k_, &ws_qsa_kc_, &ws_qsa_vc_,
+                     &ws_sc_, &ws_sc2_, &ws_ppl_, &ws_ppl_g_, &ws_ppl_in_, &ws_ppl_o_,
                      &conv_state_, &rec_state_, &topk_scratch_, &topk_out_,
                      &mtp_kv_k_, &mtp_kv_v_, &mtp_hidden_, &mtp_h_, &mtp_e_,
-                     &mtp_cat_, &mtp_gate_, &mtp_sgate_, &mtp_rep_,
+                     &mtp_cat_, &mtp_gate_, &mtp_sgate_, &mtp_rep_, &mtp_chain_, &mtp_lanes_,
                      &mtp_rec_snap_, &mtp_conv_snap_,
                      &scan_hits_dev_, &scan_mass_dev_}) {
         if (*p) {

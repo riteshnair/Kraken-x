@@ -28389,7 +28389,8 @@ static void test_qwen4exp_whole_graph() {
             return v.empty() ? 0ull : std::strtoull(v.c_str(), nullptr, 16);
         };
         const PrefillProbe cc =
-            run_prefill_hash(exe, path, "the", 8, false, false, "--cpu");
+            run_prefill_hash(exe, path, "the", 8, false, false,
+                             "--cpu --kv-quant f16");
         CHECK(cc.ok, "the CLI prefills the fixture on the CPU reference");
         if (!cc.ok)
             std::fprintf(stderr, "  (cpu run rc=%d TAIL: %.400s)\n", cc.rc,

@@ -598,6 +598,13 @@ public:
         if (npu_) kind_ = BackendKind::NPU;
     }
     ~CpuBackend() override {
+        // Released expert cells are retained for reuse during inference, but
+        // the backend still owns them. Reclaim the complete free pool at
+        // teardown, after all Engine/Model cache drops have returned cells.
+        for (auto &entry : pool_free_)
+            for (void *p : entry.second) host_free(p);
+        pool_free_.clear();
+        pool_free_bytes_ = 0;
         if (npu_) npu::destroy(npu_);
     }
 
