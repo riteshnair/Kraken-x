@@ -79,7 +79,9 @@ struct EngineConfig {
     // with one f32 scale per 32 values, see KvQuant in backend.hpp. The CPU
     // reference implements both; a backend that cannot read the layout refuses
     // the run by name instead of running f16 kernels over int8 bytes.
-    i32 kv_quant = 2; // 0 = f16, 1 = int8, 2 = turbo3 (default), 3 = rot4 (experimental)
+    // Library default stays lossless for API compatibility. The CLI and server
+    // opt into turbo3 explicitly in their own argument defaults.
+    i32 kv_quant = 0; // 0 = f16, 1 = int8, 2 = turbo3, 3 = rot4 (experimental)
     // Expert index path. Empty means `<model_path>.krakenexperts.json`; a
     // workload tag (`--profile coder`) points it at a per-workload file so two
     // workloads never blend into one ranking.

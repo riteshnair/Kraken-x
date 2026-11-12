@@ -598,6 +598,13 @@ public:
         if (npu_) kind_ = BackendKind::NPU;
     }
     ~CpuBackend() override {
+        // Released expert cells are retained for reuse during inference, but
+        // the backend still owns them. Reclaim the complete free pool at
+        // teardown, after all Engine/Model cache drops have returned cells.
+        for (auto &entry : pool_free_)
+            for (void *p : entry.second) host_free(p);
+        pool_free_.clear();
+        pool_free_bytes_ = 0;
         if (npu_) npu::destroy(npu_);
     }
 
@@ -1988,7 +1995,11 @@ public:
     }
 
     size_t kv_row_bytes(i64 kv_dim, KvQuant q, i64 hd = 0) const override {
-        if (q == KvQuant::F16) return static_cast<size_t>(kv_dim) * 2;
+        // The CPU reference cache stores f32 even when the logical GGUF/KV
+        // format is called F16. kv_append and the attention readers use f32
+        // pointers and four-byte strides, so reporting two bytes here
+        // underallocates every CPU cache row.
+        if (q == KvQuant::F16) return static_cast<size_t>(kv_dim) * sizeof(f32);
         if (q == KvQuant::Turbo3 || q == KvQuant::Rot4) {
             // Per kv head: turbo3 is ceil(hd/8)*3 code bytes + one f32 scale,
             // rot4 is (hd/32)*18 (16 nibble bytes + one f16 scale per block).

@@ -5632,9 +5632,10 @@ std::atomic<bool> g_dot_wide_set{false};
 bool vec_dot_wide() {
     if (!g_dot_wide_set.load(std::memory_order_relaxed)) {
         const char *e = std::getenv("KRK_CPU_DOT_WIDE");
-        // Default to true on AVX2-capable hosts: the wide path is the fast path
-        // and the scalar fallback is available via KRK_CPU_DOT_WIDE=0.
-        g_dot_wide.store(e ? (e[0] != '\0' && e[0] != '0') : true,
+        // Exact four-lane reduction is the default. Eight/sixteen-lane
+        // reduction is an explicit throughput tier because it reassociates the
+        // sum and cannot serve as the bit-exact CPU oracle.
+        g_dot_wide.store(e ? (e[0] != '\0' && e[0] != '0') : false,
                          std::memory_order_relaxed);
         g_dot_wide_set.store(true, std::memory_order_relaxed);
     }

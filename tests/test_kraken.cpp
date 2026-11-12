@@ -2289,6 +2289,7 @@ static bool set_kv_tiered_budget(Engine &engine, Backend *cpu, const std::string
     cfg.model_path = path;
     cfg.n_ctx = 16;          // tiny context: the KV byte numbers are small and exact
     cfg.prefill_chunk = 4;
+    cfg.kv_quant = 0;      // these tests assert uncompressed KV byte geometry
     cfg.kv_hot_mb = hot_mb;
     cfg.kv_warm_mb = warm_mb;
     cfg.kv_cold_dir = cold_dir;
@@ -2479,7 +2480,7 @@ static void test_kv_tier_per_layer_widths() {
     i64 n_kv_layers = 0;
     i64 kv_dim_sum = 0;
     i64 max_kv_dim = 0;
-    size_t as = cpu->act_size();
+    const size_t as = cpu->kv_row_bytes(1, KvQuant::F16);
     for (i32 l = 0; l < mc.n_layer; l++) {
         if (!m.layer_has_kv(l)) continue;
         n_kv_layers++;
@@ -11013,13 +11014,10 @@ public:
     u64 host_allocs() const { return host_allocs_; }
     u64 host_releases() const { return host_releases_; }
 
-    // The CPU backend cannot read its own host pool from a "kernel", so the
-    // capability is faked where the cache's half of the contract is under test:
-    // whether a pinned host CELL is publishable, not whether this machine's
-    // driver maps the pool (tools/probe_hostread.hip answers that one).
-    bool host_load_supported() const override {
-        return fake_host_load_ || inner_->host_load_supported();
-    }
+    // Override the wrapped backend in both directions. This fixture tests the
+    // cache's capability gate, including refusal, independently of whether the
+    // underlying CPU backend now supports direct host-resident reads itself.
+    bool host_load_supported() const override { return fake_host_load_; }
     void set_host_load(bool on) { fake_host_load_ = on; }
 
 private:
@@ -18141,6 +18139,7 @@ static void test_http_server() {
     cfg.model_path = kTestModelPath;
     cfg.n_ctx = 64;
     cfg.prefill_chunk = 8;
+    cfg.kv_quant = 2; // match the real server's explicit CLI default
     std::string err;
     const bool inited = engine.init(cpu, cfg, &err);
     CHECK(inited, "http test: engine initialises");
@@ -28390,7 +28389,8 @@ static void test_qwen4exp_whole_graph() {
             return v.empty() ? 0ull : std::strtoull(v.c_str(), nullptr, 16);
         };
         const PrefillProbe cc =
-            run_prefill_hash(exe, path, "the", 8, false, false, "--cpu");
+            run_prefill_hash(exe, path, "the", 8, false, false,
+                             "--cpu --kv-quant f16");
         CHECK(cc.ok, "the CLI prefills the fixture on the CPU reference");
         if (!cc.ok)
             std::fprintf(stderr, "  (cpu run rc=%d TAIL: %.400s)\n", cc.rc,
@@ -31992,21 +31992,20 @@ static void test_mixed_expert_formats() {
         CHECK(ok, ("a uniform routed-expert trio still loads: " + e).c_str());
         m.unload();
     }
-    // The refusal: gate F16, up Q8_0. Both names and both formats, so a reader
-    // is told which tensor to re-quantize.
+    // Per-tensor dispatch supports mixed banks: ExpertSource keeps each
+    // matrix's own type and strides, and gemm_group receives per-matrix types.
+    // Only a fusion that actually requires one common format may refuse this.
     {
         Model m;
         std::string e;
         const bool ok = m.load(*cpu, bad, &e);
-        CHECK(!ok, "a routed trio that mixes formats is refused");
-        CHECK(e.find("mix formats") != std::string::npos,
-              ("the refusal says the experts mix formats: " + e).c_str());
-        CHECK(e.find("ffn_up_exps") != std::string::npos &&
-                  e.find("ffn_gate_exps") != std::string::npos,
-              ("and names both tensors: " + e).c_str());
-        CHECK(e.find("Q8_0") != std::string::npos &&
-                  e.find("F16") != std::string::npos,
-              ("and both formats: " + e).c_str());
+        CHECK(ok, ("a routed trio with per-tensor mixed formats loads: " + e).c_str());
+        CHECK(m.layers()[0].experts.gate->type == DType::F16,
+              "the gate bank retains its own F16 format");
+        CHECK(m.layers()[0].experts.up->type == DType::Q8_0,
+              "the up bank retains its own Q8_0 format");
+        CHECK(m.layers()[0].experts.down->type == DType::F16,
+              "the down bank retains its own F16 format");
         m.unload();
     }
     std::remove(good.c_str());
