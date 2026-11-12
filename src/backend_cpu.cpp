@@ -34,6 +34,27 @@
 namespace krk {
 
 namespace {
+std::atomic<i32> g_act_recovery{[] {
+    const char *e = std::getenv("KRK_ACT_RECOVER");
+    if (!e) return 0;
+    const std::string mode = e;
+    if (mode == "residual" || mode == "1") return 1;
+    if (mode == "adaptive" || mode == "2") return 2;
+    if (mode == "both" || mode == "3") return 3;
+    return 0;
+}()};
+std::atomic<u64> g_act_calls{0}, g_act_fallbacks{0}, g_act_corrections{0};
+std::atomic<bool> g_act_report_registered{false};
+}
+
+void set_activation_recovery_mode(ActivationRecoveryMode mode) {
+    g_act_recovery.store(static_cast<i32>(mode));
+}
+ActivationRecoveryMode activation_recovery_mode() {
+    return static_cast<ActivationRecoveryMode>(g_act_recovery.load());
+}
+
+namespace {
 // Static names so the recorder compares pointers, not strings. The dtype is in
 // the row name because "gemm_other" hid the fact that one format was 41% of a
 // decode run.
@@ -1117,7 +1138,8 @@ public:
                      n_in, rows);
             return false;
         };
-        if (!out || !x || !w || !n_out || n_mat <= 0 || rows <= 0 || n_in <= 0 || xs)
+        if (!out || !x || !w || !n_out || n_mat <= 0 || rows <= 0 || n_in <= 0 || xs ||
+            activation_recovery_mode() != ActivationRecoveryMode::Off)
             return fallback();
         // Uniform type only for the shared int8 fast path: the dot dispatch and
         // activation sidecars (sq4/sx) are type-specific.
@@ -1386,8 +1408,105 @@ public:
         return false;
     }
 
+    void gemm_f32_activation(void *out, const void *x, const void *w, DType wt,
+                             i64 n_out, i64 n_in, i64 rows) {
+        const f32 *xf = static_cast<const f32 *>(x);
+        f32 *of = static_cast<f32 *>(out);
+        const size_t row_bytes = dtype_row_bytes(wt, n_in);
+        const i64 total = rows * n_out;
+        const i64 grain = std::max<i64>(32, std::min<i64>(2048, n_out / 32));
+        if (rows > 1) {
+            const i64 tile = std::max<i64>(1, std::min<i64>(64, n_out));
+            par_for(n_out, tile, 2.0 * static_cast<f64>(total) * n_in,
+                    [&](i64 b, i64 e) {
+                vec_dot_tiled(wt, w, xf, n_in, b, e, rows, of, n_out);
+            });
+            return;
+        }
+        par_for(total, grain, 2.0 * static_cast<f64>(total) * n_in,
+                [&](i64 b, i64 e) {
+            i64 r = b / n_out, o = b - r * n_out;
+            for (i64 f = b; f < e; f++) {
+                of[f] = vec_dot_wide1(wt, static_cast<const u8 *>(w) +
+                                      static_cast<size_t>(o) * row_bytes,
+                                      xf + r * n_in, n_in);
+                if (++o == n_out) { o = 0; r++; }
+            }
+        });
+    }
+
     void gemm(void *out, const void *x, const void *w, DType wt, i64 n_out,
               i64 n_in, i64 rows) override {
+        const ActivationRecoveryMode recovery = activation_recovery_mode();
+        const bool quant_eligible = wt == DType::Q4_K || wt == DType::Q6_K ||
+            wt == DType::Q8_0 || wt == DType::TQ1_0 || wt == DType::PTQ1_0 ||
+            wt == DType::TQ2_0 || wt == DType::PQ2_0 || wt == DType::Q2_0 ||
+            wt == DType::Q2_0_64 || wt == DType::Q2_K || wt == DType::Q3_K;
+        if (recovery == ActivationRecoveryMode::Off || npu_ || !quant_eligible ||
+            n_in <= 0 || (n_in % 256) != 0 || rows <= 0 || !vec_dot_int8()) {
+            gemm_base(out, x, w, wt, n_out, n_in, rows);
+            return;
+        }
+        if (!g_act_report_registered.exchange(true)) {
+            std::atexit([] {
+                KRK_INFO("activation recovery: %llu GEMM call(s), %llu residual, %llu F32 fallback",
+                         (unsigned long long)g_act_calls.load(),
+                         (unsigned long long)g_act_corrections.load(),
+                         (unsigned long long)g_act_fallbacks.load());
+            });
+        }
+        g_act_calls++;
+        const f32 *xf = static_cast<const f32 *>(x);
+        const i64 nb = n_in / 32;
+        std::vector<i8> qx(static_cast<size_t>(rows * n_in));
+        std::vector<f32> dx(static_cast<size_t>(rows * nb));
+        bool risky = false;
+        if (recovery == ActivationRecoveryMode::Adaptive || recovery == ActivationRecoveryMode::Both) {
+            const char *rtext = std::getenv("KRK_ACT_RISK");
+            const f32 threshold = rtext ? std::max(0.0, std::atof(rtext)) : 0.35;
+            const char *dtext = std::getenv("KRK_ACT_DISCARD");
+            const f32 discard_limit = dtext ? std::max(0.0, std::atof(dtext)) : 0.05;
+            for (i64 r = 0; r < rows && !risky; r++) {
+                quantize_q8_row(xf + r * n_in, n_in, qx.data() + r * n_in, dx.data() + r * nb);
+                double se = 0.0, sx = 0.0;
+                i64 discarded = 0;
+                for (i64 i = 0; i < n_in; i++) {
+                    const f32 v = xf[r * n_in + i];
+                    const f32 q = dx[r * nb + i / 32] * qx[r * n_in + i];
+                    const double d = static_cast<double>(v) - q;
+                    se += d * d;
+                    sx += static_cast<double>(v) * v;
+                    if (v != 0.0f && q == 0.0f) discarded++;
+                }
+                const double relative = std::sqrt(se / std::max(sx, 1e-30));
+                if (relative > threshold || static_cast<f32>(discarded) > discard_limit * n_in)
+                    risky = true;
+            }
+        }
+        if (risky) {
+            g_act_fallbacks++;
+            gemm_f32_activation(out, x, w, wt, n_out, n_in, rows);
+            return;
+        }
+        gemm_base(out, x, w, wt, n_out, n_in, rows);
+        if (recovery != ActivationRecoveryMode::Residual && recovery != ActivationRecoveryMode::Both)
+            return;
+        g_act_corrections++;
+        std::vector<f32> residual(static_cast<size_t>(rows * n_in));
+        for (i64 r = 0; r < rows; r++) {
+            quantize_q8_row(xf + r * n_in, n_in, qx.data() + r * n_in, dx.data() + r * nb);
+            for (i64 i = 0; i < n_in; i++)
+                residual[r * n_in + i] = xf[r * n_in + i] -
+                    dx[r * nb + i / 32] * qx[r * n_in + i];
+        }
+        std::vector<f32> correction(static_cast<size_t>(rows * n_out));
+        gemm_f32_activation(correction.data(), residual.data(), w, wt, n_out, n_in, rows);
+        f32 *of = static_cast<f32 *>(out);
+        for (i64 i = 0; i < rows * n_out; i++) of[i] += correction[i];
+    }
+
+    void gemm_base(void *out, const void *x, const void *w, DType wt, i64 n_out,
+                   i64 n_in, i64 rows) {
         // The virtual NPU computes this dot product block on its own SIMD
         // kernels. It returns false -- having written nothing -- for a shape or
         // weight type it cannot take, and the reference loop below then runs

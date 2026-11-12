@@ -22,6 +22,13 @@
 
 namespace krk {
 
+// Opt-in CPU activation-quantization recovery. Off is the production default.
+// Residual adds Wq*(x-Q(x)); Adaptive selects the F32 activation path for risky
+// rows; Both applies residual recovery only below the adaptive risk threshold.
+enum class ActivationRecoveryMode : i32 { Off = 0, Residual = 1, Adaptive = 2, Both = 3 };
+void set_activation_recovery_mode(ActivationRecoveryMode mode);
+ActivationRecoveryMode activation_recovery_mode();
+
 enum class BackendKind {
     CPU,
     HIP,
