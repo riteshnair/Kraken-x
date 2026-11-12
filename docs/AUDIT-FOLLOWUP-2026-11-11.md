@@ -129,13 +129,24 @@ Result: **7579/7579 checks passed**, no failed or crashed groups. Check totals
 increased from the audited baseline because corrected fixtures reach assertions
 that previously crashed or refused initialization.
 
-A separate complete Debug ASan sweep with leak detection enabled is not green:
-7324/7331 checks, 49 failed groups, and one group that aborted before checks.
-Its findings include an AVX-512 Q8 test buffer overflow, additional fixture
-leaks, and an expert-cache eviction use-after-free in batch throughput. These
-are distinct from the documented batch teardown leaks above and remain open.
-The release and focused teardown results must not be presented as a fully
-sanitizer-clean suite.
+The subsequent complete Debug ASan pass repaired the remaining findings. The
+Q8 x8 fixture now allocates the complete eight-row activation, scale, and weight
+tiles its API reads. Batched MoE resolution leases every acquired slot until its
+launches finish, so later admissions cannot evict an earlier slot.
+
+Model teardown now covers the complete QuantTensor registry and the newer f32
+weight fields, global norm aliases, PLE and HC tensors, dense and HF MTP tensors,
+and LFM2 state. Direct-model and direct-backend fixtures release their resources
+in backend-safe order on success and refusal paths.
+
+Final full-suite results:
+
+| Configuration | Result |
+| --- | --- |
+| Release CPU | 7579/7579 checks, exit 0 |
+| Debug ASan, `detect_leaks=1:halt_on_error=1` | 7579/7579 checks, exit 0 |
+
+No leak suppression or assertion weakening was used.
 
 ## Audit task status
 
@@ -149,6 +160,6 @@ sanitizer-clean suite.
 | Remaining HIP graph audit | Not exhaustive |
 | Primary-document typography check | Complete |
 | Documented batch teardown leaks | Complete, focused ASan clean |
-| Complete ASan suite | Open, additional unrelated memory findings recorded above |
+| Complete ASan suite | Complete, 7579/7579 with leak detection enabled |
 
 No external issues or task records were created.

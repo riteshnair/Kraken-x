@@ -2995,6 +2995,13 @@ void Engine::shutdown() {
                      &ws_m2in_, &ws_mla_, &ws_xlat_, &ws_xlat_out_, &ws_ffn_lat_,
                      &ws_qkv_fused_, &ws_qsa_q_, &ws_qsa_k_, &ws_qsa_kc_, &ws_qsa_vc_,
                      &ws_sc_, &ws_sc2_, &ws_ppl_, &ws_ppl_g_, &ws_ppl_in_, &ws_ppl_o_,
+                     &ws_hc_, &ws_hc_n_, &ws_hc_fn_, &ws_hc_pre_, &ws_hc_post_,
+                     &ws_hc_comb_, &ws_hc_out_, &ws_hc_new_, &ws_hc_pre_attn_,
+                     &ws_hc_pre_prev_, &ws_hc_head_, &ws_hc_one_, &ws_hc_mix_,
+                     &ws_hc_g_, &ws_hc_lo_, &ws_hc_inj_, &ws_eng_kv_, &ws_eng_rows_,
+                     &ws_ple_emb_, &ws_ple_key_, &ws_ple_qry_, &ws_ple_gated_,
+                     &ws_ple_val_, &ws_ple_norm_, &ws_ple_gate_, &ws_ple_pad_,
+                     &ws_ple_conv_, &ple_state_, &sc_state_,
                      &conv_state_, &rec_state_, &topk_scratch_, &topk_out_,
                      &mtp_kv_k_, &mtp_kv_v_, &mtp_hidden_, &mtp_h_, &mtp_e_,
                      &mtp_cat_, &mtp_gate_, &mtp_sgate_, &mtp_rep_, &mtp_chain_, &mtp_lanes_,
@@ -11265,6 +11272,19 @@ bool Engine::moe_decode_batch(const LayerWeights &L, i32 layer, i32 k, i32 ne,
     // first is gone by the time the launches read it.
     if (model_.experts().capacity_slots() < batch_ids_.size()) return false;
 
+    // Hold the slot nodes and their cells across the complete resolve window.
+    // Total capacity does not prevent a WARM/HOT rebalance from evicting an
+    // earlier slot while a later expert is admitted.
+    struct BatchLeases {
+        ExpertCache &cache;
+        const std::vector<i32> &ids;
+        i32 layer;
+        size_t held = 0;
+        ~BatchLeases() {
+            for (size_t i = 0; i < held; i++) cache.set_lease(layer, ids[i], false);
+        }
+    } leases{model_.experts(), batch_ids_, layer};
+
     // Every expert is resolved BEFORE the first launch, so a refusal here has
     // issued nothing and the caller can fall back safely.
     batch_res_.clear();
@@ -11281,6 +11301,8 @@ bool Engine::moe_decode_batch(const LayerWeights &L, i32 layer, i32 k, i32 ne,
             return false;
         }
         batch_res_.push_back(re);
+        model_.experts().set_lease(layer, e, true);
+        leases.held++;
     }
 
     // Every resolved expert must still be its OWN slot. `acquire()` below

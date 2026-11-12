@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstring>
 #include <memory>
+#include <unordered_set>
 
 namespace krk {
 
@@ -98,7 +99,15 @@ std::vector<QuantTensor *> qt_fields(LayerWeights &L) {
             &L.ssm_alpha,  &L.ssm_beta,
             // LatentMoE's pair: the narrow projection the routed bank reads and
             // the one that lifts its result back to n_embd.
-            &L.latent_down, &L.latent_up};
+            &L.latent_down, &L.latent_up,
+            &L.wqkv_fused, &L.wup_fused, &L.attn_v_gate, &L.attn_v_exps,
+            &L.ple_inp_gate, &L.ple_proj,
+            &L.hc_attn_down, &L.hc_attn_up, &L.hc_attn_inject,
+            &L.hc_ffn_down, &L.hc_ffn_up, &L.hc_ffn_inject,
+            &L.hc_attn_fn, &L.hc_ffn_fn, &L.engram_kv,
+            &L.ple_key, &L.ple_value, &L.ple_conv1d,
+            &L.idx_q_proj, &L.idx_k_proj,
+            &L.sc_in, &L.sc_out, &L.sc_conv};
 }
 
 } // namespace
@@ -6377,7 +6386,14 @@ void Model::unload() {
         // expert groups read them on the device.
         for (f32 *f : {L.wo_bias, L.exp_gate_bias, L.exp_up_bias, L.exp_down_bias})
             if (f) be_->release(f);
-        for (f32 *f : {L.ssm_dt, L.ssm_a, L.ssm_norm})
+        for (f32 *f : {L.ssm_dt, L.ssm_a, L.ssm_norm, L.ssm_conv_bias,
+                       L.attn_norm_bias, L.ffn_norm_bias, L.qkv_bias,
+                       L.attn_v_gate_b, L.ple_post_norm,
+                       L.hc_attn_norm, L.hc_ffn_norm,
+                       L.hc_attn_base, L.hc_ffn_base,
+                       L.hc_attn_scale, L.hc_ffn_scale, L.engram_gate,
+                       L.ple_norm_key, L.ple_norm_query, L.ple_norm_conv,
+                       L.idx_q_norm, L.idx_k_norm})
             if (f) be_->release(f);
         // The router bias is HOST memory (see LayerWeights::router_bias): the
         // top-k that reads it runs on the host. It used to be freed through
@@ -6422,7 +6438,16 @@ void Model::unload() {
     if (tok_embd_.present() && !in_map(tok_embd_.data)) be_->release(tok_embd_.data);
     if (!cfg_.tied_embeddings && out_head_.present() && !in_map(out_head_.data))
         be_->release(out_head_.data);
-    if (out_norm_) be_->release(out_norm_);
+    for (QuantTensor *q : {&pos_embd_, &hc_head_down_, &hc_head_up_, &hc_head_fn_,
+                           &ple_tok_embd, &ple_model_proj})
+        if (q->present() && !in_map(q->data)) be_->release(q->data);
+    // Several families deliberately alias the input and output embedding norm.
+    // Release each owned allocation once while retaining those shared pointers
+    // for the lifetime of the graph.
+    std::unordered_set<f32 *> released_global_f32;
+    for (f32 *f : {out_norm_, out_norm_bias_, embd_norm_, embd_norm_bias_,
+                   hc_head_norm_, hc_head_base_, hc_head_scale_, ple_proj_norm})
+        if (f && released_global_f32.insert(f).second) be_->release(f);
     if (prefetch_host_) be_->release_host(prefetch_host_);
     prefetch_host_ = nullptr;
     read_buf_[0] = nullptr;
@@ -6469,11 +6494,17 @@ void Model::unload() {
     for (QuantTensor *q : {&mtp_.wq, &mtp_.wk, &mtp_.wv, &mtp_.wo,
                            &mtp_.router, &mtp_.shexp_gate, &mtp_.shexp_up,
                            &mtp_.shexp_down, &mtp_.shexp_inp_gate,
-                           &mtp_.eh_proj})
+                           &mtp_.ffn_gate, &mtp_.ffn_up, &mtp_.ffn_down,
+                           &mtp_.eh_proj, &mtp_.fc_embedding, &mtp_.fc_hidden,
+                           &mtp_.index_q, &mtp_.index_k,
+                           &mtp_.hc_attn.down, &mtp_.hc_attn.up, &mtp_.hc_attn.inject,
+                           &mtp_.hc_ffn.down, &mtp_.hc_ffn.up, &mtp_.hc_ffn.inject,
+                           &mtp_.hc_head.down, &mtp_.hc_head.up, &mtp_.hc_head.inject})
         if (q->present()) be_->release(q->data);
     for (f32 *f : {mtp_.attn_norm, mtp_.post_attn_norm, mtp_.q_norm,
                    mtp_.k_norm, mtp_.enorm, mtp_.hnorm,
-                   mtp_.shared_head_norm})
+                   mtp_.shared_head_norm, mtp_.index_q_norm, mtp_.index_k_norm,
+                   mtp_.hc_attn.norm, mtp_.hc_ffn.norm, mtp_.hc_head.norm})
         if (f) be_->release(f);
     if (mtp_.router_bias) host_free(mtp_.router_bias);
     // The dspark body's weights live in a LayerWeights (they are a trunk
@@ -6484,9 +6515,16 @@ void Model::unload() {
             if (q->present()) be_->release(q->data);
         for (f32 *f : {mtp_.dspark_layer.attn_norm, mtp_.dspark_layer.ffn_norm,
                        mtp_.dspark_layer.wq_a_norm, mtp_.dspark_layer.wkv_norm,
+                       mtp_.dspark_layer.wkv_a_norm,
+                       mtp_.dspark_layer.hc_attn_norm, mtp_.dspark_layer.hc_ffn_norm,
                        mtp_.dspark_layer.hc_attn_base, mtp_.dspark_layer.hc_ffn_base,
                        mtp_.dspark_layer.hc_attn_scale,
-                       mtp_.dspark_layer.hc_ffn_scale, mtp_.dspark_layer.sinks})
+                       mtp_.dspark_layer.hc_ffn_scale, mtp_.dspark_layer.sinks,
+                       mtp_.dspark_layer.idx_q_norm, mtp_.dspark_layer.idx_k_norm,
+                       mtp_.dspark_layer.engram_gate,
+                       mtp_.dspark_layer.ple_norm_key,
+                       mtp_.dspark_layer.ple_norm_query,
+                       mtp_.dspark_layer.ple_norm_conv})
             if (f) be_->release(f);
         if (mtp_.dspark_layer.router_bias)
             host_free(mtp_.dspark_layer.router_bias);
