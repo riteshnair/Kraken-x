@@ -3,7 +3,7 @@ Kraken target architecture — a tiered, device-resident inference engine
 Status: design. Nothing here is implemented. Every "current" number was measured
 on the RX 6700 XT (gfx1031) against llama.cpp built natively for HIP on the same
 card and the same files. Evidence: docs/traces/*.txt; gap register in
-docs/TODO.md from the G12 session entry onward.
+../TO-DO.md from the G12 session entry onward.
 
 
 1. What the measurements say the problem is

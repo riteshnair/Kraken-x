@@ -101,7 +101,7 @@ is not reproducible from the repository -- no gptneox or phi2 fixture exists in
 the suite pins today is the ROW (`test_arch_row_pins` asserts gptneox's
 `parallel_residual`, `fused_qkv`, `ln_bias`, `no_gate_ffn` and `rope_neox`), not
 the graph. A file-level A/B for `parallel_residual` is still owed;
-see `docs/TODO-alignment-2026-10-29.md` (B5).
+see `../TO-DO.md` (B5).
 
 `kraken-inspect` reports all three as `supported (dense)` / `runnable`;
 `kraken-tests` **6566/6566** (2026-10-29).
@@ -121,7 +121,7 @@ guesses at the numerical cause were wrong.
 `falcon` needs ALiBi plus parallel attention with multiquery — and two
 *different* norms in the parallel branch, unlike GPT-NeoX's shared row.
 (`mpt` and `bloom` were the other two entries here; they are supported now, see
-[ALIBI-AND-MPT-BLOOM.md](ALIBI-AND-MPT-BLOOM.md).) `mamba` and `rwkv` are not transformer
+[../TO-DO.md](../TO-DO.md).) `mamba` and `rwkv` are not transformer
 stacks at all: a selective state-space recurrence and a linear-attention
 recurrence respectively, and neither is the gated delta net this engine already
 implements. Those five are the honest remainder of the spec's list.

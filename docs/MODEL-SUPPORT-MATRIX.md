@@ -23,7 +23,7 @@ stops a model running.
 `docs/PLAIN-PRENORM-FAMILY.md`. That clears Phi-3-mini, Phi-4-reasoning-plus and
 adds six of the GGUF spec's own "known values" architectures — `mpt` and
 `bloom` bring ALiBi, `falcon` a parallel branch with two norms — see
-`docs/ALIBI-AND-MPT-BLOOM.md`.
+`docs/../TO-DO.md`.
 
 **Update (2026-10-29):** every recognised-but-pending family now has a fixture
 built from its own definition, run once, and deleted again —

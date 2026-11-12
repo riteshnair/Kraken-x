@@ -1,13 +1,11 @@
-# Whitelist-based ignore: this workspace also holds experiment scratch,
-# build outputs, logs, and model/data artifacts. Only the Kraken project
-# itself is tracked.
+# Whitelist-based ignore: experiment scratch, build outputs, logs, and model
+# artifacts stay outside Git. Only the Kraken project sources and current docs
+# are tracked.
 /*
 !/.gitignore
 !/CMakeLists.txt
 !/README.md
-!/more-info.md
 !/AGENTS.md
-!/PENDING-TO-DO.md
 !/TO-DO.md
 !/include/
 !/src/
@@ -16,30 +14,35 @@
 !/tools/
 !/docs/
 !/palcfg/
-# Patches carried against sibling projects (npuxl), applied by hand.
+# Source patches carried against sibling projects, applied by hand.
 !/patches/
 
-# Python bytecode from the tools/ helpers.
+# Python bytecode and editor/tool caches.
 __pycache__/
 *.pyc
+.pytest_cache/
 
-# Docs: keep the written docs, drop probe transcripts
+# Build, sanitizer, test, and profiling outputs.
+build*/
+cmake-build-*/
+krk-tests-*/
+*.log
+*.err
+*.out
+*.prof
+*.profraw
+*.gcda
+*.gcno
+*.core
+core
+reports/
+
+# Keep current written documentation, not generated transcripts or traces.
 /docs/*
 !/docs/*.md
+/docs/traces/
 
-# Shareable performance evidence: per-op traces, baseline runs, results.
-# This repeats /docs/* so the traces whitelist sits after it; without the
-# repeat the earlier !/docs/*.md is overridden and every new doc is ignored.
-/docs/*
-!/docs/*.md
-!/docs/traces/
-!/docs/traces/**
-
-# Model weights. Never in the repo: one file is bigger than the whole packfile
-# budget, GitHub refuses anything over 100 MB outright (so a push that includes
-# one is a push that never finishes), and the Drive connector stages downloads
-# in google_drive/ inside whatever directory it is called from -- which is this
-# checkout. Weights live outside the tree, in ../models.
+# Model weights and downloaded data never belong in this repository.
 *.gguf
 *.ggml
 *.safetensors
@@ -48,3 +51,8 @@ __pycache__/
 *.npz
 google_drive/
 models/
+
+# Binary patch archives and experiment bundles. Source patches remain tracked.
+*.zip
+*.tar
+*.tar.gz

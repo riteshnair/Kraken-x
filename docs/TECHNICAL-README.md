@@ -74,7 +74,7 @@ that is accessed sparsely, so they get their own cache:
 path, and it is what the CPU backend does by construction: the weights are
 `mmap`ed, the expert cache holds a budgeted resident set, and everything else
 is a page fault away. Measured on a 2.3 GiB / 32-expert model on a 3.8 GiB box
-with a 512 MiB budget — see [BENCH-CPU-DOT.md](BENCH-CPU-DOT.md) §6.
+with a 512 MiB budget — see [CPU-LOWBIT-VNNI.md](CPU-LOWBIT-VNNI.md) §6.
 
 **The asymmetry you should expect, and why it is not a bug:** decode reads the
 same `top-k` experts every step (12.5% of the pool for 4-of-32), so a warm cache
@@ -104,7 +104,7 @@ in the same order as the path it replaces. `test_gemm_batched_bit_identical`
 and an unchanged `--prefill-hash` end to end on both a q8_0 MoE and an f16 dense
 file. The first attempt -- widening each weight row to f32 and reusing it -- was
 1.9x SLOWER and was reverted; it is written up in
-[MOE-RESIDENCY.md §7](MOE-RESIDENCY.md) because it is the obvious first idea.
+[ARCHITECTURE-TIERED.md §7](ARCHITECTURE-TIERED.md) because it is the obvious first idea.
 
 **This also changed the residency conclusion.** Prefill used to look immune to
 expert residency (13.68 s against 13.95 s). It looked that way because compute
@@ -115,7 +115,7 @@ and is kept for its decode column, which is still current.
 
 ### The measured ladder (2026-10-27)
 
-Full tables in [MOE-RESIDENCY.md](MOE-RESIDENCY.md); the shape of the result, on
+Full tables in [ARCHITECTURE-TIERED.md](ARCHITECTURE-TIERED.md); the shape of the result, on
 a 1.2 GiB q8_0 MoE (20 layers, 32 experts, top-4) on 2 vCPU:
 
 | | all resident | 64 MiB | 16 MiB |
@@ -138,7 +138,7 @@ On the virtual NPU the asymmetry becomes a cliff rather than a slope: with
 `KRK_NPU_W8A8=1` decode is 32.8 ms/token resident against 416–719 ms/token when
 experts stream, because the int8 pack is memoized per weight address and a
 streaming slot changes address on every visit. The mechanism, the rejected fix
-and the numbers are in [MOE-RESIDENCY.md §5](MOE-RESIDENCY.md).
+and the numbers are in [ARCHITECTURE-TIERED.md §5](ARCHITECTURE-TIERED.md).
 
 Prefetch and prediction, all opt-in and all measured before being believed:
 
@@ -211,7 +211,7 @@ faster.
 
 Exactness witness: **4576/4576 checks unchanged** across the change (4621/4621
 with the opt-in block-format test added), golden hashes included. Full record, method, block-format limits and remaining
-headroom: [BENCH-CPU-DOT.md](BENCH-CPU-DOT.md).
+headroom: [CPU-LOWBIT-VNNI.md](CPU-LOWBIT-VNNI.md).
 
 Known limits, stated because they are the next person's starting point:
 
@@ -223,7 +223,7 @@ Known limits, stated because they are the next person's starting point:
   1.4e-07 of the term magnitude. While it is on, the CPU arm is **no longer a
   bit-exact oracle**, so turn it off before comparing against `--device` or
   `--npu`. Witness and numbers: `tools/dot_fast_witness.py`,
-  [BENCH-CPU-DOT.md](BENCH-CPU-DOT.md) §5.
+  [CPU-LOWBIT-VNNI.md](CPU-LOWBIT-VNNI.md) §5.
 - Dense weights are re-read once per row of `x`. Inverting the loop is not
   enough (`vec_dot` re-widens each call); it needs a widened row reused across
   a row block, with output blocking to keep the activation block in L2.
@@ -243,7 +243,7 @@ streaming tier, and that is a genuine gap for dense models larger than RAM.
 every weight row was decoded once per row of the batch. `vec_dot_tiled()` decodes
 each block once into registers and reuses it across eight rows; 2.28-3.35x on
 the q8_0 MoE and 3.83-4.29x on f16 dense, bit-identical, decode untouched. Full
-write-up and the rejected first attempt: [MOE-RESIDENCY.md §7](MOE-RESIDENCY.md).
+write-up and the rejected first attempt: [ARCHITECTURE-TIERED.md §7](ARCHITECTURE-TIERED.md).
 
 ## 6. The NPU path
 
@@ -399,10 +399,10 @@ ON and configuration fails without it.
 
 | document | covers |
 |---|---|
-| [MOE-RESIDENCY.md](MOE-RESIDENCY.md) | expert residency against prefill and decode, the WARM tier, chunk size, the CPU/NPU arms, the int8+streaming cliff |
+| [ARCHITECTURE-TIERED.md](ARCHITECTURE-TIERED.md) | expert residency against prefill and decode, the WARM tier, chunk size, the CPU/NPU arms, the int8+streaming cliff |
 | [OPTIONS-MATRIX.md](OPTIONS-MATRIX.md) | every flag and `KRK_*` variable, the ones that decide throughput first, the full list by owning file |
-| [BENCH-CPU-DOT.md](BENCH-CPU-DOT.md) | the dot-product finding, the 2 GiB MoE experiment, block-format limits, headroom |
-| [CPU-VS-NPU-BENCHMARK.md](CPU-VS-NPU-BENCHMARK.md) | the NPU path end to end: w8a8, device attention, refusal rules, repro commands |
+| [CPU-LOWBIT-VNNI.md](CPU-LOWBIT-VNNI.md) | the dot-product finding, the 2 GiB MoE experiment, block-format limits, headroom |
+| [CPU-LOWBIT-VNNI.md](CPU-LOWBIT-VNNI.md) | the NPU path end to end: w8a8, device attention, refusal rules, repro commands |
 | [ARCHITECTURE.md](ARCHITECTURE.md), [ARCHITECTURE-TIERED.md](ARCHITECTURE-TIERED.md) | module layout and the residency tiers |
-| [DEEP-DIVE-MOE-PREFILL-DECODE-2026-10-22.md](DEEP-DIVE-MOE-PREFILL-DECODE-2026-10-22.md) | the MoE prefill/decode investigation on real checkpoints |
-| [AUDIT-pending-index.md](AUDIT-pending-index.md) | what is settled, what is open, and what was tried and lost |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | the MoE prefill/decode investigation on real checkpoints |
+| [../TO-DO.md](../TO-DO.md) | what is settled, what is open, and what was tried and lost |

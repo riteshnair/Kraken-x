@@ -333,7 +333,7 @@ that the latest source compiled.
 - [README](../README.md): build and quick-start overview.
 - [Architecture](ARCHITECTURE.md): major components and execution flow.
 - [CPU low-bit VNNI](CPU-LOWBIT-VNNI.md): optimized quantized CPU kernels.
-- [Benchmark loading](BENCH-LOADING.md): resident and streamed weight measurements.
-- [Engineering notes](ENGINEERING-NOTES.md): historical implementation detail.
-- [Implementation audit](AUDIT-GOLI-MAT-DE-2026-11-11.md): verified findings and
+- [Benchmark loading](USER-GUIDE.md): resident and streamed weight measurements.
+- [Engineering notes](TECHNICAL-README.md): historical implementation detail.
+- [Implementation audit](../TO-DO.md): verified findings and
   remaining gaps.

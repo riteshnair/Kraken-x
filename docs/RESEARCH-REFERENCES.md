@@ -34,7 +34,6 @@ last arm. Two things moved: the pool's hand-out learned to express its reuse
 dependency as a stream wait and save the host query -- `alloc` 2445.5 -> 3.4 ms,
 with `alloc 819 reuse 18231` hand-outs -- and `pinned_warm_prefix_bytes` stopped
 keeping half the tier pageable, which is the 7.2 -> 14.8 row. Both changes are
-recorded with their own A/Bs in `docs/AUDIT-gpu-resident-expert-cache.md`; the
 old rows are kept here only as the historical reading.)
 
 So the ranking is *conditional*, and the condition is where the working set sits:
@@ -87,7 +86,6 @@ stdout** -- and making that publish non-blocking changed nothing, so the rate is
 Then slot-addressed dispatch, then the in-graph fill, and the LFU port last. Do not take their plain
 LRU (rejected here on measurement), their per-layout-group budgets, or zero-slot substitution
 (every routed expert must run). Full comparison, gates per step and the REAP-288 file's 78.04
-GiB / 65.4 GiB-of-experts shape: `docs/AUDIT-gpu-resident-expert-cache.md`.
 
 ### PS5LM-Plus (abhi245y, 2026-10) -- a console appliance, not an engine to borrow from
 **What it is:** a jailbroken-PS5 homebrew app that embeds llama.cpp and runs GGUF on
@@ -198,7 +196,6 @@ to the flat cache on the small models (7 decode arms, `scripts/kv_tier_geometry_
 two KV planes sharing one cold-file namespace spilled 1916 pages, restored 1860,
 reported 0 dropped, and produced fluent text that differed from the flat cache.
 That is why every compression scheme above needs the verbatim-copy gate the plan
-asks for, and why `docs/AUDIT-plan-vs-code.md` calls paged KV a rewrite of the
 per-layer geometry rather than an addition beside it.
 **Open:** page tables, refcounts, prefix hashes, any KV quantisation.
 
@@ -258,7 +255,6 @@ the drafter is not trained, it is *shipped*. `C:\Strata-HIP-data\mtp\` holds
 shards"), `mtp-q2_0.gguf` (889,014,272 bytes, with a per-tensor format report) and
 the `--mtp .../rt` directory its configs pass beside `--spec 4 --spec-min-p 0.5`.
 kraken recognizes `mtp.*` shards only to refuse them (`src/arch.cpp:113`). See
-`docs/STRATA-VS-KRAKEN.md` for the measured head-to-head this came out of.
 
 ---
 
@@ -299,4 +295,3 @@ No paper's internal numbers were reproduced here, no GPU other than gfx1201 was
 run, and nothing in the notes above is a claim about a paper's implementation.
 Where a number appears, it came from a command in this repo; where a capability is
 called missing, the search that found nothing is stated in
-`docs/AUDIT-plan-vs-code.md`.

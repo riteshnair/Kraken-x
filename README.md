@@ -30,9 +30,9 @@ and selected backend. A GGUF extension alone does not prove that a file is
 runnable. Run `kraken-inspect` first. Kraken refuses unsupported features by name
 instead of silently substituting a different model graph.
 
-The longer engineering history is preserved in
-[docs/ENGINEERING-NOTES.md](docs/ENGINEERING-NOTES.md). This README focuses on
-building and using the current tree.
+See the [user guide](docs/USER-GUIDE.md) for detailed operation and the current
+[pending-work list](TO-DO.md) for verified gaps. This README focuses on building
+and using the current tree.
 
 ## Quick start
 
@@ -322,12 +322,9 @@ otherwise make a failed build appear successful.
 - [Tiered architecture](docs/ARCHITECTURE-TIERED.md): residency and storage.
 - [CPU low-bit VNNI](docs/CPU-LOWBIT-VNNI.md): optimized kernels, controls,
   validation, and isolated measurements.
-- [Engineering notes](docs/ENGINEERING-NOTES.md): historical design details and
-  model-specific implementation notes.
-- [Current implementation audit](docs/AUDIT-GOLI-MAT-DE-2026-11-11.md): audited
-  scope, confirmed findings, fixes, and remaining work.
-- [Audit follow-up](docs/AUDIT-FOLLOWUP-2026-11-11.md): cache-safety fixes,
-  restored memory controls, sanitizer evidence, and remaining numerical gates.
+- [Model support](docs/MODEL-SUPPORT-MATRIX.md): architecture and schema support.
+- [Technical reference](docs/TECHNICAL-README.md): implementation details.
+- [Pending work](TO-DO.md): the single current list of gaps and blocked validation.
 
 When documentation and `kraken --help` disagree, inspect the current parser and
 report the mismatch. Performance tables are historical unless they identify the
