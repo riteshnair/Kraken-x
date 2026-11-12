@@ -965,13 +965,10 @@ void deq_ptq1_0(const u8 *b, f32 *y, i64 nblk) {
 // bytes. So the kernel is pinned to the reference decoder rather than to a
 // second opinion about the layout.
 
-// Fill `vals` (256) and `dsub` (16) for one Q3_K block; returns nothing.
-static void q3k_unpack(const u8 *b, i8 *vals, f32 *dsub) {
+static void q3k_scales(const u8 *b, f32 *dsub) {
     constexpr u32 kMask1 = 0x03030303u;
     constexpr u32 kMask2 = 0x0f0f0f0fu;
     const f32 d_all = fp16_to_fp32(static_cast<u16>(b[108] | (b[109] << 8)));
-    const u8 *hm = b;
-    const u8 *q = b + 32;
     u32 aux[4];
     std::memset(aux, 0, sizeof(aux));
     std::memcpy(aux, b + 96, 12);
@@ -981,33 +978,29 @@ static void q3k_unpack(const u8 *b, i8 *vals, f32 *dsub) {
     aux[0] = (aux[0] & kMask2) | (((tmp >> 0) & kMask1) << 4);
     aux[1] = (aux[1] & kMask2) | (((tmp >> 2) & kMask1) << 4);
     const i8 *scales = reinterpret_cast<const i8 *>(aux);
-    const __m128i m3 = _mm_set1_epi8(3);
-    const __m128i m1 = _mm_set1_epi8(1);
-    const __m128i four = _mm_set1_epi8(4);
-    for (int s = 0; s < 16; s++) {
+    for (int s = 0; s < 16; s++)
         dsub[s] = d_all * static_cast<f32>(scales[s] - 32);
-        // Sub-block s covers values [s*16, s*16+16): the low/high half of the
-        // 2j bit-plane, in the 128-value group s/8. Value v's quantum byte is
-        // hm[v % 32] and its hmask bit is v/32 == s/2.
-        const int nn = s / 8, j = (s % 8) / 2, half = s % 2;
-        const u8 *qq = q + nn * 32 + half * 16;
-        const u8 *hh = hm + half * 16;
-        const __m128i qv = _mm_loadu_si128(reinterpret_cast<const __m128i *>(qq));
-        const __m128i hv = _mm_loadu_si128(reinterpret_cast<const __m128i *>(hh));
-        // The 2-bit plane, sixteen values at once. A 16-bit-lane shift would
-        // pull the neighbouring byte's low bits into the high byte, but the
-        // mask to 2 bits discards exactly those, for both bytes of every lane.
-        const __m128i q2 = _mm_and_si128(
-            _mm_srl_epi16(qv, _mm_cvtsi32_si128(2 * j)), m3);
-        // The hmask bit is UNIFORM across the group (it is s/2), so the same
-        // 16-bit-lane shift is exact here too once masked to one bit.
-        const __m128i hb = _mm_and_si128(
-            _mm_srl_epi16(hv, _mm_cvtsi32_si128(s / 2)), m1);
-        // value = q2 - (hb ? 0 : 4) = q2 + 4*hb - 4
-        const __m128i v = _mm_sub_epi8(
-            _mm_add_epi8(q2, _mm_slli_epi16(hb, 2)), four);
-        _mm_storeu_si128(reinterpret_cast<__m128i *>(vals + s * 16), v);
-    }
+}
+
+static inline __m128i q3k_values16(const u8 *b, int s) {
+    const int nn = s / 8, j = (s % 8) / 2, half = s % 2;
+    const __m128i qv = _mm_loadu_si128(reinterpret_cast<const __m128i *>(
+        b + 32 + nn * 32 + half * 16));
+    const __m128i hv = _mm_loadu_si128(reinterpret_cast<const __m128i *>(
+        b + half * 16));
+    const __m128i q2 = _mm_and_si128(
+        _mm_srl_epi16(qv, _mm_cvtsi32_si128(2 * j)), _mm_set1_epi8(3));
+    const __m128i hb = _mm_and_si128(
+        _mm_srl_epi16(hv, _mm_cvtsi32_si128(s / 2)), _mm_set1_epi8(1));
+    return _mm_sub_epi8(_mm_add_epi8(q2, _mm_slli_epi16(hb, 2)),
+                        _mm_set1_epi8(4));
+}
+
+static void q3k_unpack(const u8 *b, i8 *vals, f32 *dsub) {
+    q3k_scales(b, dsub);
+    for (int s = 0; s < 16; s++)
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(vals + s * 16),
+                         q3k_values16(b, s));
 }
 
 // Fill `vals` (256, in [0,3]) plus the two per-sub-block scale tables.
@@ -1048,6 +1041,27 @@ static void q2k_unpack(const u8 *b, i8 *vals, f32 *dlo, f32 *dmn) {
 // this one KEEPS the sign trick: it is on the hot path for Q3_K/Q4_K, and a
 // p/n split there costs two extra compares per 16 values for an input the
 // quantiser cannot produce.
+static inline __m128i q2k_values16(const u8 *b, int s) {
+    const int g = s / 8, j = (s % 8) / 2, half = s % 2;
+    const __m128i qv = _mm_loadu_si128(reinterpret_cast<const __m128i *>(
+        b + 16 + g * 32 + half * 16));
+    return _mm_and_si128(_mm_srl_epi16(qv, _mm_cvtsi32_si128(2 * j)),
+                         _mm_set1_epi8(3));
+}
+
+static inline __m128i dot16_signed_vec(__m128i a, const i8 *bv,
+                                       const __m128i ones16) {
+    const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i *>(bv));
+    return _mm_madd_epi16(_mm_maddubs_epi16(_mm_abs_epi8(a),
+                          _mm_sign_epi8(b, a)), ones16);
+}
+
+static inline __m128i dot16_unsigned_vec(__m128i a, const i8 *bv,
+                                         const __m128i ones16) {
+    const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i *>(bv));
+    return _mm_madd_epi16(_mm_maddubs_epi16(a, b), ones16);
+}
+
 static inline __m128i dot16_signed_lanes(const i8 *av, const i8 *bv,
                                          const __m128i ones16) {
     const __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i *>(av));
@@ -1208,6 +1222,63 @@ q23_dot16_vlvnni(const i8 *a, const i8 *x, bool signed_weight) {
 }
 #endif
 
+#if defined(__AVXVNNI__) || defined(KRK_DOT_AVXVNNI)
+KRK_TARGET_ATTR("avx2,fma,avxvnni") inline __m128i
+q23_dot16_vec_vnni(__m128i av, const i8 *x, bool signed_weight) {
+    const __m128i xv = _mm_loadu_si128(reinterpret_cast<const __m128i *>(x));
+    const __m128i mag = signed_weight ? _mm_abs_epi8(av) : av;
+    const __m128i sx = signed_weight ? _mm_sign_epi8(xv, av) : xv;
+    return _mm_dpbusd_epi32(_mm_setzero_si128(), mag, sx);
+}
+#endif
+#if defined(KRK_DOT_AVX512)
+KRK_TARGET_ATTR("avx2,fma,avx512vl,avx512vnni") inline __m128i
+q23_dot16_vec_vlvnni(__m128i av, const i8 *x, bool signed_weight) {
+    const __m128i xv = _mm_loadu_si128(reinterpret_cast<const __m128i *>(x));
+    const __m128i mag = signed_weight ? _mm_abs_epi8(av) : av;
+    const __m128i sx = signed_weight ? _mm_sign_epi8(xv, av) : xv;
+    return _mm_dpbusd_epi32(_mm_setzero_si128(), mag, sx);
+}
+#endif
+static inline __m128i q23_dot16_vec_avx2(__m128i av, const i8 *x, bool signed_weight) {
+    return signed_weight ? dot16_signed_vec(av, x, _mm_set1_epi16(1))
+                         : dot16_unsigned_vec(av, x, _mm_set1_epi16(1));
+}
+
+template <bool Signed, __m128i (*Dot)(__m128i, const i8 *, bool)>
+static f32 q23k_dot_1_direct(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
+    __m128 acc = _mm_setzero_ps();
+    f32 dsub[16];
+    for (i64 nb = 0; nb < n / 256; nb++, w += Signed ? 110 : 84) {
+        const i8 *xr = xq + nb * 256;
+        const f32 *dr = dx + nb * 8;
+        if constexpr (Signed) q3k_scales(w, dsub);
+        const f32 d = Signed ? 0.0f : fp16_to_fp32(static_cast<u16>(w[80] | (w[81] << 8)));
+        const f32 dmin = Signed ? 0.0f : fp16_to_fp32(static_cast<u16>(w[82] | (w[83] << 8)));
+        for (int s = 0; s < 16; s++) {
+            const __m128i values = Signed ? q3k_values16(w, s) : q2k_values16(w, s);
+            if constexpr (Signed) {
+                acc = _mm_fmadd_ps(_mm_set1_ps(dsub[s] * dr[s / 2]),
+                    _mm_cvtepi32_ps(Dot(values, xr + s * 16, true)), acc);
+            } else {
+                const u8 sc = w[s];
+                acc = _mm_fmadd_ps(_mm_set1_ps(d * static_cast<f32>(sc & 15) * dr[s / 2]),
+                    _mm_cvtepi32_ps(Dot(values, xr + s * 16, false)), acc);
+                acc = _mm_fmadd_ps(_mm_set1_ps(-dmin * static_cast<f32>(sc >> 4) * dr[s / 2]),
+                    _mm_cvtepi32_ps(sum16_lanes(xr + s * 16,
+                        _mm_set1_epi8(1), _mm_set1_epi16(1))), acc);
+            }
+        }
+    }
+    return hsum4_ps(acc);
+}
+
+static bool q23_direct_enabled() {
+    static const bool v = !(std::getenv("KRK_CPU_Q23_DIRECT") &&
+                            std::getenv("KRK_CPU_Q23_DIRECT")[0] == '0');
+    return v;
+}
+
 template <bool Signed, __m128i (*Dot)(const i8 *, const i8 *, bool)>
 static void q23k_dot_x8_vnni(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
                              i64 rstride, i64 dstride, f32 *out, i64 out_stride) {
@@ -1328,6 +1399,15 @@ f32 q3k_q8_internal(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
 
 f32 q2k_q8_internal(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
 #if defined(KRK_DOT_AVX2)
+    if (q23_direct_enabled()) {
+#if defined(__AVXVNNI__) || defined(KRK_DOT_AVXVNNI)
+        if (cpu_has_avxvnni()) return q23k_dot_1_direct<false, q23_dot16_vec_vnni>(w, xq, dx, n);
+#endif
+#if defined(KRK_DOT_AVX512)
+        if (cpu_has_vl_vnni()) return q23k_dot_1_direct<false, q23_dot16_vec_vlvnni>(w, xq, dx, n);
+#endif
+        return q23k_dot_1_direct<false, q23_dot16_vec_avx2>(w, xq, dx, n);
+    }
     if (q23_vnni_enabled()) {
 #if defined(__AVXVNNI__) || defined(KRK_DOT_AVXVNNI)
         if (cpu_has_avxvnni()) return q23k_dot_1_vnni<false, q23_dot16_vnni>(w, xq, dx, n);
@@ -1803,8 +1883,94 @@ static f32 q2code_dot_1(const u8 *w, const i8 *xq, const f32 *dx, i64 n, i64 B,
                                _mm256_extractf128_ps(acc, 1)));
 }
 
+// Raw packed-code TQ2: q in [0,3], value=q-1.  Keep q unsigned and x signed;
+// subtract sum(x) once per 32-value plane.  This preserves q=3 and x=-128
+// without the two 256-byte positive/negative expansion buffers.
+static inline __m256i tq2_raw_lanes_avx2(__m256i q, __m256i x) {
+    const __m256i ones = _mm256_set1_epi8(1);
+    const __m256i qx = _mm256_maddubs_epi16(q, x);
+    const __m256i sx = _mm256_maddubs_epi16(ones, x);
+    return _mm256_madd_epi16(_mm256_sub_epi16(qx, sx), _mm256_set1_epi16(1));
+}
+#if defined(KRK_DOT_AVX2)
+#if defined(__AVXVNNI__) || defined(KRK_DOT_AVXVNNI)
+KRK_TARGET_ATTR("avx2,fma,avxvnni") static __m256i
+tq2_raw_lanes_vnni(__m256i q, __m256i x) {
+    const __m256i z = _mm256_setzero_si256();
+    const __m256i qx = _mm256_dpbusd_epi32(z, q, x);
+    const __m256i sx = _mm256_dpbusd_epi32(z, _mm256_set1_epi8(1), x);
+    return _mm256_sub_epi32(qx, sx);
+}
+#endif
+#if defined(KRK_DOT_AVX512)
+KRK_TARGET_ATTR("avx2,fma,avx512vl,avx512vnni") static __m256i
+tq2_raw_lanes_vlvnni(__m256i q, __m256i x) {
+    const __m256i z = _mm256_setzero_si256();
+    const __m256i qx = _mm256_dpbusd_epi32(z, q, x);
+    const __m256i sx = _mm256_dpbusd_epi32(z, _mm256_set1_epi8(1), x);
+    return _mm256_sub_epi32(qx, sx);
+}
+#endif
+#endif
+template <__m256i (*Dot)(__m256i, __m256i)>
+static void tq2_raw_dot_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                           i64 rstride, i64 dstride, f32 *out, i64 out_stride) {
+    __m256 acc[8];
+    for (int r = 0; r < 8; r++) acc[r] = _mm256_setzero_ps();
+    const __m256i three = _mm256_set1_epi8(3);
+    for (i64 nb = 0; nb < n / 256; nb++, w += 66) {
+        const f32 d = fp16_to_fp32(static_cast<u16>(w[64] | (w[65] << 8)));
+        __m256i codes[8];
+        for (int g = 0; g < 2; g++) {
+            const __m256i packed = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(w + g * 32));
+            for (int l = 0; l < 4; l++)
+                codes[g * 4 + l] = _mm256_and_si256(_mm256_srl_epi16(
+                    packed, _mm_cvtsi32_si128(l * 2)), three);
+        }
+        for (int r = 0; r < 8; r++) {
+            const i8 *xr = xq + static_cast<i64>(r) * rstride + nb * 256;
+            const f32 *dr = dx + static_cast<i64>(r) * dstride + nb * 8;
+            __m256 a = _mm256_setzero_ps();
+            for (int c = 0; c < 8; c++) {
+                const __m256i x = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i *>(xr + c * 32));
+                a = _mm256_fmadd_ps(_mm256_set1_ps(dr[c]),
+                    _mm256_cvtepi32_ps(Dot(codes[c], x)), a);
+            }
+            acc[r] = _mm256_fmadd_ps(_mm256_set1_ps(d), a, acc[r]);
+        }
+    }
+    for (int r = 0; r < 8; r++)
+        out[static_cast<i64>(r) * out_stride] = hsum4_ps(_mm_add_ps(
+            _mm256_castps256_ps128(acc[r]), _mm256_extractf128_ps(acc[r], 1)));
+}
+
+static void tq2_raw_dot_x8_dispatch(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
+                                    i64 rstride, i64 dstride, f32 *out, i64 out_stride) {
+#if defined(KRK_DOT_AVX2)
+#if defined(__AVXVNNI__) || defined(KRK_DOT_AVXVNNI)
+    if (cpu_has_avxvnni()) {
+        tq2_raw_dot_x8<tq2_raw_lanes_vnni>(w, xq, dx, n, rstride, dstride, out, out_stride);
+        return;
+    }
+#endif
+#if defined(KRK_DOT_AVX512)
+    if (cpu_has_vl_vnni()) {
+        tq2_raw_dot_x8<tq2_raw_lanes_vlvnni>(w, xq, dx, n, rstride, dstride, out, out_stride);
+        return;
+    }
+#endif
+#endif
+    tq2_raw_dot_x8<tq2_raw_lanes_avx2>(w, xq, dx, n, rstride, dstride, out, out_stride);
+}
+
 void tq2_0_q8_x8_internal(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
                           i64 rstride, i64 dstride, f32 *out, i64 out_stride) {
+    if (ternary_lanes_enabled()) {
+        tq2_raw_dot_x8_dispatch(w, xq, dx, n, rstride, dstride, out, out_stride);
+        return;
+    }
     q2code_dot_x8_impl(w, xq, dx, n, rstride, dstride, out, out_stride, 256, 66,
                        unpack_tq2_codes);
 }
@@ -1861,6 +2027,9 @@ f32 i2_s_q8_internal(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
 }
 
 f32 tq2_0_q8_internal(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
+    // Raw codes pay off when their unpack is shared by eight rows.  For one
+    // row, reducing each packed plane immediately retains less ILP than the
+    // established expand-once kernel, so keep that faster scalar path.
     return q2code_dot_1(w, xq, dx, n, 256, 66, unpack_tq2_codes);
 }
 f32 pq2_0_q8_internal(const u8 *w, const i8 *xq, const f32 *dx, i64 n) {

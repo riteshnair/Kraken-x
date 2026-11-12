@@ -31,15 +31,19 @@ int main(int argc, char **argv) {
     constexpr i64 n = 4096, n_out = 512;
     const bool k3 = type == "q3_K", t1 = type == "tq1", t2 = type == "tq2";
     const i64 rb = k3 ? 110 : (type == "q2_K" ? 84 : (t1 ? 54 : 66));
+    const i64 blocks = n / (k3 || type == "q2_K" || t2 ? 256 : 256);
+    const i64 row_bytes = rb * blocks;
     std::mt19937 rng(0xC0FFEE);
-    std::vector<u8> w(static_cast<size_t>(rb * n_out));
+    std::vector<u8> w(static_cast<size_t>(row_bytes * n_out));
     for (u8 &v : w) v = static_cast<u8>(rng());
     for (i64 o = 0; o < n_out; o++) {
-        u8 *b = w.data() + o * rb;
-        if (k3) put_f16(b + 108, 0.019f);
-        else if (type == "q2_K") { put_f16(b + 80, 0.017f); put_f16(b + 82, 0.007f); }
-        else if (t1) put_f16(b + 52, 0.019f);
-        else put_f16(b + 64, 0.019f);
+        for (i64 nb = 0; nb < blocks; nb++) {
+            u8 *b = w.data() + o * row_bytes + nb * rb;
+            if (k3) put_f16(b + 108, 0.019f);
+            else if (type == "q2_K") { put_f16(b + 80, 0.017f); put_f16(b + 82, 0.007f); }
+            else if (t1) put_f16(b + 52, 0.019f);
+            else put_f16(b + 64, 0.019f);
+        }
     }
     std::vector<f32> x(rows * n);
     std::normal_distribution<f32> normal(0.0f, 1.0f);
@@ -52,7 +56,7 @@ int main(int argc, char **argv) {
     const auto start = std::chrono::steady_clock::now();
     for (int rep = 0; rep < reps; rep++) {
         for (i64 o = 0; o < n_out; o++) {
-            const u8 *b = w.data() + o * rb;
+            const u8 *b = w.data() + o * row_bytes;
             if (rows == 8) {
                 if (k3) dot_q3_K_q8_x8(b, xq.data(), dx.data(), n, n, n / 32, out.data() + o, n_out);
                 else if (type == "q2_K") dot_q2_K_q8_x8(b, xq.data(), dx.data(), n, n, n / 32, out.data() + o, n_out);
