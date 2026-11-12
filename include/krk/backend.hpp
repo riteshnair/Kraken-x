@@ -22,6 +22,13 @@
 
 namespace krk {
 
+// Opt-in CPU activation-quantization recovery. Off is the production default.
+// Residual adds Wq*(x-Q(x)); Adaptive selects the F32 activation path for risky
+// rows; Both applies residual recovery only below the adaptive risk threshold.
+enum class ActivationRecoveryMode : i32 { Off = 0, Residual = 1, Adaptive = 2, Both = 3 };
+void set_activation_recovery_mode(ActivationRecoveryMode mode);
+ActivationRecoveryMode activation_recovery_mode();
+
 enum class BackendKind {
     CPU,
     HIP,
@@ -30,6 +37,10 @@ enum class BackendKind {
     // memory directly, so like the CPU reference it has no separate device
     // tier -- see has_device_memory().
     NPU,
+    // Intel Meteor Lake (Core Ultra) host backend: isolated full-copy backend
+    // running on host memory with AVX2/VNNI-tuned kernels, independently
+    // validated against the CPU reference.
+    Intel,
 };
 
 // A per-shard weight pull source. The loader passes a table of these; the
@@ -116,7 +127,7 @@ struct DeviceCaps {
 // expert pool 4697 -> 359 MiB as the KV tier grew). Int8 is 1.78x smaller at
 // 32-wide blocks (1 byte + 4/32) against f16's 2, and 3.6x against the CPU
 // reference's f32.
-enum class KvQuant : i32 { F16 = 0, Int8 = 1 };
+enum class KvQuant : i32 { F16 = 0, Int8 = 1, Turbo3 = 2, Rot4 = 3 };
 
 struct AttnDesc {
     i64 n_head = 0;        // query heads
@@ -208,6 +219,16 @@ struct AttnDesc {
     // bit-identical to the pre-feature arithmetic: every int8 path is guarded
     // by this flag, so a run that never sets it cannot change.
     bool kv_int8 = false;
+    // TurboQuant 3-bit cache (arxiv 2504.19874v1; see krk/turbo_kv.hpp).
+    // Mutually exclusive with kv_int8. The row is stored PER KV HEAD -- each
+    // head has its own rotation seed and its own scale -- so both the append
+    // and the read derive a head's slice as `hkv * turbo_row_bytes(hd)`.
+    bool kv_turbo = false;
+    // Q4_0 blocks in the rotated basis (`krk::KvPack::Rot4`): the conservative
+    // packed format and the default. Same rotation as kv_turbo, but a per-32
+    // block scale instead of one per row, so a bad scale can only damage its
+    // own block. Mutually exclusive with kv_turbo and kv_int8.
+    bool kv_rot4 = false;
     // Self-only block mask, for a masked-block drafter. When `skip_from >= 0`, a
     // query row at position p >= skip_from ALSO sees every key in
     // [skip_from, p) as masked -- i.e. it keeps the context before skip_from and
@@ -470,6 +491,19 @@ public:
     // read it once, and the same bytes out of RAM cost one pass at the same
     // order of speed with no VRAM slot and no eviction.
     virtual bool host_load_supported() const { return false; }
+    // True when this backend computes directly on host memory, so a weight the
+    // loader would otherwise copy into an owned buffer can be POINTED AT the
+    // file's read-only mapping instead. A device backend must answer false: its
+    // kernels cannot read a host mapping, and a streamed/promoted weight has to
+    // own its bytes. The CPU backend answers true, and that difference is the
+    // whole memory budget of a capped MoE run: the trunk is then paid for once
+    // (reclaimable page cache) instead of twice (page cache + private heap),
+    // and the freed bytes go to the expert cache, which is the tier that
+    // actually decides the token rate. The mapping outlives every weight
+    // (`Gguf` is owned by `Model`), and kernels only read weights, so the
+    // lifetime and constness both hold. `KRK_WEIGHT_INPLACE=0` restores the
+    // copy for an A/B.
+    virtual bool weights_in_place() const { return false; }
     // Fills `dst` (pageable host memory) with `bytes` taken from `mapped_src`,
     // a pointer into the weight mapping. A backend that can read the file
     // directly (see set_weight_pull) does so, because a cold expert should cost
@@ -1145,8 +1179,13 @@ public:
     // format. The engine sizes the cache and the tier slices from this, so a
     // backend that adds a format has one number to answer for instead of
     // every call site learning the layout.
-    virtual size_t kv_row_bytes(i64 kv_dim, KvQuant q) const {
+    //
+    // `hd` is the per-head width, and only a format whose storage is per head
+    // needs it (TurboQuant: one rotation and one scale per kv head). Formats
+    // that pack the whole kv_dim row ignore it, and 0 means "not supplied".
+    virtual size_t kv_row_bytes(i64 kv_dim, KvQuant q, i64 hd = 0) const {
         (void)q;
+        (void)hd;
         return static_cast<size_t>(kv_dim) * act_size();
     }
 
@@ -1895,6 +1934,9 @@ Backend *make_npu_backend(int device_index, bool whole_graph, std::string *err);
 // True when this build has NPU support compiled in (the device itself may
 // still fail to open).
 bool npu_available();
+// The Intel Meteor Lake host backend. Always available in builds that compile
+// it; *err is filled on failure.
+Backend *make_intel_backend(std::string *err);
 // Number of visible HIP devices, or 0 when this build has no HIP support.
 int hip_device_count();
 // Human-readable runtime/version string for logging, or "unavailable".

@@ -492,12 +492,18 @@ static void test_q8_0_scale_array_row_keyed() {
     const int n_out = 8;    // exactly one eight-row tile: the grouping that broke
     const int nb = n_in / 32;
     const int row_bytes = nb * 34;
-    std::vector<u8> w(static_cast<size_t>(n_out) * row_bytes);
+    // The final call still reads a complete eight-row weight tile. Padding
+    // supplies those unused rows without changing any asserted output.
+    std::vector<u8> w(static_cast<size_t>(n_out + 8) * row_bytes, 0);
     std::vector<f32> x(static_cast<size_t>(n_in));
-    std::vector<i8> xq(static_cast<size_t>(n_in));
+    // x8 consumes an eight-row activation tile. Repeat the same input row so
+    // every output-row oracle still compares identical arithmetic, without
+    // letting the AVX-512 row loads run past a one-row fixture allocation.
+    std::vector<i8> xq(static_cast<size_t>(8 * n_in));
     for (int i = 0; i < n_in; i++) {
         x[i] = 0.01f * static_cast<f32>((i * 37) % 19 - 9);
-        xq[i] = static_cast<i8>((i * 13) % 41 - 20);
+        const i8 q = static_cast<i8>((i * 13) % 41 - 20);
+        for (int r = 0; r < 8; r++) xq[static_cast<size_t>(r * n_in + i)] = q;
     }
     // Scales that depend on BOTH the row and the block: no row shares a scale
     // with another, so any reuse across rows shows up immediately.
@@ -516,9 +522,11 @@ static void test_q8_0_scale_array_row_keyed() {
     }
     // The x8 kernels always write eight output rows at out + r*out_stride, so
     // the buffer has to hold them; row 0 of each call lands on index `o`.
-    std::vector<f32> dx(static_cast<size_t>(nb)),
+    std::vector<f32> dx(static_cast<size_t>(8 * nb)),
         ref(static_cast<size_t>(n_out) * 8), got(static_cast<size_t>(n_out) * 8);
-    for (int b = 0; b < nb; b++) dx[b] = 0.02f * static_cast<f32>(b + 1);
+    for (int b = 0; b < nb; b++)
+        for (int r = 0; r < 8; r++)
+            dx[static_cast<size_t>(r * nb + b)] = 0.02f * static_cast<f32>(b + 1);
     for (int o = 0; o < n_out; o++)
         dot_q8_0_q8_x8(w.data() + static_cast<size_t>(o) * row_bytes, xq.data(),
                        dx.data(), n_in, n_in, nb, ref.data() + o, n_out);
@@ -2289,6 +2297,7 @@ static bool set_kv_tiered_budget(Engine &engine, Backend *cpu, const std::string
     cfg.model_path = path;
     cfg.n_ctx = 16;          // tiny context: the KV byte numbers are small and exact
     cfg.prefill_chunk = 4;
+    cfg.kv_quant = 0;      // these tests assert uncompressed KV byte geometry
     cfg.kv_hot_mb = hot_mb;
     cfg.kv_warm_mb = warm_mb;
     cfg.kv_cold_dir = cold_dir;
@@ -2479,7 +2488,7 @@ static void test_kv_tier_per_layer_widths() {
     i64 n_kv_layers = 0;
     i64 kv_dim_sum = 0;
     i64 max_kv_dim = 0;
-    size_t as = cpu->act_size();
+    const size_t as = cpu->kv_row_bytes(1, KvQuant::F16);
     for (i32 l = 0; l < mc.n_layer; l++) {
         if (!m.layer_has_kv(l)) continue;
         n_kv_layers++;
@@ -3263,15 +3272,17 @@ static void test_nvfp4_sidecar_scale() {
             c.model_path = p;
             c.n_ctx = 64;
             c.prefill_chunk = 8;
-            if (!e.init(be, c, &err)) return false;
+            if (!e.init(be, c, &err)) { delete be; return false; }
             GenerateParams gp;
             gp.prompt = "the";
             gp.max_tokens = 2;
             GenerateResult r;
-            if (!e.generate(gp, &r)) return false;
+            if (!e.generate(gp, &r)) { e.shutdown(); delete be; return false; }
             const i32 nv = e.model().cfg().n_vocab;
             lg.assign(e.last_logits(), e.last_logits() + nv);
             tok = r.tokens.empty() ? -1 : r.tokens.back();
+            e.shutdown();
+            delete be;
             return true;
         };
         std::vector<f32> a_lg, b_lg;
@@ -3452,6 +3463,8 @@ static void test_moe_latent() {
         CHECK(!loaded, what);
         CHECK(err.find("latent") != std::string::npos,
               "... and the refusal names the latent");
+        e.shutdown();
+        delete be;
     };
     CHECK(build_latent_moe_model("kraken-latent-half.gguf", 32, 16, 64, 4, 2, true,
                                  false),
@@ -3468,6 +3481,8 @@ static void test_moe_latent() {
           "wrote the narrow-bank-no-pair fixture");
     refuses("kraken-latent-nopair.gguf",
             "a narrow routed bank with no latent projection is refused");
+    engine.shutdown();
+    delete cpu;
 }
 
 // Per-layer expert counts and top-k. What this pins:
@@ -3538,7 +3553,11 @@ static void test_moe_per_layer_experts() {
                       u_engine.model().n_expert_at(1) == 4,
                   "... with the same count on every layer");
         }
+        u_engine.shutdown();
+        delete u_cpu;
     }
+    engine.shutdown();
+    delete cpu;
 }
 
 // ---------------------------------------------------------------------------
@@ -3744,14 +3763,16 @@ static bool plain_logits_of(const std::string &path, std::vector<f32> &lg,
     c.model_path = path;
     c.n_ctx = 64;
     c.prefill_chunk = 8;
-    if (!e.init(be, c, &err)) return false;
+    if (!e.init(be, c, &err)) { delete be; return false; }
     GenerateParams gp;
     gp.prompt = "the";
     gp.max_tokens = 2;
     GenerateResult r;
-    if (!e.generate(gp, &r)) return false;
+    if (!e.generate(gp, &r)) { e.shutdown(); delete be; return false; }
     const i32 nv = e.model().cfg().n_vocab;
     lg.assign(e.last_logits(), e.last_logits() + nv);
+    e.shutdown();
+    delete be;
     return true;
 }
 
@@ -4418,6 +4439,7 @@ static void test_gdn_group_matrix_types() {
         CHECK(diff > 0,
               "an F32 matrix read as F16 differs, so a type mix-up is visible");
     }
+    delete cpu;
 }
 
 // The two backend ops the batched MoE decode path is built from, and that path
@@ -5748,14 +5770,16 @@ static bool gemma4_logits(const std::string &p, std::vector<f32> &lg,
     c.model_path = p;
     c.n_ctx = 64;
     c.prefill_chunk = 8;
-    if (!e.init(be, c, &err)) return false;
+    if (!e.init(be, c, &err)) { delete be; return false; }
     GenerateParams gp;
     gp.prompt = "the";
     gp.max_tokens = 2;
     GenerateResult r;
-    if (!e.generate(gp, &r)) return false;
+    if (!e.generate(gp, &r)) { e.shutdown(); delete be; return false; }
     const i32 nv = e.model().cfg().n_vocab;
     lg.assign(e.last_logits(), e.last_logits() + nv);
+    e.shutdown();
+    delete be;
     return true;
 }
 
@@ -10072,6 +10096,125 @@ static void test_tokenizer_spm_and_bpe() {
 }
 
 // ---------------------------------------------------------------------------
+// gemma4's tokenizer: an SPM-style BPE
+// ---------------------------------------------------------------------------
+//
+// gemma-4-E4B's vocabulary ships `merges` -- it IS a BPE -- but its pieces are
+// RAW UTF-8 with U+2581 as the space marker, and its merges run over the whole
+// text with no word-level pre-split. That is a pre-type of its own in the
+// reference (llama.cpp `LLAMA_VOCAB_PRE_TYPE_GEMMA4`: "spaces are replaced with
+// U+2581 by the normalizer, then BPE merges run on the whole text without
+// word-level pre-splitting", `byte_encode = false`), selected by the vocab's
+// model string.
+//
+// Running it through the GPT-2 byte permutation is not a near miss. The codec
+// maps the space to U+0120, which such a vocabulary's merge table never names
+// -- the real file has 137,542 pieces containing U+2581 and exactly ONE
+// containing U+0120 -- so every word boundary fell out as that lone piece and
+// the model was handed a token it never saw for every space in the prompt.
+// Measured against llama.cpp's own tokenizer on gemma-4-E4B-it-Q4_K_M:
+// "The capital of France is" is `[2, 818, 5279, 529, 7001, 563]` there and was
+// `[2, 818, 245237, 41626, 245237, 1340, ...]` here, and the model answered
+// `  is is is isisisis` instead of ` Paris.`.
+//
+// The `gpt2` arm is the control that keeps the pin honest: the same bytes and
+// the same merges under the GPT-2 pre-type must NOT produce the gemma4 answer.
+static bool build_gemma4_tokenizer_model(const std::string &path, const char *model) {
+    const std::string sp = "\xE2\x96\x81";  // U+2581
+    std::vector<std::string> tokens = {
+        "<unk>", "<bos>", sp, "The", sp + "the", "cat", sp + "cat",
+        "T", "h", "e", "c", "a", "t", "Th", "ca",
+    };
+    for (int i = 0; i < 256; i++) {
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "<0x%02X>", i);
+        tokens.emplace_back(buf);
+    }
+    // Rank order is the merge order the greedy loop follows; "▁ cat" is last so
+    // the two words are built character by character first.
+    std::vector<std::string> merges = {
+        "T h", "Th e", "c a", "ca t", sp + " cat", sp + " the",
+    };
+    GgufBuilder b;
+    b.meta_str("general.architecture", "gemma4");
+    b.meta_str("general.name", "kraken-gemma4-tokenizer");
+    b.meta_u32("general.alignment", 32);
+    b.meta_str("tokenizer.ggml.model", model);
+    b.meta_str_array("tokenizer.ggml.tokens", tokens);
+    b.meta_str_array("tokenizer.ggml.merges", merges);
+    b.meta_u32("tokenizer.ggml.bos_token_id", 1);
+    b.meta_u32("tokenizer.ggml.eos_token_id", 0);
+    b.meta_bool("tokenizer.ggml.add_bos_token", true);
+    return b.write(path);
+}
+
+static void test_gemma4_tokenizer() {
+    const std::string sp = "\xE2\x96\x81";
+    {
+        const std::string path = "kraken-gemma4-tok.gguf";
+        CHECK(build_gemma4_tokenizer_model(path, "gemma4"),
+              "wrote the gemma4 tokenizer fixture");
+        Gguf g;
+        std::string err;
+        CHECK(g.load(path, &err), "reload for the gemma4 tokenizer");
+        Tokenizer tok;
+        CHECK(tok.load(g, &err), "gemma4 tokenizer loads");
+        CHECK(tok.model() == TokModel::Bpe,
+              "gemma4 is still a BPE -- it ships merges, and SPM would drop them");
+        const i32 the = tok.piece_id("The"), cat = tok.piece_id(sp + "cat");
+        const i32 marker = tok.piece_id(sp);
+        CHECK(the >= 0 && cat >= 0 && marker >= 0,
+              "the fixture carries The / the space marker / the merged word");
+        // The whole point: a space is the MARKER, and the merge crosses it, so
+        // "The cat" is two pieces and not `The`, `<0x20>`, `cat`.
+        std::vector<i32> ids;
+        CHECK(tok.encode("The cat", ids, false) == 2,
+              "a space is U+2581 and the merge crosses it: two pieces");
+        CHECK(ids.size() == 2 && ids[0] == the && ids[1] == cat,
+              "encoding is The | U+2581cat");
+        const std::string back = tok.decode(ids.data(), static_cast<int>(ids.size()));
+        CHECK(back == "The cat", "U+2581 decodes back to a space");
+        std::vector<i32> with_bos;
+        CHECK(tok.encode("The cat", with_bos, true) == 3 && with_bos[0] == 1,
+              "add_special still prepends BOS on this path");
+        // No space in the text, so no marker: the merge table's `c a t` chain
+        // still builds the word.
+        std::vector<i32> bare;
+        CHECK(tok.encode("cat", bare, false) == 1 && bare[0] == tok.piece_id("cat"),
+              "a bare word merges without the marker");
+        // Raw UTF-8: a piece the vocabulary does not carry comes apart BYTE by
+        // byte (raw-UTF-8 vocabularies have no codepoint mapping to fall back
+        // through), which is U+00E9 = C3 A9 = two pieces.
+        std::vector<i32> accent;
+        CHECK(tok.encode("\xC3\xA9", accent, false) == 2 &&
+                  accent[0] == tok.piece_id("<0xC3>") &&
+                  accent[1] == tok.piece_id("<0xA9>"),
+              "an unknown piece falls back per raw byte");
+        std::remove(path.c_str());
+    }
+    {
+        // Control. Same tokens, same merges, GPT-2 pre-type: the space becomes
+        // U+0120, no merge crosses it, and the codepoint falls out as a byte
+        // piece. A fixture that answered the gemma4 way for BOTH pre-types
+        // would be measuring the fixture, not the tokenizer.
+        const std::string path = "kraken-gemma4-tok-gpt2.gguf";
+        CHECK(build_gemma4_tokenizer_model(path, "gpt2"),
+              "wrote the same bytes under the GPT-2 pre-type");
+        Gguf g;
+        std::string err;
+        CHECK(g.load(path, &err), "reload for the GPT-2 control");
+        Tokenizer tok;
+        CHECK(tok.load(g, &err), "the GPT-2 control loads");
+        std::vector<i32> ids;
+        CHECK(tok.encode("The cat", ids, false) == 3,
+              "the GPT-2 pre-type does NOT cross the space (control)");
+        CHECK(ids.size() == 3 && ids[1] == tok.piece_id("<0x20>"),
+              "the control puts a <0x20> byte piece at the boundary");
+        std::remove(path.c_str());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // sampler determinism
 // ---------------------------------------------------------------------------
 
@@ -10478,6 +10621,7 @@ static void test_moe_schema_and_laziness() {
         CHECK(got == "<|start_header_id|>user<|end_header_id|>\n\nhi<|eot_id|>"
                      "<|start_header_id|>assistant<|end_header_id|>\n\n",
               "and it renders the layout the file declares");
+        m2.unload();
         delete cpu2;
     }
 
@@ -10499,6 +10643,7 @@ static void test_moe_schema_and_laziness() {
               "the builtin is used instead");
         CHECK(!m3.chat_template_or_builtin().empty(),
               "and there is still a layout to render with");
+        m3.unload();
         delete cpu3;
     }
         const ModelConfig &mc = m.cfg();
@@ -10894,13 +11039,10 @@ public:
     u64 host_allocs() const { return host_allocs_; }
     u64 host_releases() const { return host_releases_; }
 
-    // The CPU backend cannot read its own host pool from a "kernel", so the
-    // capability is faked where the cache's half of the contract is under test:
-    // whether a pinned host CELL is publishable, not whether this machine's
-    // driver maps the pool (tools/probe_hostread.hip answers that one).
-    bool host_load_supported() const override {
-        return fake_host_load_ || inner_->host_load_supported();
-    }
+    // Override the wrapped backend in both directions. This fixture tests the
+    // cache's capability gate, including refusal, independently of whether the
+    // underlying CPU backend now supports direct host-resident reads itself.
+    bool host_load_supported() const override { return fake_host_load_; }
     void set_host_load(bool on) { fake_host_load_ = on; }
 
 private:
@@ -11987,6 +12129,7 @@ static void test_expert_cache_policy() {
               "and a repeated reading does not shrink it twice");
         CHECK(clamp.reclamp_vram_budget(3000, 2000) == budget - 4,
               "free VRAM above the floor never raises or lowers the budget");
+        clamp.clear();
     }
 
     cache.clear();
@@ -13752,6 +13895,7 @@ static void test_dspark_head_set() {
                 d.unload();
             }
         }
+        tm.unload();
     }
     delete cpu;
     std::remove(head.c_str());
@@ -14027,18 +14171,20 @@ static bool dflash_rows_of(const std::string &target, const std::string &head_pa
     EngineConfig cfg;
     cfg.model_path = target;
     cfg.n_ctx = 64;
-    if (!engine.init(cpu, cfg, &err)) return false;
-    if (!engine.load_dflash(head_path, &err)) return false;
+    if (!engine.init(cpu, cfg, &err)) { delete cpu; return false; }
+    if (!engine.load_dflash(head_path, &err)) {
+        engine.shutdown(); delete cpu; return false;
+    }
     GenerateParams p;
     p.prompt = "the";
     p.max_tokens = 1;
     p.sampler.greedy = true;
     GenerateResult gr;
-    if (!engine.generate(p, &gr)) return false;
+    if (!engine.generate(p, &gr)) { engine.shutdown(); delete cpu; return false; }
     std::vector<i32> ids;
     if (engine.tokenizer().encode("the", ids, true) <= 0 || ids.empty()) {
         err = "the fixture prompt does not encode";
-        return false;
+        engine.shutdown(); delete cpu; return false;
     }
     const Model &m = engine.model();
     const i32 nv = m.cfg().n_vocab;
@@ -14049,9 +14195,11 @@ static bool dflash_rows_of(const std::string &target, const std::string &head_pa
                                            static_cast<i32>(gr.prompt_tokens), dfr);
     if (nr <= 0) {
         err = "the block produced no rows";
-        return false;
+        engine.shutdown(); delete cpu; return false;
     }
     out = dfr.data;
+    engine.shutdown();
+    delete cpu;
     return true;
 }
 
@@ -14490,6 +14638,8 @@ static void test_alibi_refusal_names_the_bias() {
         c.n_ctx = 64;
         std::string err;
         CHECK(e.init(be, c, &err), "the real backend accepts an ALiBi model");
+        e.shutdown();
+        delete be;
     }
     {
         Backend *be = new CountingBackend(make_cpu_backend());
@@ -16180,6 +16330,7 @@ static void test_lfm2_shortconv() {
             CHECK(attn_layers == 1,
                   "and only the attention layer owns a KV cache");
         }
+        m.unload();
         delete cpu;
     }
 
@@ -16585,6 +16736,7 @@ static void group_attention_sinks() {
                    "prefill row t with a sink equals decode row t with the "
                    "sink (cpu)");
     }
+    delete cpu;
 }
 
 // One CLI generation. Returns stdout with the bracketed status lines
@@ -18022,6 +18174,7 @@ static void test_http_server() {
     cfg.model_path = kTestModelPath;
     cfg.n_ctx = 64;
     cfg.prefill_chunk = 8;
+    cfg.kv_quant = 2; // match the real server's explicit CLI default
     std::string err;
     const bool inited = engine.init(cpu, cfg, &err);
     CHECK(inited, "http test: engine initialises");
@@ -18095,6 +18248,25 @@ static void test_http_server() {
         CHECK(j.is_object() && s && s->is_string() && s->as_string() == "ok",
               "http: /health reports ok");
     }
+
+    // RV32 tool: exact arithmetic does not enter or mutate the generation path.
+    CHECK(http_request(port, "POST", "/v1/tools/rv32",
+                       "{\"expression\":\"100+2*3-4/2\"}", &status, &body) && status == 200,
+          "http: RV32 expression returns 200");
+    {
+        JsonValue j;
+        std::string e;
+        const std::string payload = body.substr(body.find("\r\n\r\n") + 4);
+        CHECK(json_parse(payload, &j, &e) && j.get_int("result") == 104 &&
+                  j.get_int("instructions") > 0,
+              "http: RV32 expression has the exact result and execution count");
+    }
+    CHECK(http_request(port, "POST", "/v1/tools/rv32",
+                       "{\"expression\":\"2147483647+1\"}", &status, &body) && status == 400,
+          "http: RV32 overflow is refused");
+    CHECK(http_request(port, "POST", "/v1/tools/rv32",
+                       "{\"expression\":\"1/0\"}", &status, &body) && status == 400,
+          "http: RV32 division by zero is refused");
 
     // models
     CHECK(http_request(port, "GET", "/v1/models", "", &status, &body) && status == 200,
@@ -19239,6 +19411,7 @@ static void test_mtp_sidecar() {
         CHECK(err.find("qwen2") != std::string::npos &&
                   err.find("llama") != std::string::npos,
               "the refusal names both families");
+        m.unload();
     }
 
     // 3. A file with no block past the stack is refused with the reason, not
@@ -19250,7 +19423,9 @@ static void test_mtp_sidecar() {
         m.set_mtp_load(true);
         m.set_mtp_path(nob);
         CHECK(!m.load(*cpu, trunk, &err), "a file with no nextn block is refused");
+        m.unload();
         CHECK(err.find("blk.") != std::string::npos, "the refusal names what it looked for");
+        m.unload();
     }
 
     // 4. A block whose attention is a different width from the trunk's is
@@ -19263,6 +19438,7 @@ static void test_mtp_sidecar() {
         m.set_mtp_load(true);
         m.set_mtp_path(wide);
         CHECK(!m.load(*cpu, trunk, &err), "a block whose head count disagrees is refused");
+        m.unload();
         CHECK(err.find("head") != std::string::npos, "the refusal says it is the attention");
     }
 
@@ -19480,6 +19656,7 @@ static void test_mtp_head_qwen4() {
         CHECK(!m.load(*cpu, trunk, &err), "a bank of another width is refused");
         CHECK(err.find("gate_up_proj") != std::string::npos,
               "the refusal names the tensor that disagrees");
+        m.unload();
     }
 
     // 3. A half-written split prefix is refused, naming the missing half.
@@ -19495,6 +19672,7 @@ static void test_mtp_head_qwen4() {
         CHECK(!m.load(*cpu, trunk, &err), "fc_embedding without fc_hidden is refused");
         CHECK(err.find("fc_hidden") != std::string::npos,
               "the refusal names the missing half of the prefix");
+        m.unload();
     }
 
     // 4. The complete split prefix (the EXL3 spelling) loads and is reported as
@@ -19513,6 +19691,7 @@ static void test_mtp_head_qwen4() {
         CHECK(b.hf && b.eh_proj_split, "the split form is reported as such");
         CHECK(b.fc_embedding.present() && b.fc_hidden.present(),
               "both halves of the split prefix are uploaded");
+        m.unload();
     }
 
     std::remove(trunk.c_str());
@@ -22789,6 +22968,7 @@ static void test_mtp_sidecar_mla() {
               "the five shared-latent tables are staged f16, as the trunk's are");
         CHECK(m.mtp().n_expert == kMlaExpert && m.mtp().n_ff_exp == kMlaFFExp,
               "the routed bank is the block's own, at the geometry it declares");
+        m.unload();
     }
 
     // ---- 2. a trunk that is not the shared-latent stack is refused -------
@@ -22818,6 +22998,7 @@ static void test_mtp_sidecar_mla() {
                       err.find("V4 metadata") != std::string::npos,
                   "and the refusal names the trunk's own metadata, not a tensor "
                   "of the block");
+        m.unload();
             std::remove(lite.c_str());
         }
     }
@@ -22835,6 +23016,7 @@ static void test_mtp_sidecar_mla() {
             CHECK(!ok, "a block with no hyper-connection pair is refused");
             CHECK(err.find("hc_attn_fn") != std::string::npos,
                   "the refusal names the missing mixer");
+        m.unload();
             std::remove(nohc.c_str());
         }
     }
@@ -22855,6 +23037,7 @@ static void test_mtp_sidecar_mla() {
             CHECK(err.find(std::to_string(kMlaKeyLen - 1)) != std::string::npos &&
                       err.find(std::to_string(kMlaKeyLen)) != std::string::npos,
                   "... and both widths, so the file can be fixed without a guess");
+        m.unload();
             std::remove(narrow.c_str());
         }
     }
@@ -28252,7 +28435,8 @@ static void test_qwen4exp_whole_graph() {
             return v.empty() ? 0ull : std::strtoull(v.c_str(), nullptr, 16);
         };
         const PrefillProbe cc =
-            run_prefill_hash(exe, path, "the", 8, false, false, "--cpu");
+            run_prefill_hash(exe, path, "the", 8, false, false,
+                             "--cpu --kv-quant f16");
         CHECK(cc.ok, "the CLI prefills the fixture on the CPU reference");
         if (!cc.ok)
             std::fprintf(stderr, "  (cpu run rc=%d TAIL: %.400s)\n", cc.rc,
@@ -31854,21 +32038,20 @@ static void test_mixed_expert_formats() {
         CHECK(ok, ("a uniform routed-expert trio still loads: " + e).c_str());
         m.unload();
     }
-    // The refusal: gate F16, up Q8_0. Both names and both formats, so a reader
-    // is told which tensor to re-quantize.
+    // Per-tensor dispatch supports mixed banks: ExpertSource keeps each
+    // matrix's own type and strides, and gemm_group receives per-matrix types.
+    // Only a fusion that actually requires one common format may refuse this.
     {
         Model m;
         std::string e;
         const bool ok = m.load(*cpu, bad, &e);
-        CHECK(!ok, "a routed trio that mixes formats is refused");
-        CHECK(e.find("mix formats") != std::string::npos,
-              ("the refusal says the experts mix formats: " + e).c_str());
-        CHECK(e.find("ffn_up_exps") != std::string::npos &&
-                  e.find("ffn_gate_exps") != std::string::npos,
-              ("and names both tensors: " + e).c_str());
-        CHECK(e.find("Q8_0") != std::string::npos &&
-                  e.find("F16") != std::string::npos,
-              ("and both formats: " + e).c_str());
+        CHECK(ok, ("a routed trio with per-tensor mixed formats loads: " + e).c_str());
+        CHECK(m.layers()[0].experts.gate->type == DType::F16,
+              "the gate bank retains its own F16 format");
+        CHECK(m.layers()[0].experts.up->type == DType::Q8_0,
+              "the up bank retains its own Q8_0 format");
+        CHECK(m.layers()[0].experts.down->type == DType::F16,
+              "the down bank retains its own F16 format");
         m.unload();
     }
     std::remove(good.c_str());
@@ -31961,6 +32144,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_load_verdict)
     TEST_GROUP(test_gguf_roundtrip)
     TEST_GROUP(test_tokenizer_spm_and_bpe)
+    TEST_GROUP(test_gemma4_tokenizer)
     TEST_GROUP(test_sampler_determinism)
     TEST_GROUP(test_spec_sampling)
     TEST_GROUP(test_logit_softcap)

@@ -111,6 +111,13 @@ struct CpuTopology {
     i64 max_khz = 0;
     bool hybrid = false;
     bool pinned = false;
+    // LOGICAL is not PHYSICAL: n_fast counts SMT siblings as threads (8 on a
+    // 4P+8E+2LP-E Meteor Lake), while n_fast_phys counts the physical P cores
+    // (4). Which one the POOL should use is a measurement, and it is NOT the
+    // physical count -- see the width table in the Pool constructor. This field
+    // is kept because a caller that wants "one participant per physical core"
+    // has no other way to ask; the pool itself does not cap to it.
+    i64 n_fast_phys = 0;
 
     std::string summary() const {
         if (order.empty()) return "cpu topology unknown";
@@ -169,11 +176,13 @@ inline bool detect_cpu_topology_win(CpuTopology &t, i64 hc) {
 
     struct Lp { int id; BYTE eff; };
     std::vector<Lp> lps;
+    std::vector<BYTE> core_eff;  // one entry per PHYSICAL core
     lps.reserve(static_cast<size_t>(hc));
     for (unsigned char *p = buf.data(); p < buf.data() + len; ) {
         auto *e = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *>(p);
         if (e->Relationship == RelationProcessorCore) {
             const BYTE eff = e->Processor.EfficiencyClass;
+            core_eff.push_back(eff);
             for (WORD g = 0; g < e->Processor.GroupCount; g++) {
                 const auto &gm = e->Processor.GroupMask[g];
                 KAFFINITY mask = gm.Mask;
@@ -202,6 +211,11 @@ inline bool detect_cpu_topology_win(CpuTopology &t, i64 hc) {
         if (lp.eff == max_eff) t.n_fast++; else t.n_slow++;
     }
     t.hybrid = max_eff != min_eff;
+    // One RelationProcessorCore entry per PHYSICAL core, so the count of
+    // top-class entries is the physical P-core count, not the LP count.
+    t.n_fast_phys = 0;
+    for (BYTE e : core_eff)
+        if (e == max_eff) t.n_fast_phys++;
     // If the OS reports more logical CPUs than we enumerated (multi-group box
     // we don't fully map), keep the enumeration as the preferred prefix and do
     // not claim a complete topology.
@@ -241,9 +255,15 @@ inline CpuTopology detect_cpu_topology(i64 hc) {
             else t.n_slow++;
         }
         t.hybrid = t.n_slow > 0;
+        // No per-core view on this path, so the logical count is the only
+        // answer available; treating it as physical would cap every small op at
+        // the P+HT width, which is what the engine already did. Leave 0 (no
+        // cap) so an un-inspectable box keeps its previous behaviour.
+        t.n_fast_phys = 0;
     } else {
         for (i64 i = 0; i < hc; i++) t.order.push_back(i);
         t.n_fast = hc;
+        t.n_fast_phys = 0;
     }
     return t;
 }
@@ -296,30 +316,57 @@ public:
     // Which core each participant landed on. Settled at construction and
     // re-settled by set_workers(), so it is safe to read any time.
     const CpuTopology &topology() const { return topo_; }
+    // Physical performance-core count, when the OS reported one. This is the
+    // width at which a decode-shaped op stops waiting on an SMT sibling or an
+    // E-core. 0 means unknown -> callers apply no cap.
+    i64 physical_fast() const { return topo_.n_fast_phys; }
 
     // Pin the total participant count (workers = n - 1). Retires the
     // current worker generation and spawns a new one; a no-op while a
     // task is in flight. The engine calls this during init, before the
     // first forward pass.
     void set_workers(i64 n) {
-        std::unique_lock<std::mutex> lk(mu_);
-        if (n < 1 || body_fn_ != nullptr) return;
-        const i64 want = std::min<i64>(n - 1, 63);
-        if (want == static_cast<i64>(workers_.size())) return;
-        // Retire the current generation: each worker exits its loop as
-        // soon as its generation no longer matches, then is joined.
-        gen_.fetch_add(1, std::memory_order_release);
-        cv_start_.notify_all();
-        for (std::thread &t : workers_)
+        // THE JOIN MUST NOT HOLD mu_. A parked worker is inside
+        // cv_start_.wait(lk, pred), and re-checking that predicate means
+        // reacquiring mu_ -- so joining it while this thread owns mu_ waits for
+        // a thread that is waiting for the mutex. That is a hard deadlock, and
+        // it only fired sometimes because a worker that was still in its 2 ms
+        // SPIN phase observes the generation bump without touching mu_ at all:
+        // measured with `--threads 4` on Qwen3.8-4B, 4 hangs in 12 runs, while
+        // the same width set through KRK_THREADS (which sizes the pool in the
+        // constructor and never calls this) hung 0 times in 12.
+        //
+        // So: bump the generation and take the old generation out of
+        // workers_ under the lock, notify, release, and only then join.
+        std::vector<std::thread> old;
+        i64 want = 0;
+        {
+            std::unique_lock<std::mutex> lk(mu_);
+            if (n < 1 || body_fn_ != nullptr) return;
+            want = std::min<i64>(n - 1, 63);
+            if (want == static_cast<i64>(workers_.size())) return;
+            gen_.fetch_add(1, std::memory_order_release);
+            old.swap(workers_);
+            cv_start_.notify_all();
+        }
+        for (std::thread &t : old)
             if (t.joinable()) t.join();
-        workers_.clear();
-        // No task can be in flight here (body_ == nullptr), so the new
-        // generation starts at the CURRENT id: seeding it with 0 would send
-        // every fresh worker chasing a task that was drained long ago.
+        old.clear();
+        // No task can be in flight here (body_fn_ == nullptr on entry, and a
+        // worker's only way back in is a task id this thread has not
+        // published), so the new generation starts at the CURRENT id: seeding
+        // it with 0 would send every fresh worker chasing a task that was
+        // drained long ago.
         const i64 start = task_id_.load(std::memory_order_acquire);
+        std::lock_guard<std::mutex> lk(mu_);
         for (i64 i = 0; i < want; i++)
             workers_.emplace_back(
                 [this, g = gen_.load(std::memory_order_acquire), idx = i, start] {
+                    // The constructor pins each worker to the core it was
+                    // assigned; this path did not, so `--threads N` silently
+                    // gave up the fastest-first placement while the banner went
+                    // on reporting "pinned". Same call, same width.
+                    if (pinned_) pin_this_thread(worker_cpu(idx));
                     worker_loop(g, idx, start);
                 });
     }
@@ -344,7 +391,7 @@ public:
     // trampoline for both paths makes the serial case and the pooled case the
     // same machine code, so the floor can be tuned without moving a number.
     template <class F>
-    void run(i64 n, i64 grain, bool split, F &&body) {
+    void run(i64 n, i64 grain, bool split, F &&body, i64 max_parts = 0) {
         if (n <= 0) return;
         using G = typename std::remove_reference<F>::type;
         void (*const invoke)(void *, i64, i64) = [](void *ctx, i64 b, i64 e) {
@@ -356,6 +403,11 @@ public:
         i64 participants = all;
         const i64 cap = active_cap_.load(std::memory_order_acquire);
         if (cap > 0 && cap < participants) participants = cap;
+        // Per-call ceiling (see par_for's kParSmallFloor): a small op that is
+        // split wider than the physical performance cores spends its time
+        // waiting for participants that are slower than the ones it already
+        // has. `max_parts == 0` means no ceiling.
+        if (max_parts > 0 && max_parts < participants) participants = max_parts;
         if (!split || blocks <= 1 || participants <= 1) {
             invoke(&body, 0, n);
             return;
@@ -449,12 +501,44 @@ private:
             if (v > 0) { hc = v; hc_forced = true; }
         }
         topo_ = detect_cpu_topology(hw);
-        // On a hybrid part the slow cluster drags the whole pool (a decode step
-        // is as slow as its slowest participant). Default to the performance
-        // cluster unless the user asked for a specific count; prefill-heavy work
-        // can opt back in with KRK_THREADS=<all> or --threads.
-        if (!hc_forced && topo_.hybrid && topo_.n_fast > 0 && hc > topo_.n_fast)
-            hc = topo_.n_fast;
+        // WIDTH. The default is the number that was measured on this class of
+        // part, and the measurement says the P cluster WITH its SMT siblings --
+        // not the physical P count, and not every logical CPU.
+        //
+        // Qwen3.8-4B-Q4_K_M (2.59 GB, 22-token prompt, -n 32, greedy), one
+        // width per round with the starting width rotated each round so the
+        // warm-up slot is not one arm's:
+        //
+        //   width       prefill ms   prefill tok/s   decode tok/s
+        //   4              2161.8          14.85           3.45
+        //   6              1927.4          16.66           3.85
+        //   8  (default)   1507.2          21.29           4.10
+        //  10              2048.1          15.63           3.35
+        //  14              2125.1          15.06           2.55
+        //
+        // The shape is the memory-bandwidth curve the same box reports from
+        // kraken-membw (512 MiB, median of 9): 8 threads peak at 26.5 GB/s,
+        // 14 at 24.8, 18 at 20.4 -- 23% below 8. A decode step is one stream
+        // per participant and the P cluster's SMT pairs are what supply the
+        // extra memory-level parallelism; 4 threads (one per physical P core)
+        // has half the streams and measures 16% slower, which is why the pool
+        // does NOT cap to physical cores. An older note here claimed the
+        // opposite from a single sequential sweep; that reading was page-cache
+        // warm-up (see par_small_width in backend_cpu.cpp, which found the
+        // physical cap 20% slower once the A/B was interleaved).
+        //
+        // So on a hybrid part the slow cluster never joins the pool unless the
+        // user asks (KRK_THREADS=<all> or --threads). Where the topology could
+        // not be read at all there is no fast cluster to find, and taking EVERY
+        // logical CPU is the one choice the curve above rules out for a
+        // bandwidth-bound kernel -- so fall back to half the logical count
+        // rather than all of it. That is a guard, not a measurement.
+        if (!hc_forced) {
+            if (topo_.hybrid && topo_.n_fast > 0)
+                hc = std::min(hc, topo_.n_fast);
+            else if (topo_.order.empty())
+                hc = std::min(hc, std::max<i64>(1, (hw + 1) / 2));
+        }
         if (hc < 1) hc = 1;
         setup_placement_pinning();
         const i64 nw = std::min<i64>(hc - 1, 63);

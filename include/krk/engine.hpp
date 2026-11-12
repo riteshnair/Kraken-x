@@ -79,7 +79,22 @@ struct EngineConfig {
     // with one f32 scale per 32 values, see KvQuant in backend.hpp. The CPU
     // reference implements both; a backend that cannot read the layout refuses
     // the run by name instead of running f16 kernels over int8 bytes.
-    i32 kv_quant = 0;
+    // Library default stays lossless for API compatibility. The CLI and server
+    // opt into turbo3 explicitly in their own argument defaults.
+    i32 kv_quant = 0; // 0 = f16, 1 = int8, 2 = turbo3, 3 = rot4 (experimental)
+    // Expert index path. Empty means `<model_path>.krakenexperts.json`; a
+    // workload tag (`--profile coder`) points it at a per-workload file so two
+    // workloads never blend into one ranking.
+    std::string expert_index_path;
+    // The bounded host-pool seed. -1 = on, 0 = off (--expert-warmup 0). This is
+    // NOT cfg.expert_warmup: the CPU path forces that to 0 to mean "no VRAM
+    // tier to warm", which is a different question from whether to seed the
+    // host pool, and reading it directly made the seed impossible on CPU.
+    i32 host_pool_seed = -1;
+    // True when --kv-quant came from the caller. A default that a model cannot
+    // use (MLA, or a run with a nextn/draft block) falls back to f16 with a
+    // warning; an EXPLICIT request for a format the run cannot use is refused.
+    bool kv_quant_explicit = false;
 
     // Dense weight budget in MiB. 0 (the default) is automatic: weights stay
     // resident while they fit, and whole layers are streamed from the file once
@@ -996,6 +1011,10 @@ private:
     // KRK_EXPERT_PIN_MB=<n> sizes the ring (default: half the measured room
     // beside the VRAM floor).
     void pin_hot_experts();
+    // CPU backend: fill the bounded host pool from the ranked index, hottest
+    // first, stopping at the budget (see the definition for why the ranked
+    // warmup above does not do this on a build with no device memory).
+    void fill_host_pool();
     // Publishes the device dispatch table (ExpertCache::publish_dispatch_table)
     // when the whole routed set is device-resident, so a layer can pick its
     // experts' matrices without a host pointer per expert. Called at the end of
@@ -1104,6 +1123,13 @@ private:
     bool generate_speculative(const GenerateParams &p, GenerateResult *res,
                               const std::vector<i32> &ids, f64 *prefill_ms,
                               f64 *decode_ms, i64 *decode_steps);
+    // The same round with no drafter at all: proposals are the tokens that
+    // followed the last n tokens the last time that n-gram appeared in this
+    // context. Greedy only, and the text must be byte-identical to plain
+    // decode because verification decides every token. KRK_NGRAM=1 selects it.
+    bool generate_ngram(const GenerateParams &p, GenerateResult *res,
+                        const std::vector<i32> &ids, f64 *prefill_ms,
+                        f64 *decode_ms, i64 *decode_steps);
     // The DFlash variant: the drafter is a head set, not an engine, so the
     // proposals come from a masked block instead of a second model's decode
     // loop, and the target's captured activations are what feed it.
@@ -1250,6 +1276,10 @@ private:
     size_t mtp_rec_snap_bytes_ = 0;
     size_t mtp_conv_snap_bytes_ = 0;
     i64 mtp_kv_dim_ = 0;
+    // Bytes per cached position for the nextn block's K and V planes. Equals
+    // mtp_kv_dim_ * act_size for an f16 cache and the packed row size for
+    // turbo3/rot4/int8, so the block's append and read agree with the sizing.
+    i64 mtp_kv_row_ = 0;
     void *mtp_kv_k_ = nullptr;
     void *mtp_kv_v_ = nullptr;
     void *mtp_hidden_ = nullptr; // [kv_cap, n_embd] pre-final-norm rows

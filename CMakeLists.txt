@@ -99,6 +99,8 @@ set(KRK_GPU_TARGETS "gfx1031;gfx1201"
 
 set(KRK_CORE_SOURCES
     src/common.cpp
+    src/rv32.cpp
+    src/rv32_calc.cpp
     src/arch.cpp
     src/verdict.cpp
     src/quant.cpp
@@ -212,6 +214,12 @@ else()
                                              -Wno-unused-parameter)
     if(KRK_NATIVE_CPU)
         target_compile_options(krk_core PRIVATE -march=native)
+        # AVX2 dot-product kernels on by default for native builds.
+        target_compile_definitions(krk_core PRIVATE KRK_DOT_AVX2=1)
+        # AVX-VNNI (_mm256_dpbusd_epi32, 256-bit VEX) is available on Meteor
+        # Lake and Zen 4+; march=native enables it but we define this so
+        # guarded 256-bit VNNI paths can be compiled in.
+        target_compile_definitions(krk_core PRIVATE KRK_DOT_AVXVNNI=1)
     endif()
 endif()
 
@@ -550,7 +558,8 @@ endif()
 if(WIN32)
     # `kraken --bench` reports which GPU engine actually ran the work by
     # sampling the per-process "GPU Engine" performance counters (PDH).
-    target_link_libraries(kraken PRIVATE pdh)
+    # psapi: peak working set / memory counters in the run stats.
+    target_link_libraries(kraken PRIVATE pdh psapi)
 endif()
 
 add_executable(kraken-server src/main_server.cpp)
@@ -611,6 +620,10 @@ target_link_libraries(kraken-gemv-scale PRIVATE krk_core)
 # Is a ternary format actually faster for a CPU decode GEMV? q8_0 against the
 # LUT shape and a VNNI-native bit-plane decode, each reading its own format.
 add_executable(kraken-ternary-gemv tools/bench_ternary_gemv.cpp)
+add_executable(kraken-lowbit-vnni-bench tools/bench_lowbit_vnni.cpp)
+target_link_libraries(kraken-lowbit-vnni-bench PRIVATE krk_core)
+add_executable(kraken-act-recovery-bench tools/bench_act_recovery.cpp)
+target_link_libraries(kraken-act-recovery-bench PRIVATE krk_core)
 
 # Every block count, odd ones included: the 512-bit Q8_0 kernel advances two
 # blocks per iteration, so an odd count depends on the dispatcher refusing it.
@@ -651,6 +664,23 @@ endif()
 # AVX2, scalar. Absent rungs are reported, not skipped silently.
 add_executable(kraken-kquant-dot tools/ta_kquant_dot.cpp)
 target_link_libraries(kraken-kquant-dot PRIVATE krk_core)
+
+# Chunk invariance at the arithmetic boundary: eight activation rows must be
+# bit-identical to eight rows=1 calls for every K-quant used by the CPU GEMM.
+add_executable(kraken-rv32 tools/rv32_cli.cpp)
+target_link_libraries(kraken-rv32 PRIVATE krk_core)
+
+add_executable(kraken-kquant-x8 tools/ta_kquant_x8.cpp)
+target_link_libraries(kraken-kquant-x8 PRIVATE krk_core)
+if(KRK_BUILD_TESTS)
+    add_test(NAME kraken-kquant-x8 COMMAND kraken-kquant-x8)
+endif()
+
+add_executable(kraken-gemv-q4k tools/ta_gemv_q4k.cpp)
+target_link_libraries(kraken-gemv-q4k PRIVATE krk_core)
+
+add_executable(kraken-membw tools/ta_membw.cpp)
+target_link_libraries(kraken-membw PRIVATE krk_core)
 
 add_executable(kraken-q80-tiers tools/ta_q80_tiers.cpp)
 target_link_libraries(kraken-q80-tiers PRIVATE krk_core)
@@ -829,6 +859,13 @@ endif()
 
 if(KRK_BUILD_TESTS)
     enable_testing()
+    add_executable(kraken-rv32-tests tools/ta_rv32.cpp)
+    target_link_libraries(kraken-rv32-tests PRIVATE krk_core)
+    add_test(NAME kraken-rv32 COMMAND kraken-rv32-tests)
+    add_executable(kraken-act-recovery-tests tools/ta_act_recovery.cpp)
+    target_link_libraries(kraken-act-recovery-tests PRIVATE krk_core)
+    add_test(NAME kraken-act-recovery COMMAND kraken-act-recovery-tests)
+
     add_executable(kraken-tests tests/test_kraken.cpp)
     target_link_libraries(kraken-tests PRIVATE krk_core)
     # The prefill-chunk bit-exactness group spawns the CLI and has to know

@@ -6,6 +6,28 @@ It is a triage index, not a claim that every historical measurement or remote
 host was revalidated. The full historical entries remain in those documents.
 No commits, pushes, deployments or sibling-project edits were performed.
 
+## Current verification update, 2026-11-12
+
+The complete release and Debug ASan suites pass 7579/7579 checks. ASan runs
+with leak detection enabled and no suppression. This settles the memory-safety
+and teardown item, not the hardware and real-model items below.
+
+The next actionable order is:
+
+1. Real-model OLMoE, DFlash, Qwen4Exp, MLA, and Gemma verification when the
+   named artifacts and independent oracle are available.
+2. GPU routing-plan and launch-reduction work with output-equivalence gates and
+   matched native-hardware measurements.
+3. Continuous server work: cancellation, persistence, radix reuse, and advanced
+   speculation. Existing continuous batching and KV tiering are not reopened.
+4. Remaining CPU and GPU performance experiments only with matched controls.
+   Historical rejected kernel and self-draft directions stay closed without new
+   falsifying evidence.
+
+Items requiring unavailable checkpoints, independent reference logits, Windows,
+Zen 3, Core Ultra, RDNA hardware, or a real large MoE remain blocked. Synthetic
+fixtures and this CPU host cannot settle them.
+
 ## Settled in this pass
 
 | Item | Current evidence |
@@ -95,12 +117,13 @@ No commits, pushes, deployments or sibling-project edits were performed.
 
 ## Capability gaps still pending
 
-- **qwen4exp:** named registry refusal exists. Actual gated/fused attention,
-  SSM, QSA, hyperconnections and PLE execution is absent.
-- **MLA / deepseek2 / deepseek4:** absorbed latent attention/cache contract,
-  model scaling/RoPE and compressed-attention requirements; GLM-4.7-Flash
-  was inspected this pass and still refuses for MLA. Better expert residency
-  cannot by itself make those architectures runnable.
+- **qwen4exp:** synthetic whole-graph execution now covers gated attention,
+  SSM, QSA, hyperconnections and PLE. Real-checkpoint coherence and quality
+  remain unverified; do not treat fixture hashes as real-model validation.
+- **MLA / deepseek2 / deepseek4:** synthetic legacy, split, shared-latent and
+  compressed-attention paths execute, including batched per-row addressing.
+  Real-model scaling, coherence and quality remain unverified. Better expert
+  residency cannot by itself prove those architecture contracts.
 - **Gemma2/3 windows, gemma4:** per-layer attention/window geometry, input
   embeddings, projection sharing versus cache-sharing semantics.
 - **MTP / DFlash2 / DSpark:** extraction/recognition is not forward execution;

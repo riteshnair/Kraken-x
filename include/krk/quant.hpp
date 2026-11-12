@@ -284,6 +284,12 @@ f32 vec_dot_wide1(DType t, const void *w, const f32 *x, i64 n);
 void set_vec_dot_wide(bool on);
 // The pieces the GEMM needs; xq is n int8 and dx is n/32 scales.
 void quantize_q8_row(const f32 *x, i64 n, i8 *xq, f32 *dx);
+// One-pass Q8 quantization plus activation-recovery telemetry. sx/sq4 are
+// optional format sidecars. Outputs are residual RMS/input RMS and the number
+// of nonzero values whose quantized code is zero. Does not alter Q8 values.
+void quantize_q8_row_risk(const f32 *x, i64 n, i8 *xq, f32 *dx,
+                          f32 *relative_residual, i64 *discarded,
+                          i32 *sx = nullptr, i32 *sq4 = nullptr);
 // Also emits sx[]: sum of the quantised values per 32-value sub-block. It is
 // activation-only, so the dmin term uses it instead of recomputing it for every
 // weight row.
@@ -300,6 +306,23 @@ void dot_q4_K_q8_sx_x8(const u8 *w, const i8 *xq, const f32 *dx, const i32 *sx,
                        i64 n, i64 rstride, i64 dstride, i64 sstride, f32 *out,
                        i64 out_stride);
 f32 dot_q4_K_q8(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
+// The same dot with four accumulation chains instead of one. The serial form
+// is a 16-deep FMA dependency chain per 256-value block and measures 0.77% of
+// the int8 ISA peak, i.e. bound by nothing but that chain. This form is what
+// the engine runs unless KRK_Q4K_TILE=0, and it is exposed here so
+// tools/ta_gemv_q4k.cpp can time both arms in one process.
+f32 dot_q4_K_q8_tile(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
+// The shipped serial kernel by name, for a bench that must not compare the
+// default dispatch entry against itself.
+f32 dot_q4_K_q8_serial(const u8 *w, const i8 *xq, const f32 *dx, i64 n);
+// The `_sx` kernel with the block's eight (scale, min) pairs hoisted out of the
+// chunk loop. Bit-identical to dot_q4_K_q8_sx by construction; it exists to
+// price the scalar scale extraction.
+f32 dot_q4_K_q8_sx_hoist(const u8 *w, const i8 *xq, const f32 *dx,
+                         const i32 *sx, i64 n);
+// The pre-hoist `_sx` body by name, for the same reason.
+f32 dot_q4_K_q8_sx_loop(const u8 *w, const i8 *xq, const f32 *dx,
+                        const i32 *sx, i64 n);
 // Q8_0 against int8 activations with neither side expanded to f32: the signed
 // weight is split into unsigned magnitudes |w| and the products are subtracted,
 // which keeps maddubs inside i16 for the whole legal byte range (including the

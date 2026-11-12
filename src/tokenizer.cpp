@@ -332,6 +332,17 @@ bool Tokenizer::load(const Gguf &g, std::string *err) {
         model_ = TokModel::Spm;
     } else if (model == "gpt2" || model == "bpe" || model == "qwen2") {
         model_ = TokModel::Bpe;
+    } else if (model == "gemma4") {
+        // gemma4's vocabulary is BPE-shaped (it ships `merges` and no usable
+        // unigram scores) but its pieces are RAW UTF-8 with U+2581 as the
+        // space marker, not the GPT-2 byte permutation. That is a separate
+        // pre-type in the reference (`LLAMA_VOCAB_PRE_TYPE_GEMMA4`:
+        // "spaces are replaced with U+2581 by the normalizer, then BPE merges
+        // run on the whole text without word-level pre-splitting",
+        // `byte_encode = false`), and the model string is the only key that
+        // states it -- these files carry no `tokenizer.ggml.pre`.
+        model_ = TokModel::Bpe;
+        spm_bpe_ = true;
     } else if (!model.empty()) {
         // Many converters emit no model string but do emit merges/scores.
         model_ = g.get_str_array("tokenizer.ggml.merges") ? TokModel::Bpe
@@ -466,6 +477,16 @@ i32 Tokenizer::piece_id(const std::string &p) const {
 // ---------------------------------------------------------------------------
 
 int Tokenizer::encode_bpe(const std::string &text, i32 *out, int max_out) const {
+    // A gemma4 file reaches this entry point (it IS a BPE) but not this code
+    // path: its merges are raw UTF-8 over U+2581, so the GPT-2 byte mapping
+    // below turns every space into U+0120 -- a codepoint the merge table never
+    // names. The consequence is not a rounding difference: this file has
+    // exactly ONE U+0120 piece (id 245237), so `<bos> The capital of France is`
+    // came out as TEN tokens with that piece at every word boundary instead of
+    // the reference's SIX (`<bos> The ▁capital ▁of ▁France ▁is`), and the model
+    // -- given a token it was never trained on for every space -- answers
+    // garbage from the first generated token.
+    if (spm_bpe_) return encode_spm_bpe(text, out, max_out);
     const ByteCodec &codec = byte_codec();
     int n_out = 0;
 
@@ -527,6 +548,124 @@ int Tokenizer::encode_bpe(const std::string &text, i32 *out, int max_out) const 
             }
             if (n_out >= max_out) return -1;
             out[n_out++] = id;
+        }
+    }
+    return n_out;
+}
+
+// ---------------------------------------------------------------------------
+// SPM-style BPE (gemma4)
+// ---------------------------------------------------------------------------
+//
+// The vocabulary is a BPE (it ships `merges`) but its pieces are RAW UTF-8 with
+// U+2581 as the space marker -- the SentencePiece convention -- rather than the
+// GPT-2 byte permutation. The reference models this as its own pre-type
+// (llama.cpp `LLAMA_VOCAB_PRE_TYPE_GEMMA4`: "spaces are replaced with U+2581 by
+// the normalizer, then BPE merges run on the whole text without word-level
+// pre-splitting", with `byte_encode = false`), so three things differ from
+// encode_bpe and each of them alone breaks the prompt:
+//
+//   * the space marker. The GPT-2 codec maps ' ' to U+0120, which this file's
+//     merge table never names -- it has 137,542 pieces containing U+2581 and
+//     exactly ONE containing U+0120. Every word boundary therefore fell out as
+//     that lone piece (id 245237) and the model was handed a token it never saw
+//     for every space in the prompt.
+//   * the pre-split. Byte-level BPE splits words first; here merges span
+//     word boundaries (only a newline may not be inside a merge key), so a
+//     word-level split loses every `the` + ` space` merge.
+//   * the byte fallback. Raw UTF-8 with no mapping means an unknown piece
+//     decomposes BYTE by byte into the `<0xNN>` tokens, not per codepoint.
+//
+// Measured against llama.cpp's own tokenizer on `gemma-4-E4B-it-Q4_K_M`
+// (`llama-tokenize.exe`, build 12110): the reference gives
+// `[2, 818, 5279, 529, 7001, 563]` for "The capital of France is", and this
+// produced `[2, 818, 245237, 41626, 245237, 1340, 245237, 31756, 245237, 511]`
+// -- ten tokens with the bogus piece at every space. On 42 layers of that
+// mismatch the model answered `  is is is isisisis` instead of ` Paris.`.
+int Tokenizer::encode_spm_bpe(const std::string &text, i32 *out,
+                             int max_out) const {
+    // The normalizer's job: fold spaces to the marker, and nothing else. No
+    // leading marker -- `tokenizer.ggml.add_space_prefix` belongs to the SPM
+    // path, and this family states it false.
+    std::string norm;
+    norm.reserve(text.size() + 8);
+    for (char c : text) {
+        if (c == ' ')
+            norm += "\xE2\x96\x81";
+        else
+            norm.push_back(c);
+    }
+
+    int n_out = 0;
+    auto emit = [&](i32 id) {
+        if (n_out >= max_out) return false;
+        out[n_out++] = id;
+        return true;
+    };
+
+    std::vector<std::string> syms;
+    size_t i = 0;
+    while (i < norm.size()) {
+        // The reference's pre-split is `[^\n]+|[\n]+`: a newline run is one
+        // chunk (a merge key may not contain a newline), everything else is
+        // one chunk however much punctuation or whitespace it holds.
+        const bool nl = norm[i] == '\n';
+        size_t j = i;
+        while (j < norm.size() && (norm[j] == '\n') == nl) j++;
+        const std::string chunk = norm.substr(i, j - i);
+        i = j;
+        if (nl) {
+            // A newline run is a single token when the vocabulary has it
+            // ("\n", "\n\n", ...). Without this the fallback would emit one
+            // <0x0A> per newline, which is the pre-split's whole reason for
+            // existing.
+            const i32 id = piece_id(chunk);
+            if (id >= 0) {
+                if (!emit(id)) return -1;
+                continue;
+            }
+        }
+        // raw UTF-8 codepoints, NOT byte-codec-mapped
+        syms.clear();
+        size_t p = 0;
+        while (p < chunk.size()) {
+            u32 cp = 0;
+            const int len = utf8_decode(chunk, p, &cp);
+            syms.emplace_back(chunk, p, static_cast<size_t>(len));
+            p += static_cast<size_t>(len);
+        }
+        while (syms.size() > 1) {
+            int best_rank = INT_MAX;
+            size_t best_at = 0;
+            for (size_t k = 0; k + 1 < syms.size(); k++) {
+                const std::string key = syms[k] + " " + syms[k + 1];
+                auto it = ranks_.find(key);
+                if (it != ranks_.end() && it->second < best_rank) {
+                    best_rank = it->second;
+                    best_at = k;
+                }
+            }
+            if (best_rank == INT_MAX) break;
+            syms[best_at] += syms[best_at + 1];
+            syms.erase(syms.begin() + static_cast<ptrdiff_t>(best_at + 1));
+        }
+        for (const std::string &s : syms) {
+            const i32 id = piece_id(s);
+            if (id >= 0) {
+                if (!emit(id)) return -1;
+                continue;
+            }
+            // byte fallback over the RAW bytes: the <0xNN> pieces are the
+            // vocabulary's own byte tokens (token_type BYTE), and a raw-UTF-8
+            // piece that is absent has to come apart per byte, not per
+            // codepoint.
+            for (char c : s) {
+                char buf[16];
+                std::snprintf(buf, sizeof(buf), "<0x%02X>",
+                              static_cast<unsigned>(static_cast<u8>(c)));
+                const i32 bid = piece_id(buf);
+                if (bid >= 0 && !emit(bid)) return -1;
+            }
         }
     }
     return n_out;
@@ -693,7 +832,12 @@ std::string Tokenizer::decode(const i32 *toks, int n) const {
             if (ok) { out.push_back(static_cast<char>(v)); continue; }
         }
 
-        if (model_ == TokModel::Spm) {
+        // The SPM convention is also the DECODE for an SPM-style BPE: U+2581 is
+        // a space and every other piece is raw text. Running gemma4 through the
+        // byte-level branch below would try to un-map the GPT-2 permutation
+        // from pieces that never went through it, i.e. it would rewrite bytes
+        // the vocabulary spells literally.
+        if (model_ == TokModel::Spm || spm_bpe_) {
             size_t i2 = 0;
             while (i2 < p.size()) {
                 u32 cp = 0;

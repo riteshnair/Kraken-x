@@ -216,6 +216,11 @@ public:
     // The returned pointer is valid until the next acquire().
     const ResidentExpert *acquire(const ExpertSource &src, i32 layer, i32 expert);
 
+    // A multi-expert consumer holds every returned slot until its launches are
+    // complete. Without these leases, admitting a later expert can evict and
+    // erase an earlier unordered_map node even when total slot capacity fits.
+    void set_lease(i32 layer, i32 expert, bool held);
+
     // The same matrices WITHOUT a device copy, when they are already in the
     // pinned host tier and the backend can address that memory from a kernel.
     //

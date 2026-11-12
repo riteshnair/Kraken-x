@@ -1590,6 +1590,11 @@ size_t ExpertCache::preload(const ExpertSource &src, i32 layer) {
     return staged;
 }
 
+void ExpertCache::set_lease(i32 layer, i32 expert, bool held) {
+    auto it = slots_.find(slot_key(layer, expert));
+    if (it != slots_.end()) it->second.leased = held;
+}
+
 const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
                                            i32 expert) {
     if (!be_ || !src.present()) return nullptr;
@@ -1725,6 +1730,13 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
     const void *batch_src[3] = {};
     size_t batch_len[3] = {};
     int nb = 0;
+    // Collected here and issued as ONE concurrent batch after the loop. Three
+    // slices read one at a time, one expert after another, is the whole of a
+    // 20 ms layer on GLM-4.7-Flash (~1 GB/s of weight traffic); the three
+    // destination cells are disjoint, so the reads are independent.
+    Backend::ReadReq read_reqs[3]{};
+    int nr = 0;
+    size_t total_read = 0;
     bool loaded = true;
     for (int i = 0; i < 3 && loaded; i++) {
         const GgufTensor *t = srcs[i];
@@ -1789,18 +1801,27 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
             // Rejected or no tier: read it in the way the cache did before the
             // tier existed, straight from the mapping through the pull path.
             //
-            // Timed as a READ, not as a transfer. This upload IS the file read:
-            // it faults the mapping in and copies it to the device, and on the
-            // arm this cache exists for -- no WARM tier, so every miss comes
+            // Timed as a READ, not as a transfer: this IS the file read, and on
+            // the arm this cache exists for -- no WARM tier, so every miss comes
             // here -- it is the whole I/O cost of the run. It used to sit
             // outside every timer, and the consequence was a profile that
             // claimed `expert-path read 0.0 ms` while the same run reported
             // 366 MiB read from the file. `xfer` is for the DMA out of a WARM
             // buffer, where the bytes are already in RAM.
-            MsTimer read_clock(&read_ms_,
-                               phase_sink(&pf_read_ms_, &dc_read_ms_));
-            be_->upload(dsts[i]->data, t->plane(e), per);
+            read_reqs[nr].dst = dsts[i]->data;
+            read_reqs[nr].mapped_src = t->plane(e);
+            read_reqs[nr].bytes = per;
+            total_read += per;
+            nr++;
         }
+    }
+    if (nr > 0) {
+        MsTimer read_clock(&read_ms_, phase_sink(&pf_read_ms_, &dc_read_ms_));
+        // `warm.read` is the DISK-TIER read a cold expert pays. On a model
+        // whose routed set does not fit, this row is the step.
+        HostAdd h("expert.warm.read");
+        be_->read_host_batch(read_reqs, nr);
+        h.bytes(static_cast<krk::i64>(total_read));
     }
     {
         MsTimer t(&xfer_ms_, phase_sink(&pf_xfer_ms_, &dc_xfer_ms_));

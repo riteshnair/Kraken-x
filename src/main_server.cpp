@@ -33,7 +33,8 @@ struct Args {
     // tokens: 397.1 tok/s at 256 against 462.6 at 512), and the exact-rung
     // hashes are identical at 1, 8 and 512.
     int chunk = 512;
-    int kv_quant = 0;  // 0 = f16 KV, 1 = int8 (EngineConfig::kv_quant)
+    int kv_quant = 2;  // 0 = f16, 1 = int8, 2 = turbo3 (default), 3 = rot4 (experimental)
+bool kv_quant_explicit = false;
     // rows>1 GEMM on the throughput rung, matching the CLI's default: the exact
     // grid costs 36% of a chunk on Qwen3.5-35B-A3B (147.0 -> 225.1 tok/s) for a
     // chunk-invariance guarantee nothing but --prefill-hash consumes.
@@ -113,10 +114,11 @@ void usage() {
         "                        arm takes (resident experts always stay on GPU)\n"
         "  --draft MODEL         draft model for greedy speculative decoding\n"
         "  --draft-tokens N      speculation window (default 4)\n"
-        "  --cpu                 use the scalar reference backend\n"
+        "  --cpu                 use the CPU backend; optional SIMD and quantized\n"
+        "                        kernels may change reduction order from strict scalar\n"
         "  --npu                 run the GEMM path on the virtual NPU\n"
         "                        (github.com/riteshnair/npuxl-improved; needs a\n"
-                        "                        -DKRK_ENABLE_NPU=ON build)\n"
+        "                        -DKRK_ENABLE_NPU=ON build)\n"
         "  --npu-cpu             run the whole inference through the virtual NPU\n"
         "                        (every op the device has; reference bodies for\n"
         "                        the ops it lacks)\n"
@@ -181,10 +183,13 @@ bool parse(int argc, char **argv, Args *a) {
         else if (f == "--ctx") a->ctx = next_i("--ctx");
         else if (f == "--kv-quant") {
             const std::string v = next("--kv-quant");
+            a->kv_quant_explicit = true;
             if (v == "int8") a->kv_quant = 1;
+            else if (v == "turbo3" || v == "turbo" || v == "tq3") a->kv_quant = 2;
+            else if (v == "rot4" || v == "q4" || v == "q4_0") a->kv_quant = 3;
             else if (v == "f16") a->kv_quant = 0;
             else {
-                std::fprintf(stderr, "kraken-server: --kv-quant needs f16|int8, got '%s'\n",
+                std::fprintf(stderr, "kraken-server: --kv-quant needs f16|int8|turbo3|rot4, got '%s'\n",
                              v.c_str());
                 return false;
             }
@@ -302,6 +307,7 @@ int main(int argc, char **argv) {
     cfg.n_ctx = a.ctx;
     cfg.prefill_chunk = a.chunk;
     cfg.kv_quant = a.kv_quant;
+    cfg.kv_quant_explicit = a.kv_quant_explicit;
     cfg.threads = a.threads;
     cfg.expert_cache_mb = a.expert_cache_mb;
     // No expected_reply_tokens here on purpose: the server's requests carry

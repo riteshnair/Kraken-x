@@ -14,6 +14,7 @@
 //     reuse is a serial-mode feature there, because "the cache" is per slot.
 #include "krk/server.hpp"
 #include "krk/host_time.hpp"
+#include "krk/rv32_calc.hpp"
 #include "krk/webui.hpp"
 
 #include <cstdio>
@@ -414,6 +415,31 @@ bool OpenAiService::handle(const HttpRequest &req, HttpResponse &res, HttpConn &
             return true;
         }
         return handle_models(res);
+    }
+    if (req.path == "/v1/tools/rv32") {
+        if (req.method != "POST") {
+            res = json_response(405, error_body("use POST"));
+            return true;
+        }
+        JsonValue body;
+        std::string expression, err;
+        if (!json_parse(req.body, &body, &err) || !body.is_object() ||
+            !body.get_string("expression", &expression)) {
+            res = json_response(400, error_body("expected JSON object with a nonempty expression string"));
+            return true;
+        }
+        Rv32CalcResult calculated;
+        if (!rv32_calculate(expression, &calculated, &err)) {
+            res = json_response(400, error_body(err));
+            return true;
+        }
+        JsonValue out = JsonValue::object();
+        out.set("object", "rv32.calculation");
+        out.set("result", calculated.value);
+        out.set("instructions", calculated.instructions);
+        out.set("backend", "rv32im-zba");
+        res = json_response(200, std::move(out));
+        return true;
     }
     if (req.path == "/v1/completions" || req.path == "/v1/chat/completions") {
         if (req.method != "POST") {

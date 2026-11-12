@@ -55,7 +55,10 @@ static bool cap_working_set(size_t) { return false; }
 namespace {
 // The configured cache format in the one spelling every call site uses.
 krk::KvQuant kv_quant_of(const krk::EngineConfig &c) {
-    return c.kv_quant == 1 ? krk::KvQuant::Int8 : krk::KvQuant::F16;
+    if (c.kv_quant == 3) return krk::KvQuant::Rot4;
+    if (c.kv_quant == 2) return krk::KvQuant::Turbo3;
+    if (c.kv_quant == 1) return krk::KvQuant::Int8;
+    return krk::KvQuant::F16;
 }
 } // namespace
 namespace krk {
@@ -2165,8 +2168,15 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
             KRK_WARN("mtp probe: off -- %s", why);
         } else {
             mtp_kv_dim_ = bkv;
-            mtp_kv_k_ = alloc(static_cast<size_t>(kv_cap_ * mtp_kv_dim_) * as);
-            mtp_kv_v_ = alloc(static_cast<size_t>(kv_cap_ * mtp_kv_dim_) * as);
+            // The block's cache is sized in BYTES, from the same row function
+            // the trunk uses, so a packed format and the f16 fallback share one
+            // number and the append/read cannot disagree with the allocation.
+            mtp_kv_row_ = static_cast<i64>(
+                be_->kv_row_bytes(bkv, kv_quant_of(cfg_), m.head_dim));
+            mtp_kv_k_ = alloc(static_cast<size_t>(kv_cap_) *
+                              static_cast<size_t>(mtp_kv_row_));
+            mtp_kv_v_ = alloc(static_cast<size_t>(kv_cap_) *
+                              static_cast<size_t>(mtp_kv_row_));
             mtp_hidden_ = alloc(static_cast<size_t>(kv_cap_ * n_embd_) * as);
             // A hyper-connection head reads the LANE STACK, not the mixed row:
             // the mixed row is already the collapse, and the block's prefix is
@@ -2401,29 +2411,82 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     // Quantized K/V is validated before the cache is sized: a backend that
     // cannot read the layout must refuse, not run f16 kernels over int8 bytes
     // (which produces fluent text rather than an error).
-    const KvQuant kvq = cfg_.kv_quant == 1 ? KvQuant::Int8 : KvQuant::F16;
-    if (kvq == KvQuant::Int8) {
-        if (!be_->kv_quant_supported(kvq)) {
-            // The CPU reference and HIP both answer true: the quantising append
-            // plus all four attention readers, with the cache bytes and the
-            // attention output invariant to the chunk size
-            // (`kraken-bench --bitexact`'s int8 block is the device proof). A
-            // backend that answers false is one with no int8 reader at all, so
-            // this refusal names what is missing rather than borrowing a
-            // reason from the layout's history.
-            *err = "kv-quant int8: this backend has no attention kernels for "
-                   "the int8 cache layout (the CPU reference and HIP implement "
-                   "it)";
-            return false;
+    KvQuant kvq = kv_quant_of(cfg_);
+    if (kvq != KvQuant::F16) {
+        const char *qname = kvq == KvQuant::Turbo3 ? "turbo3" : "int8";
+        // Three reasons a run cannot express a packed cache. They are collected
+        // before deciding, because a DEFAULT and an explicit request must be
+        // answered differently: the default must never turn a model that ran
+        // yesterday into a refusal today, and an explicit request must never be
+        // silently downgraded to something other than what was asked for.
+        const bool be_ok = be_->kv_quant_supported(kvq);
+        const bool attn_shape_ok = model_.cfg().mla_layout == MlaLayout::None;
+        const bool draft_ok = !(!cfg_.draft_head.empty());
+        // The rotated formats need an orthogonal Hadamard over the head, which
+        // is exact only when the head width is a power of two. A chunked
+        // transform is still orthogonal, but the SHAPE of the rotated
+        // coordinates stops matching the codebook's assumption as the chunks
+        // shrink, and the effect is not small: Phi-3's head is 96 (64+32), and
+        // measured against f16 the logits KL was 0.198 with the argmax moving,
+        // versus 0.0017 for int8 on the same file -- while the isolated kernel
+        // still reported MSE 0.0336. Until the padding form lands (rotate a
+        // zero-padded power-of-two vector and keep all of its coefficients),
+        // these widths fall back rather than run a rotation that is orthogonal
+        // and still wrong.
+        bool hd_ok = true;
+        if (kvq == KvQuant::Turbo3 || kvq == KvQuant::Rot4) {
+            for (i32 l = 0; l < model_.cfg().n_layer; l++) {
+                if (!model_.layer_has_kv(l)) continue;
+                const i64 hd = model_.head_dim_at(l);
+                if (hd > 0 && (hd & (hd - 1)) != 0) { hd_ok = false; break; }
+            }
         }
-        if (model_.cfg().mla_layout != MlaLayout::None) {
-            *err = "kv-quant int8: the MLA cache layout has no int8 write/read path";
-            return false;
-        }
-        if (cfg_.mtp_spec || cfg_.mtp_probe || !cfg_.draft_head.empty()) {
-            *err = "kv-quant int8: the nextn/draft block keeps its own KV and has "
-                   "no int8 path; run it with kv-quant f16";
-            return false;
+        // A family with NO pre-attention scaling (gemma4 states
+        // `attention.scale = 1.0`, where every other family passes
+        // 1/sqrt(head_dim)) normalizes q and k per head and then dots them
+        // unscaled, so its logits are +-sqrt(head_dim) -- +-16 to +-23 here, i.e.
+        // e^16 -- and its softmax is very nearly one-hot. The rotated 3/4-bit
+        // cache spreads its quantization error over the whole head, which moves
+        // those logits by more than the gap between the top two keys.
+        //
+        // Measured on gemma-4-E4B-it-Q4_K_M, same command, one switch apart:
+        // `f16` answers ` Paris.` (the reference text), `int8` answers it too,
+        // `turbo3` -- the default -- answers ` EringerskJotice:course:CLUChar`
+        // and `rot4` ` to thek k to the process on it on taking on`. Both head
+        // widths on this family (512 global, 256 windowed) are powers of two, so
+        // the Hadamard above is exact and `hd_ok` is true: this is the 4-bit
+        // cache's precision, not a rotated-basis defect. int8 stays available
+        // because it costs 1.8x instead of 3.5x and reproduces the text.
+        const bool logit_ok =
+            (kvq != KvQuant::Turbo3 && kvq != KvQuant::Rot4) ||
+            model_.cfg().attn_scale < 1.0f;
+        if (!be_ok || !attn_shape_ok || !draft_ok || !hd_ok || !logit_ok) {
+            const char *why =
+                !be_ok
+                    ? "this backend has no reader for that cache layout"
+                    : !attn_shape_ok
+                          ? "the MLA cache is a latent row with its own "
+                            "read/write path"
+                          : !draft_ok
+                                ? "the head-set drafter has no packed-cache reader"
+                                : !logit_ok
+                                      ? "this family applies no pre-attention "
+                                        "scaling, so its logits are "
+                                        "+-sqrt(head_dim) and a 4-bit key cache "
+                                        "moves the argmax of its near-one-hot "
+                                        "softmax"
+                                      : "this model's head width is not a power of two, "
+                                        "which the rotated formats do not support yet";
+            if (cfg_.kv_quant_explicit) {
+                *err = format("kv-quant %s: %s; run it with --kv-quant f16",
+                              qname, why);
+                return false;
+            }
+            KRK_WARN("kv-quant %s is the default but %s -- falling back to f16 "
+                     "for this model (pass --kv-quant f16 to make that explicit)",
+                     qname, why);
+            cfg_.kv_quant = 0;
+            kvq = KvQuant::F16;
         }
     }
     size_t kv_load_bytes = 0; // both planes, for the load report below
@@ -2444,9 +2507,10 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         size_t kv_plane = 0;
         for (i32 l = 0; l < mc.n_layer; l++) {
             if (!model_.layer_has_kv(l)) continue;
-            const size_t b = static_cast<size_t>(kv_cap_) *
-                             static_cast<size_t>(n_slots_) *
-                             be_->kv_row_bytes(model_.kv_dim_at(l), kvq);
+            const size_t b =
+                static_cast<size_t>(kv_cap_) * static_cast<size_t>(n_slots_) *
+                be_->kv_row_bytes(model_.kv_dim_at(l), kvq,
+                                  model_.head_dim_at(l));
             kv_len[static_cast<size_t>(l)] = b;
             kv_plane += b;
         }
@@ -2699,6 +2763,16 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     // bytes that are free once the ring has taken its own.
     pin_hot_experts();
 
+    // ---- the bounded host-pool seed (CPU backend) -------------------------
+    // The two phases above are VRAM-tier work and both return early with no
+    // device memory, so on a CPU build the pool started EMPTY on every run: a
+    // measured ranking was read and blended and then never used. Measured on
+    // GLM-4.7-Flash, HOT stayed at 38.0% across two --coder runs while the
+    // index grew. This fills the bounded host pool from the ranking instead,
+    // hottest first, and STOPS at the budget -- it never reads the whole routed
+    // set, which is what the CPU warmup refuses to do.
+    fill_host_pool();
+
     // ---- the expert pool must not fill the card ---------------------------
     // Its budget is decided before the KV cache and before this engine's own
     // workspaces exist, so it can name every byte that was free at that moment
@@ -2918,10 +2992,19 @@ void Engine::shutdown() {
         &ws_xg_, &ws_gateg_, &ws_upg_, &ws_plan_, &ws_alpha_,
                      &ws_scale_, &ws_ebatch_, &ws_edown_, &ws_ebscale_,
                      &ws_qkv_, &ws_z_, &ws_h_, &ws_ssm_, &ws_beta_, &ws_agate_,
-                     &ws_m2in_,
+                     &ws_m2in_, &ws_mla_, &ws_xlat_, &ws_xlat_out_, &ws_ffn_lat_,
+                     &ws_qkv_fused_, &ws_qsa_q_, &ws_qsa_k_, &ws_qsa_kc_, &ws_qsa_vc_,
+                     &ws_sc_, &ws_sc2_, &ws_ppl_, &ws_ppl_g_, &ws_ppl_in_, &ws_ppl_o_,
+                     &ws_hc_, &ws_hc_n_, &ws_hc_fn_, &ws_hc_pre_, &ws_hc_post_,
+                     &ws_hc_comb_, &ws_hc_out_, &ws_hc_new_, &ws_hc_pre_attn_,
+                     &ws_hc_pre_prev_, &ws_hc_head_, &ws_hc_one_, &ws_hc_mix_,
+                     &ws_hc_g_, &ws_hc_lo_, &ws_hc_inj_, &ws_eng_kv_, &ws_eng_rows_,
+                     &ws_ple_emb_, &ws_ple_key_, &ws_ple_qry_, &ws_ple_gated_,
+                     &ws_ple_val_, &ws_ple_norm_, &ws_ple_gate_, &ws_ple_pad_,
+                     &ws_ple_conv_, &ple_state_, &sc_state_,
                      &conv_state_, &rec_state_, &topk_scratch_, &topk_out_,
                      &mtp_kv_k_, &mtp_kv_v_, &mtp_hidden_, &mtp_h_, &mtp_e_,
-                     &mtp_cat_, &mtp_gate_, &mtp_sgate_, &mtp_rep_,
+                     &mtp_cat_, &mtp_gate_, &mtp_sgate_, &mtp_rep_, &mtp_chain_, &mtp_lanes_,
                      &mtp_rec_snap_, &mtp_conv_snap_,
                      &scan_hits_dev_, &scan_mass_dev_}) {
         if (*p) {
@@ -3787,6 +3870,47 @@ void Engine::msa_attention(const AttnDesc &d, const void *kbase, const void *vba
     AttnDesc dd = d;
     dd.n_key_runs = static_cast<i32>(msa_runs_.size() / 2);
     dd.key_runs = msa_runs_.empty() ? nullptr : msa_runs_.data();
+    // A packed cache cannot be read by the block-sparse body: that body stages
+    // an f32 element-addressed row (`hkv * hd`) and the packed readers resolve
+    // a byte-addressed head slice. The backend used to warn and leave the
+    // output ZEROED, which is a finite, fluent, wrong answer rather than an
+    // error.
+    //
+    // What to do instead, in order of how much it changes:
+    //   1. DENSE FALLBACK (default): drop the run list and attend the whole
+    //      visible range through the packed dense path, which already honours
+    //      `skip_from`. The attention math stays exact; what changes is that
+    //      the layer no longer applies the indexer's block SELECTION. That is
+    //      the same trade `KRK_SWA_OFF` makes for a window -- a fuller, slower,
+    //      usually better answer -- so it is a documented arm and not a
+    //      silent substitution.
+    //   2. REFUSE (KRK_MSA_REFUSE=1): for a run that must reproduce the sparse
+    //      selection exactly. Loud, and the caller learns the flag.
+    // True packed support means teaching attn_sparse_rows the rotated-basis
+    // read; that is mechanical (its addressing is already row-based) but it
+    // needs an MSA model on the box to validate, and none is here.
+    if (dd.kv_int8 || dd.kv_turbo || dd.kv_rot4) {
+        const char *e = std::getenv("KRK_MSA_REFUSE");
+        if (e && e[0] == '1') {
+            if (forward_error_.empty())
+                forward_error_ =
+                    "block-sparse attention (MSA) cannot read a packed KV cache "
+                    "(int8/turbo3/rot4) and KRK_MSA_REFUSE=1 asked for a refusal; "
+                    "run this model with --kv-quant f16";
+            return;
+        }
+        static bool told = false;
+        if (!told) {
+            told = true;
+            KRK_WARN("block-sparse attention (MSA) has no packed-cache reader; "
+                     "attending this layer DENSELY over its visible range "
+                     "(same arithmetic, full context, no block selection). "
+                     "KRK_MSA_REFUSE=1 refuses instead, --kv-quant f16 keeps "
+                     "the sparse path.");
+        }
+        dd.n_key_runs = 0;
+        dd.key_runs = nullptr;
+    }
     be_->attention(ws_attn_, ws_q_, kbase, vbase, dd);
 }
 
@@ -4477,9 +4601,15 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // The int8 row is kv_dim bytes plus one f32 scale per 32 values, so a
         // position's stride is the backend's answer for that width, not the
         // element count. Both the append and the attention read this one number.
-        if (kv_quant_of(cfg_) == KvQuant::Int8)
-            d.pos_stride = static_cast<i64>(be_->kv_row_bytes(lkv, kv_quant_of(cfg_)));
+        if (kv_quant_of(cfg_) != KvQuant::F16)
+            d.pos_stride = static_cast<i64>(be_->kv_row_bytes(
+                lkv, kv_quant_of(cfg_), d.hd));
         d.kv_int8 = kv_quant_of(cfg_) == KvQuant::Int8;
+        // TurboQuant's row is per kv head (own rotation seed, own scale), so
+        // the read derives a head's slice from d.hd; the stride above is the
+        // whole position's bytes, exactly as the int8 row is.
+        d.kv_turbo = kv_quant_of(cfg_) == KvQuant::Turbo3;
+        d.kv_rot4 = kv_quant_of(cfg_) == KvQuant::Rot4;
         // A sliding-window layer sees only its last `swa_window` keys; the full
         // layers of the same stack see the whole prefix.
         d.window = (mc.swa_window > 0 && model_.is_swa(l)) ? mc.swa_window : 0;
@@ -4831,8 +4961,17 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
             // file carries no tensor, so a family that declares it must run it
             // here, before the row reaches the cache -- normalizing on read
             // would cost a pass per attended key instead of one per token.
+            //
+            // PER HEAD, not over the whole KV row: the reference's Vcur is
+            // [n_embd_head, n_head_kv, n_tokens] and ggml_rms_norm reduces dim
+            // 0, which is one head. The 2 KB row of a 2-KV-head layer is two
+            // independent normals, and a single reduction over both rescales
+            // one head against the other -- a different vector, not a rounding
+            // difference (measured on gemma-4-E4B layer 0 against an
+            // independent numpy forward of the same graph: relL2 7.2e-2,
+            // cos 0.9974, and every stage after it inherits the error).
             if (mc.v_norm_weightless && L.wv.present())
-                be_->rmsnorm(ws_v_, ws_v_, nullptr, n, lkv, mc.rms_eps);
+                be_->rmsnorm(ws_v_, ws_v_, nullptr, n * lkvh, d.hd, mc.rms_eps);
             // Post-norm, pre-rope: the row the rotation consumes. The
             // fused arm's copy of it lives in registers and never lands
             // in this buffer, so this row covers the separate chain only.
@@ -4924,7 +5063,7 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
             if (mc.attn_gate_wide)
                 be_->mul_act(ws_attn_, ws_agate_, static_cast<i64>(n) * lq);
             else
-                be_->mul_head_broadcast(ws_attn_, ws_agate_, n, lh, mc.head_dim);
+                be_->mul_head_broadcast(ws_attn_, ws_agate_, n, lh, d.hd);
             dump_row("attn.gated", l, ws_attn_, lq, n);
         }
 
@@ -5680,8 +5819,13 @@ bool Engine::mtp_attn_body(const MtpBlock &m, i32 pos, bool norm_first, i32 wind
     d.n_tok = 1;
     d.pos0 = pos;
     d.layer_stride = 0;
-    d.pos_stride = kvw;
+    // Allocation uses bytes. The uncompressed CPU/HIP append uses element
+    // strides, while packed caches use byte strides, matching the trunk path.
+    d.pos_stride = kv_quant_of(cfg_) == KvQuant::F16 ? mtp_kv_dim_ : mtp_kv_row_;
     d.layer = 0;
+    d.kv_int8 = kv_quant_of(cfg_) == KvQuant::Int8;
+    d.kv_turbo = kv_quant_of(cfg_) == KvQuant::Turbo3;
+    d.kv_rot4 = kv_quant_of(cfg_) == KvQuant::Rot4;
     d.window = 0;
     d.scale = static_cast<f32>(1.0 / std::sqrt(static_cast<f64>(hd)));
     d.softcap = mc.attn_softcap;
@@ -6210,9 +6354,9 @@ Engine::MtpProbe Engine::mtp_probe_step() {
     // history rather than attend over tokens this prompt never had.
     if (mtp_fed_ < 0 || mtp_fed_ > r.pos) {
         be_->fill0(mtp_kv_k_,
-                   static_cast<size_t>(P) * static_cast<size_t>(mtp_kv_dim_) * as);
+                   static_cast<size_t>(P) * static_cast<size_t>(mtp_kv_row_));
         be_->fill0(mtp_kv_v_,
-                   static_cast<size_t>(P) * static_cast<size_t>(mtp_kv_dim_) * as);
+                   static_cast<size_t>(P) * static_cast<size_t>(mtp_kv_row_));
         mtp_fed_ = 0;
     }
     for (i32 p = static_cast<i32>(mtp_fed_); p < P; p++) {
@@ -6421,67 +6565,60 @@ void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n, void *dst,
     // number of blocks wide, so the halves are row VIEWS of the one weight and
     // the gated path below runs unchanged -- same gemm_group, same silu
     // epilogue, same values the split tensors would have given.
+    //
+    // Use the layer's own dense FFN width: some families (e.g. gemma4/Firefly)
+    // vary feed_forward_length per block, so n_ff_ is only the workspace-sized
+    // maximum and every tensor/count here must match this layer.
     QuantTensor wgate = L.wgate;
     QuantTensor wup = L.wup;
+    i64 l_n_ff = n_ff_;
     if (L.wup_fused.present()) {
+        l_n_ff = L.wup_fused.n_out / 2;
         const i64 rb = static_cast<i64>(
             dtype_row_bytes(L.wup_fused.type, L.wup_fused.n_in));
         wgate = L.wup_fused;
-        wgate.n_out = n_ff_;
+        wgate.n_out = l_n_ff;
         wup = L.wup_fused;
-        wup.data = static_cast<u8 *>(L.wup_fused.data) + n_ff_ * rb;
-        wup.n_out = n_ff_;
+        wup.data = static_cast<u8 *>(L.wup_fused.data) + l_n_ff * rb;
+        wup.n_out = l_n_ff;
+    } else if (wgate.present()) {
+        l_n_ff = wgate.n_out;
+    } else if (wup.present()) {
+        l_n_ff = wup.n_out;
+    } else if (L.wdown.present()) {
+        l_n_ff = L.wdown.n_in;
     }
+    if (l_n_ff <= 0) l_n_ff = n_ff_;
     if (wgate.type == wup.type && !wgate.scaled() && !wup.scaled()) {
         void *gu[2] = {ws_gate_, ws_up_};
         const void *wgu[2] = {wgate.data, wup.data};
-        const i64 ngu[2] = {n_ff_, n_ff_};
+        const i64 ngu[2] = {l_n_ff, l_n_ff};
         be_->gemm_group(gu, xn, wgu, wgate.type, ngu, n_embd_, 2, n,
                         !gelu && !relu_sqr && !row_scaled, &silu_done);
     } else {
-        gemm_w(ws_gate_, xn, wgate, n_ff_, n_embd_, n);
-        gemm_w(ws_up_, xn, wup, n_ff_, n_embd_, n);
+        gemm_w(ws_gate_, xn, wgate, l_n_ff, n_embd_, n);
+        gemm_w(ws_up_, xn, wup, l_n_ff, n_embd_, n);
     }
     if (!silu_done) {
         if (gelu) {
-            be_->gelu_act(ws_gate_, n * n_ff_);
-            be_->mul_act(ws_gate_, ws_up_, n * n_ff_);
+            be_->gelu_act(ws_gate_, n * l_n_ff);
+            be_->mul_act(ws_gate_, ws_up_, n * l_n_ff);
         } else if (relu_sqr) {
-            // relu(gate)^2 * up. relu_sqr_act is in place on the gate, then the
-            // up leg multiplies -- the same two launches GeGLU takes.
-            //
-            // `row_scaled` is NOT applied on this arm: there is no
-            // relu_sqr+mul+row-max kernel, and the scale is a numerical guard
-            // (it divides a row by its max and the sub-norm below divides it
-            // back in), not part of the function -- `ffn_rowscale_on()` off
-            // already runs every arm unscaled. What it does buy is f16 headroom,
-            // and relu^2 is quadratic, so this arm reaches the store with larger
-            // magnitudes than the silu one. Recorded in the TODO as a
-            // range-only difference, not a correctness one.
-            be_->relu_sqr_act(ws_gate_, n * n_ff_);
-            be_->mul_act(ws_gate_, ws_up_, n * n_ff_);
+            be_->relu_sqr_act(ws_gate_, n * l_n_ff);
+            be_->mul_act(ws_gate_, ws_up_, n * l_n_ff);
         } else {
-            be_->silu_mul(ws_gate_, ws_gate_, ws_up_, n * n_ff_,
-                          row_scaled ? n_ff_ : 0,
+            be_->silu_mul(ws_gate_, ws_gate_, ws_up_, n * l_n_ff,
+                          row_scaled ? l_n_ff : 0,
                           row_scaled ? static_cast<f32 *>(ws_fscl_) : nullptr);
         }
     }
-    dump_row("attn.ffng", l, ws_gate_, n_ff_, n,
+    dump_row("attn.ffng", l, ws_gate_, l_n_ff, n,
              row_scaled ? static_cast<const f32 *>(ws_fscl_) : nullptr);
-    // BitNet's SubLN, FFN half: an RMSNorm on the GATED INTERMEDIATE, between
-    // silu(gate)*up and the down projection -- not on the pre-FFN input, which
-    // is what ffn_norm already is. `ffn_sub_norm` is n_ff wide against
-    // ffn_norm's n_embd, and that is the shape that says which is which. In
-    // place, so the folded-down transform below reads the normalized row; the
-    // dump above is still the raw gated product.
     if (L.ffn_sub_norm)
-        be_->rmsnorm(ws_gate_, ws_gate_, L.ffn_sub_norm, n, n_ff_, dmc.rms_eps);
-    // The intermediate is a folded input as well (its width is n_ff, wider
-    // than anything above), which is safe to put over ws_had_ because the
-    // gate/up gemms have already consumed their copy.
+        be_->rmsnorm(ws_gate_, ws_gate_, L.ffn_sub_norm, n, l_n_ff, dmc.rms_eps);
     const void *gn = ws_gate_;
     if (L.h_ffn_down) {
-        had_xform(ws_had_, ws_gate_, n, n_ff_, false, false);
+        had_xform(ws_had_, ws_gate_, n, l_n_ff, false, false);
         gn = ws_had_;
     }
     const f32 *pn = post_norm ? post_norm : L.ffn_post_norm;
@@ -6491,7 +6628,7 @@ void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n, void *dst,
         // folded residual store -- the norm has to read the projection, so the
         // epilogue cannot write straight into ws_x_ -- which is why this runs
         // as gemm + norm + add.
-        gemm_w(ws_x2_, gn, L.wdown, n_embd_, n_ff_, n);
+        gemm_w(ws_x2_, gn, L.wdown, n_embd_, l_n_ff, n);
         const f32 peps =
             dmc.post_norm_eps > 0.0f ? dmc.post_norm_eps : dmc.rms_eps;
         be_->rmsnorm(ws_x2_, ws_x2_, pn, n, n_embd_, peps, nullptr);
@@ -6501,7 +6638,7 @@ void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n, void *dst,
     } else if (dst) {
         // A branch with no norm of its own still cannot take the folded
         // residual store, because it has no residual to store into.
-        gemm_w(dst, gn, L.wdown, n_embd_, n_ff_, n);
+        gemm_w(dst, gn, L.wdown, n_embd_, l_n_ff, n);
         dump_row("attn.down", l, dst, n_embd_, n);
     } else if (dmc.residual_scale_ffn) {
         // MiniCPM3 scales the FFN result by `scale_depth/sqrt(n_layer)` before
@@ -6509,7 +6646,7 @@ void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n, void *dst,
         // The folded store writes straight into the residual, so it cannot
         // carry a multiply: this is the gemm + scale + add the reference does,
         // gated on the flag so every other family keeps the fold.
-        gemm_w(ws_x2_, gn, L.wdown, n_embd_, n_ff_, n);
+        gemm_w(ws_x2_, gn, L.wdown, n_embd_, l_n_ff, n);
         // The branch as projected, before the residual scale -- the other side
         // of the multiply, so a trace can prove the factor is applied ONCE and
         // with the value the config says (test_minicpm3_scale_arithmetic).
@@ -6520,7 +6657,7 @@ void Engine::dense_ffn(const LayerWeights &L, i32 l, i64 n, void *dst,
         dump_row("attn.down", l, ws_x2_, n_embd_, n);
         be_->add_inplace(ws_x_, ws_x2_, static_cast<i64>(n) * n_embd_);
     } else {
-        gemm_residual(ws_x_, gn, L.wdown.data, L.wdown.type, n_embd_, n_ff_, n,
+        gemm_residual(ws_x_, gn, L.wdown.data, L.wdown.type, n_embd_, l_n_ff, n,
                       ws_x2_, L.wdown.gs);
         dump_row("attn.down", l, ws_x2_, n_embd_, n);
     }
@@ -6748,7 +6885,9 @@ bool Engine::kv_rollback_zero(i64 pos) {
     }
     for (i64 l = 0; l < model_.cfg().n_layer; l++) {
         if (!model_.layer_writes_kv(l)) continue;
-        const size_t row = be_->kv_row_bytes(model_.kv_dim_at(l), cfg_.kv_quant == 1 ? KvQuant::Int8 : KvQuant::F16);
+        const size_t row = be_->kv_row_bytes(model_.kv_dim_at(l),
+                                             kv_quant_of(cfg_),
+                                             model_.head_dim_at(l));
         u8 *kb = static_cast<u8 *>(kbase[static_cast<size_t>(l)]) +
                  static_cast<size_t>(pos) * row;
         u8 *vb = static_cast<u8 *>(vbase[static_cast<size_t>(l)]) +
@@ -7164,7 +7303,12 @@ bool Engine::configure_expert_cache(std::string *err) {
     // loading from the GGUF/mapping and leaving headroom for other work.
     if (be_ && !be_->has_device_memory() && mc.is_moe) {
         const size_t ram_cap = host_budget > 0 ? host_budget : warm;
-        if (cfg_.expert_cache_mb > 0) {
+        if (cfg_.expert_cache_slots > 0) {
+            // An explicit count is a contract, not an auto-sizing hint. Keep
+            // the byte budget and exact slot ceiling computed above.
+            budget = model_.max_expert_bytes() *
+                     static_cast<size_t>(cfg_.expert_cache_slots);
+        } else if (cfg_.expert_cache_mb > 0) {
             const size_t req =
                 static_cast<size_t>(cfg_.expert_cache_mb) * 1024u * 1024u;
             budget = ram_cap > 0 ? std::min(req, ram_cap) : req;
@@ -7178,10 +7322,12 @@ bool Engine::configure_expert_cache(std::string *err) {
             budget = std::min(total_bytes > 0 ? total_bytes : static_cast<size_t>(256) * 1024u * 1024u,
                               static_cast<size_t>(1024) * 1024u * 1024u);
         }
-        warm = 0;
-        slot_budget = 0;
-        cfg_.expert_warmup = 0;
-        cfg_.expert_warm_prefetch = 0;
+        // Automatic WARM stays off because the mapping is already host memory.
+        // A positive explicit request remains a real bounded read-through tier.
+        if (cfg_.expert_warm_mb <= 0) warm = 0;
+        if (cfg_.expert_warmup < 0) cfg_.expert_warmup = 0;
+        // Explicit warmup=1 and warm-prefetch remain valid with a requested
+        // host tier; only their automatic forms default off on CPU.
         KRK_INFO("expert cache: cpu host-resident pool %.0f MiB for %.0f MiB routed "
                  "set (bounded by live free RAM/reserves, lazy load, no VRAM tier)",
                  static_cast<f64>(budget) / (1024.0 * 1024.0),
@@ -7630,6 +7776,17 @@ bool Engine::configure_expert_cache(std::string *err) {
 bool Engine::load_dflash(const std::string &path, std::string *err) {
     if (!be_) {
         if (err) *err = "the engine must be initialised before the drafter";
+        return false;
+    }
+    // The DFlash block writes and reads its OWN K/V rows directly, so a packed
+    // trunk cache says nothing about it and it has no packed reader. Init
+    // cannot see this (the drafter loads after init), so the refusal lives here
+    // rather than in the kv-quant fallback -- otherwise `--dflash` on a default
+    // turbo3 run would read packed bytes as floats.
+    if (kv_quant_of(cfg_) != KvQuant::F16) {
+        if (err)
+            *err = "dflash keeps its own KV rows and has no packed-cache reader; "
+                   "run it with --kv-quant f16";
         return false;
     }
     if (dflash_) return true;
@@ -9496,11 +9653,18 @@ void Engine::write_expert_index_rows(const std::string &path,
         KRK_WARN("expert scan: cannot write %s", path.c_str());
         return;
     }
+    // The path is a Windows path with single backslashes, which is NOT legal
+    // inside a JSON string ("\m" is an invalid escape). Emitted raw, this
+    // writer produced a file its own reader could not parse -- json_parse
+    // failed and expert_index_parse returned empty with no message, which read
+    // as "does not describe this model" and silently disabled the profile.
+    std::string src_path_json;
+    krk::json_escape_to(src_path_json, cfg_.model_path);
     std::fprintf(f,
                  "{\n  \"version\": 1,\n"
                  "  \"kind\": \"kraken-expert-index\",\n"
                  "  \"mode\": \"%s\",\n"
-                 "  \"source_path\": \"%s\",\n"
+                 "  \"source_path\": %s,\n"
                  "  \"source_size\": %llu,\n"
                  "  \"source_mtime\": %llu,\n"
                  "  \"arch\": \"%s\",\n"
@@ -9510,7 +9674,7 @@ void Engine::write_expert_index_rows(const std::string &path,
                  "  \"positions_scanned\": %lld,\n"
                  "  \"layers\": [\n",
                  mode,
-                 cfg_.model_path.c_str(),
+                 src_path_json.c_str(),
                  src_size, src_mtime,
                  mc.arch.c_str(), mc.n_layer, ne, mc.n_expert_used,
                  static_cast<unsigned long long>(one),
@@ -9553,27 +9717,65 @@ ExpertIndexRows expert_index_parse(const std::string &text, i32 n_layer,
                                    unsigned long long src_size) {
     ExpertIndexRows out;
     if (n_layer <= 0 || n_expert <= 0) return out;
+    static const bool dbg = [] {
+        const char *e = std::getenv("KRK_EXPERT_DEBUG");
+        return e && e[0] == '1';
+    }();
     const size_t cells = static_cast<size_t>(n_layer) *
                          static_cast<size_t>(n_expert);
     JsonValue root;
     std::string err;
-    if (!json_parse(text, &root, &err) || !root.is_object()) return out;
+    if (!json_parse(text, &root, &err) || !root.is_object()) {
+        // LOUD, because this is the failure that is easiest to misread: an
+        // unparseable file looked exactly like a file about another model, and
+        // the only visible symptom was a warmup and an adapt that did nothing.
+        if (dbg)
+            KRK_WARN("expert index: unparseable JSON (%s) -- %zu bytes read",
+                     err.empty() ? "no detail" : err.c_str(), text.size());
+        return out;
+    }
     std::string kind;
     root.get_string("kind", &kind);
-    if (kind != "kraken-expert-index" || root.get_int("version", 0) != 1)
+    // KRK_EXPERT_DEBUG=1 names the field that failed. A validation that only
+    // says "does not describe this model" cost a debugging session: the file
+    // this same build had just written was rejected and nothing said why.
+    auto reject = [&](const char *why, const char *have, const char *want) {
+        if (dbg)
+            KRK_WARN("expert index: refusing -- %s (file '%s', expected '%s')",
+                     why, have, want);
         return out;
-    if (root.get_int("n_layer", -1) != n_layer ||
-        root.get_int("n_expert", -1) != n_expert)
-        return out;
+    };
+    if (dbg) {
+        std::string fa;
+        root.get_string("arch", &fa);
+        KRK_INFO("expert index: kind='%s' version=%lld layers=%lld experts=%lld "
+                 "arch='%s' size=%lld tokens=%lld (expected kind ok, version 1, "
+                 "%d layers, %d experts, arch '%s', size %llu)",
+                 kind.c_str(),
+                 (long long)root.get_int("version", 0),
+                 (long long)root.get_int("n_layer", -1),
+                 (long long)root.get_int("n_expert", -1), fa.c_str(),
+                 (long long)root.get_int("source_size", -1),
+                 (long long)root.get_int("positions_scanned", -1), n_layer,
+                 n_expert, arch.c_str(), src_size);
+    }
+    if (kind != "kraken-expert-index")
+        return reject("kind", kind.c_str(), "kraken-expert-index");
+    if (root.get_int("version", 0) != 1) return reject("version", "?", "1");
+    if (root.get_int("n_layer", -1) != n_layer)
+        return reject("n_layer", "?", "n_layer");
+    if (root.get_int("n_expert", -1) != n_expert)
+        return reject("n_expert", "?", "n_expert");
     std::string file_arch;
     root.get_string("arch", &file_arch);
-    if (!file_arch.empty() && file_arch != arch) return out;
+    if (!file_arch.empty() && file_arch != arch)
+        return reject("arch", file_arch.c_str(), arch.c_str());
     const i64 isz = root.get_int("source_size", -1);
     // A zero on either side means "unknown" rather than "different": the
     // 64-bit probe is what knows the size, and a fixture has no model file.
     if (isz > 0 && src_size > 0 &&
         static_cast<unsigned long long>(isz) != src_size)
-        return out;
+        return reject("source_size", "?", "the model's size");
     // `positions_scanned` 0 (or absent, which reads as 0) means the file
     // records no measurement at all -- a scan that died before its first
     // position. Its per-layer order is then whatever the one partial forward
@@ -9697,7 +9899,85 @@ void Engine::merge_expert_index(const std::string &path, double retain) {
              static_cast<long long>(expert_scan_tokens_), path.c_str(), retain);
 }
 
-// True when the ranked warmup should run. Split out from warm_experts()
+// Fills the bounded HOST pool from the ranked index, hottest first, stopping at
+// the budget. The ranked warmup above is a VRAM-tier phase and returns early
+// with no device memory, which is why a measured ranking was read, blended, and
+// then never used on a CPU build: HOT stayed at 38.0% across two --coder runs
+// on GLM-4.7-Flash while the index was being updated. This is the CPU
+// equivalent, and it is deliberately BOUNDED -- it never reads the whole routed
+// set, which is what ``expert_warmup_wanted`` refuses to do on a laptop.
+void Engine::fill_host_pool() {
+    const ModelConfig &mc = model_.cfg();
+    if (!be_ || be_->has_device_memory()) return;
+    if (!mc.is_moe || mc.n_expert <= 0 || mc.n_layer <= 0) return;
+    if (cfg_.host_pool_seed == 0) return; // --expert-warmup 0 declines the seed
+    if (const char *e = std::getenv("KRK_POOL_SEED"))
+        if (e[0] == '0') return;
+    const std::vector<std::pair<i32, i32>> order = load_expert_index();
+    if (order.empty()) return;
+    std::vector<const ExpertSource *> srcs(static_cast<size_t>(mc.n_layer),
+                                           nullptr);
+    for (i32 l = 0; l < mc.n_layer; l++) {
+        const LayerWeights &L = model_.layers()[static_cast<size_t>(l)];
+        if (L.experts.present()) srcs[static_cast<size_t>(l)] = &L.experts;
+    }
+    ExpertCache &ec = model_.experts();
+    const size_t budget = ec.budget_bytes();
+    if (budget == 0) return;
+    // Seed a FRACTION, not the whole budget. Filling it entirely measured
+    // WORSE (HOT 38.0% -> 35.5%, misses 3837 -> 4359 on GLM-4.7-Flash): a
+    // one-run ranking covers part of the routing mass, so pinning all of the
+    // pool to it leaves the adaptive LFU nowhere to put the rest and every
+    // off-profile expert evicts a profile one. The same shape is recorded for
+    // the REAP tier (a tier between the set and the room misses forever).
+    // KRK_POOL_SEED_PCT overrides, 100 = seed everything.
+    // Measured, and OFF by default because it did not pay: GLM-4.7-Flash at a
+    // 3 GiB pool, 24 tokens, HOT hit rate
+    //     no seed      38.0%   (misses 3837)
+    //     seed 50%     37.2%   (4062)
+    //     seed 75%     36.8%   (4196)
+    //     seed 100%    35.5%   (4359)
+    // The LFU reaches that hot set by itself within ~30 tokens, and the ranking
+    // available here was measured over only 79 positions, so a stale prior adds
+    // churn instead of removing it. It stays because the same file, blended
+    // over many runs and applied to a cold start with a small pool, is the case
+    // it was written for -- and KRK_POOL_SEED_PCT=60 is how to try it.
+    static const i64 pct = [] {
+        const char *e = std::getenv("KRK_POOL_SEED_PCT");
+        if (e && *e) {
+            const long v = std::atol(e);
+            if (v >= 0) return static_cast<i64>(v > 100 ? 100 : v);
+        }
+        return i64(0);
+    }();
+    const size_t cap = budget * static_cast<size_t>(pct) / 100u;
+    size_t got = 0, bytes = 0, layer_n = 0;
+    std::vector<u8> seen(static_cast<size_t>(mc.n_layer), 0);
+    for (const auto &le : order) {
+        const i32 l = le.first, e = le.second;
+        if (l < 0 || l >= mc.n_layer) continue;
+        const ExpertSource *src = srcs[static_cast<size_t>(l)];
+        if (!src) continue;
+        const size_t need = src->expert_bytes();
+        if (need == 0) continue;
+        // Bounded: stop at the plan. Letting acquire() evict to make room here
+        // would turn a seed into a scan of the whole routed set.
+        if (bytes + need > cap) break;
+        if (!ec.acquire(*src, l, e)) break;
+        bytes += need;
+        got++;
+        if (!seen[static_cast<size_t>(l)]) {
+            seen[static_cast<size_t>(l)] = 1;
+            layer_n++;
+        }
+    }
+    KRK_INFO("expert pool: seeded %zu expert(s), %.0f MiB of a %.0f MiB budget, "
+             "%zu layer(s), from the ranked index",
+             got, static_cast<f64>(bytes) / 1048576.0,
+             static_cast<f64>(budget) / 1048576.0, layer_n);
+}
+
+    // True when the ranked warmup should run. Split out from warm_experts()
 // because configure_expert_cache has to know whether to leave WARM alone: the
 // two phases fill the same tier in different orders and cannot both run.
 bool Engine::expert_warmup_wanted() const {
@@ -9711,7 +9991,7 @@ bool Engine::expert_warmup_wanted() const {
     // CPU/no-device: no VRAM tier to stage into. The bounded host-resident pool
     // is filled on demand by acquire(); a full warmup pass would read the whole
     // routed set and thrash memory on laptops. Keep it opt-in.
-    if (be_ && !be_->has_device_memory()) return false;
+    if (be_ && !be_->has_device_memory() && cfg_.expert_warmup <= 0) return false;
     if (ec.warm_capacity_bytes() == 0 && !ec.warm_as_mapping())
         return false; // no second tier to fill
     bool on = cfg_.expert_warmup > 0;
@@ -10045,7 +10325,9 @@ std::vector<std::pair<i32, i32>> Engine::load_expert_index() const {
     std::vector<std::pair<i32, i32>> out;
     const ModelConfig &mc = model_.cfg();
     if (!mc.is_moe || mc.n_expert <= 0 || mc.n_layer <= 0) return out;
-    const std::string path = cfg_.model_path + ".krakenexperts.json";
+    const std::string path = cfg_.expert_index_path.empty()
+                                 ? cfg_.model_path + ".krakenexperts.json"
+                                 : cfg_.expert_index_path;
     FILE *f = std::fopen(path.c_str(), "rb");
     if (!f) return out; // no ranking: warm_experts falls back to an even order
     std::string text;
@@ -10990,6 +11272,19 @@ bool Engine::moe_decode_batch(const LayerWeights &L, i32 layer, i32 k, i32 ne,
     // first is gone by the time the launches read it.
     if (model_.experts().capacity_slots() < batch_ids_.size()) return false;
 
+    // Hold the slot nodes and their cells across the complete resolve window.
+    // Total capacity does not prevent a WARM/HOT rebalance from evicting an
+    // earlier slot while a later expert is admitted.
+    struct BatchLeases {
+        ExpertCache &cache;
+        const std::vector<i32> &ids;
+        i32 layer;
+        size_t held = 0;
+        ~BatchLeases() {
+            for (size_t i = 0; i < held; i++) cache.set_lease(layer, ids[i], false);
+        }
+    } leases{model_.experts(), batch_ids_, layer};
+
     // Every expert is resolved BEFORE the first launch, so a refusal here has
     // issued nothing and the caller can fall back safely.
     batch_res_.clear();
@@ -11006,6 +11301,8 @@ bool Engine::moe_decode_batch(const LayerWeights &L, i32 layer, i32 k, i32 ne,
             return false;
         }
         batch_res_.push_back(re);
+        model_.experts().set_lease(layer, e, true);
+        leases.held++;
     }
 
     // Every resolved expert must still be its OWN slot. `acquire()` below
@@ -11815,9 +12112,61 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
             // to get expert weights". Adding it to the weights as well is a
             // plausible-looking and wrong change -- and so is applying it at
             // all when it already entered the logits above (`pre_bias`).
+            // Cache-Prior (arxiv 2412.00099): promote cached experts by biasing
+            // the selection score. m_tilde[e] = 1 if expert e is in VRAM/WARM or
+            // is in the top-J (always selected). bias = lambda * delta * m_tilde.
+            // delta = max(prob) - min(prob) for this layer's router output.
+            // Weights use the original (unbiased) probability.
+            f32 cache_prior_lambda = 0.0f;
+            if (const char *e = std::getenv("KRK_CACHE_PRIOR")) {
+                cache_prior_lambda = static_cast<f32>(std::atof(e));
+            }
+            f32 delta_avg = 0.0f;
+            if (cache_prior_lambda > 0.0f) {
+                f32 mx = -1e30f, mn = 1e30f;
+                for (i32 e = 0; e < ne; e++) {
+                    const f32 sc = moe_prob_[static_cast<size_t>(e)];
+                    if (sc > mx) mx = sc;
+                    if (sc < mn) mn = sc;
+                }
+                delta_avg = mx - mn;
+                if (delta_avg < 0) delta_avg = 0;
+            }
+            // top-J threshold
+            f32 topJ_threshold = -1e30f;
+            if (cache_prior_lambda > 0.0f) {
+                i32 J = mc.n_expert_group > 1 ? 2 : 1;
+                f32 top_scores[4] = {-1e30f, -1e30f, -1e30f, -1e30f};
+                for (i32 e = 0; e < ne; e++) {
+                    const f32 sc = moe_prob_[static_cast<size_t>(e)];
+                    for (i32 j = 0; j < J; j++) {
+                        if (sc > top_scores[j]) {
+                            for (i32 kk = J - 1; kk > j; kk--) top_scores[kk] = top_scores[kk-1];
+                            top_scores[j] = sc;
+                            break;
+                        }
+                    }
+                }
+                topJ_threshold = top_scores[J-1];
+            }
+            auto cache_prior_bias = [&](i32 e) -> f32 {
+                if (cache_prior_lambda <= 0.0f) return 0.0f;
+                // top-J: always promote top-J experts
+                // (J=1 for standard MoE, J=2 for granular)
+                // We check if e is in the top-J by score
+                // m_tilde: 1 if cached or top-J
+                bool in_cache = model_.experts().in_vram(layer, e) ||
+                                model_.experts().in_host(layer, e);
+                // top-J: always promote top-J experts
+                // Determine if e is in top-J by score
+                bool is_topJ = moe_prob_[static_cast<size_t>(e)] >= topJ_threshold;
+                if (!in_cache && !is_topJ) return 0.0f;
+                return cache_prior_lambda * delta_avg;
+            };
             auto sel_score = [&](i32 e) {
                 return moe_prob_[static_cast<size_t>(e)] +
-                       ((rb && !pre_bias) ? rb[static_cast<size_t>(e)] : 0.0f);
+                       ((rb && !pre_bias) ? rb[static_cast<size_t>(e)] : 0.0f) +
+                       cache_prior_bias(e);
             };
             // ---- group-limited selection ----------------------------------
             // DeepSeek-V3's rule (llama-graph.cpp, "select top n_group_used
@@ -14030,6 +14379,274 @@ bool Engine::generate_speculative(const GenerateParams &p, GenerateResult *res,
     return true;
 }
 
+// ---------------------------------------------------------------------------
+//  N-gram (prompt-lookup) speculation.
+//
+//  Why this exists: a decode step on this box is a BANDWIDTH limit, not a
+//  compute one. Qwen3.8-4B-Q4_K reads 2.51 GB of weights per token, the machine
+//  measures 26.5 GB/s of achievable read bandwidth, and 8 threads already reach
+//  10.4 tok/s = 26.1 GB/s. The kernel is 70-93% of the single-core wall. Nothing
+//  instruction-level is left. The one way past a bytes-per-token wall without
+//  changing the weight format is to make a single read of the weights serve
+//  several tokens, which is what a verified multi-token round does.
+//
+//  Every other speculative path here needs a DRAFTER -- a second model, a nextn
+//  block, a DFlash head set, an EAGLE head -- and on this box they are either
+//  absent for a given file or broken (measured self-draft acceptance 27.8%).
+//  This one needs nothing: it proposes the tokens that followed the last `n`
+//  tokens the last time that same n-gram appeared in this context. Text that
+//  copies itself -- code, edits, RAG answers, structured output -- is most of
+//  the continuation; free prose simply proposes nothing and the round costs one
+//  plain decode step.
+//
+//  Correctness is absolute and cheap to check, and it is the gate this ships on:
+//  greedy verification emits exactly what plain decode would emit, so the text
+//  must be BYTE-IDENTICAL to `generate` on the same prompt and seed.
+//
+//  Round shape (target only -- there is no draft KV to keep aligned):
+//    propose   the n-gram continuation, up to k tokens
+//    pre-check proposal[0] against the target's own argmax. A miss costs one
+//              plain decode step and the block never runs.
+//    verify    ONE batched forward of the proposals, one device argmax per row
+//    accept    the longest prefix whose rows agree, plus the bonus token
+//    reject    kv_rollback to the accepted prefix
+// ---------------------------------------------------------------------------
+bool Engine::generate_ngram(const GenerateParams &p, GenerateResult *res,
+                            const std::vector<i32> &ids, f64 *prefill_ms,
+                            f64 *decode_ms, i64 *decode_steps) {
+    // Read once per request, not per round: a getenv inside the decode loop
+    // would be a per-token cost in the thing this change exists to shorten.
+    const i64 n = [] {
+        const char *e = std::getenv("KRK_NGRAM_N");
+        const long v = e ? std::atol(e) : 0;
+        return v > 0 ? static_cast<i64>(v) : 3;
+    }();
+    const i32 k = [] {
+        const char *e = std::getenv("KRK_NGRAM_K");
+        const int v = e ? std::atoi(e) : 0;
+        return v > 0 ? v : 4;
+    }();
+
+    expert_phase(ExpertCache::PhasePrefill);
+    const Timer prefill_timer;
+    for (i64 i = 0; i < static_cast<i64>(ids.size()); i += chunk_) {
+        if (cancel_requested(p)) {
+            mark_cancelled(p, res, i);
+            *prefill_ms = prefill_timer.ms();
+            return true;
+        }
+        const i32 nf = static_cast<i32>(
+            std::min<i64>(chunk_, static_cast<i64>(ids.size()) - i));
+        const bool last = (i + nf) == static_cast<i64>(ids.size());
+        if (!forward(ids.data() + i, nf, static_cast<i32>(i), last)) {
+            res->error = forward_failure_error();
+            res->finish = FinishError;
+            return false;
+        }
+    }
+    fetch_logits();
+    *prefill_ms = prefill_timer.ms();
+    expert_phase(ExpertCache::PhaseDecode);
+
+    Sampler sampler;
+    sampler.reset(p.sampler);
+    sampler.accept(ids.data(), static_cast<int>(ids.size()));
+    TokenEmitter emit(p, tok_, sampler, res, ids);
+
+    const Timer decode_timer;
+    i64 timed_decode_steps = 0;
+    auto finish_run = [&](Finish f) {
+        res->finish = f;
+        *decode_ms = decode_timer.ms();
+        *decode_steps = timed_decode_steps;
+        emit.finish(f == FinishStop);
+    };
+
+    i64 pos = static_cast<i64>(ids.size());
+    std::vector<i32> prop(static_cast<size_t>(k), 0);
+    std::vector<f32> rows(static_cast<size_t>(k) * static_cast<size_t>(n_vocab_));
+
+    // The proposal. History is [0, pos) -- prompt followed by generated -- and
+    // the search runs BACKWARD so the most recent occurrence of the n-gram wins.
+    // A recent repeat is what a copying task actually continues; the first
+    // occurrence in a long prompt is usually a different phrase entirely.
+    const i64 n_prompt = static_cast<i64>(ids.size());
+    auto hist = [&](i64 i) -> i32 {
+        return (i < n_prompt) ? ids[static_cast<size_t>(i)]
+                              : res->tokens[static_cast<size_t>(i - n_prompt)];
+    };
+    auto propose = [&](i64 at_pos) -> i32 {
+        const i64 total = at_pos;
+        if (total < n + 1) return 0;
+        for (i64 q = total - n - 1; q >= 0; q--) {
+            bool hit = true;
+            for (i64 j = 0; j < n; j++) {
+                if (hist(q + j) != hist(total - n + j)) {
+                    hit = false;
+                    break;
+                }
+            }
+            if (!hit) continue;
+            i32 d = 0;
+            while (d < k && q + n + d < total) {
+                prop[static_cast<size_t>(d)] = hist(q + n + d);
+                d++;
+            }
+            return d;
+        }
+        return 0;
+    };
+
+    // Invariant at the top of every round: the target KV holds [0, pos) and
+    // logits_host_ predicts position pos. Identical to plain decode, so the
+    // pre-check IS the plain decode step.
+    while (res->generated < p.max_tokens && pos < kv_cap_) {
+        KRK_TIME_HOST("spec.round");
+        if (p.debug_topk > 0)
+            dump_topk(p.debug_topk, res->generated, pos, logits_host_, n_vocab_);
+        const i32 first = argmax_of(logits_host_, n_vocab_);
+
+        // ---- propose -------------------------------------------------------
+        i32 d = propose(pos);
+        while (d > 0 && pos + d > kv_cap_) d--;
+        draft_proposed_ += static_cast<u64>(d);
+        spec_steps_++;
+        timed_decode_steps++;
+
+        // ---- pre-check: does the target agree with the first proposal? -----
+        // A miss costs exactly one plain decode step (the block never runs), so
+        // a bad n-gram is cheaper here than in every drafter that has to build a
+        // proposal first.
+        if (d == 0 || first != prop[0]) {
+            if (first == tok_.eos()) {
+                finish_run(FinishEos);
+                return true;
+            }
+            emit.accept(first);
+            if (pos + 1 >= kv_cap_) {
+                finish_run(FinishContext);
+                return true;
+            }
+            if (!forward(&first, 1, static_cast<i32>(pos), true)) {
+                res->error = forward_failure_error();
+                finish_run(FinishError);
+                return false;
+            }
+            pos++;
+            fetch_logits();
+            continue;
+        }
+
+        // ---- verify: one batched forward of the proposals ------------------
+        i32 d_eff = d;
+        while (d_eff > 0 && pos + d_eff > kv_cap_) d_eff--;
+        if (d_eff <= 0) {
+            finish_run(FinishContext);
+            return true;
+        }
+        if (!forward_core(prop.data(), d_eff, static_cast<i32>(pos), LogitsNone)) {
+            res->error = forward_failure_error();
+            finish_run(FinishError);
+            return false;
+        }
+        kv_pos_ = pos + d_eff;
+        // One argmax per verified row, on the device where there is one. The
+        // whole-row download is the CPU-backend path and is why rows[] exists.
+        std::vector<i32> row_ids(static_cast<size_t>(d_eff), 0);
+        for (i32 j = 0; j < d_eff; j++) {
+            head_compute(j);
+            i32 id = 0;
+            if (!topk_argmax(&id)) {
+                be_->sync();
+                be_->download_f32(rows.data() + static_cast<size_t>(j) * n_vocab_,
+                                  ws_logits_, n_vocab_);
+                id = argmax_of(rows.data() + static_cast<size_t>(j) * n_vocab_,
+                               n_vocab_);
+            }
+            row_ids[static_cast<size_t>(j)] = id;
+        }
+        auto row_pred = [&](i32 j) {  // argmax of block row j (1-based)
+            return row_ids[static_cast<size_t>(j - 1)];
+        };
+
+        // ---- accept the longest greedy-matching prefix ---------------------
+        i32 a = 1;  // prop[0] passed the pre-check
+        while (a < d_eff && row_pred(a) == prop[static_cast<size_t>(a)]) a++;
+        const bool full = (a == d_eff);
+
+        bool stop_hit = false;
+        i32 emitted = 0;
+        for (i32 j = 0; j < a; j++) {
+            if (res->generated >= p.max_tokens) break;
+            const i32 t = prop[static_cast<size_t>(j)];
+            // An accepted proposal is still a generated token, and the plain
+            // loop tests the end token BEFORE emitting it.
+            if (t == tok_.eos()) {
+                kv_rollback(pos + emitted);
+                finish_run(FinishEos);
+                return true;
+            }
+            draft_accepted_++;
+            stop_hit = emit.accept(t);
+            emitted++;
+            if (stop_hit) break;
+        }
+        if (stop_hit) {
+            kv_rollback(pos + emitted);
+            finish_run(FinishStop);
+            return true;
+        }
+
+        if (full && res->generated < p.max_tokens) {
+            // Full match: row d predicts the bonus token for pos+d.
+            const i32 bonus = row_pred(d_eff);
+            if (bonus == tok_.eos()) {
+                kv_rollback(pos + emitted);
+                finish_run(FinishEos);
+                return true;
+            }
+            emit.accept(bonus);
+            emitted++;
+            if (pos + emitted < kv_cap_ && res->generated < p.max_tokens) {
+                const i32 b = res->tokens.back();
+                if (!forward(&b, 1, static_cast<i32>(pos + emitted - 1), true)) {
+                    res->error = forward_failure_error();
+                    finish_run(FinishError);
+                    return false;
+                }
+                fetch_logits();
+            }
+        }
+        if (full && res->generated >= p.max_tokens) kv_rollback(pos + emitted);
+        // A partial accept leaves rows for rejected proposals in the cache; the
+        // next round would attend to them.
+        if (!full) kv_rollback(pos + emitted);
+        pos += emitted;
+
+        if (res->generated >= p.max_tokens) {
+            finish_run(FinishLength);
+            return true;
+        }
+        if (pos + 1 >= kv_cap_) {
+            finish_run(FinishContext);
+            return true;
+        }
+
+        // The target's logits must predict pos again. After a partial accept
+        // that is block row `emitted` (1-based), which is no longer in rows[]
+        // once the argmax is taken on the device -- one head gemm and one
+        // download, exactly as the draft round does it.
+        if (!full && emitted >= 1) {
+            head_compute(emitted - 1);
+            if (spec_row_sync()) be_->sync();
+            be_->download_f32(logits_host_, ws_logits_, n_vocab_);
+        }
+    }
+
+    finish_run(res->generated >= p.max_tokens ? FinishLength : FinishContext);
+    return true;
+}
+
 // The DFlash round. Same shape as generate_speculative -- greedy-only, one
 // batched verification per round, longest matching prefix kept -- with the
 // proposal side replaced. A DFlash drafter cannot be asked "what comes next":
@@ -14716,6 +15333,32 @@ bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
                  "not positive, which is the greedy limit, and greedy with a head "
                  "is taken by the branch above");
     }
+
+    // N-gram (prompt-lookup) speculation needs no drafter at all, so it goes
+    // ahead of the paths that need one: proposals are the tokens that followed
+    // this n-gram the last time it appeared. Greedy only (verification is a
+    // prefix match), and refused on a delta-rule recurrent target because a
+    // partial rewind has no inverse there -- the same rule kv_rollback
+    // enforces. A file that cannot speculate decodes plainly rather than
+    // warning: that is not a misconfiguration, it is the ceiling.
+    {
+        const char *ng = std::getenv("KRK_NGRAM");
+        if (ng && ng[0] == '1' && p.sampler.greedy &&
+            !(model_.is_recurrent() && !model_.has_lfm_conv())) {
+            f64 prefill_ms = 0, decode_ms = 0;
+            i64 decode_steps = 0;
+            const bool ok = generate_ngram(p, res, ids, &prefill_ms, &decode_ms,
+                                           &decode_steps);
+            res->prefill_ms = prefill_ms;
+            res->decode_ms = decode_ms;
+            res->decode_steps = decode_steps;
+            return ok;
+        }
+    }
+    if (const char *ng = std::getenv("KRK_NGRAM"))
+        if (ng[0] == '1' && model_.is_recurrent() && !model_.has_lfm_conv())
+            KRK_WARN("n-gram speculation needs a reversible cache and a "
+                     "delta-rule recurrent target has none; decoding plainly");
 
     // Greedy-only fast path: with a draft loaded and argmax sampling requested,
     // speculative decoding produces bit-identical output to the plain loop, so

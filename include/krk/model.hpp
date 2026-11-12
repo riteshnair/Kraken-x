@@ -685,6 +685,11 @@ struct ModelConfig {
     // n_head_kv holding the maximum, which is what a shared workspace and one
     // KV slot are measured against.
     std::vector<i32> n_head_kv_layer;
+
+    // Per-layer dense FFN width. Some families (e.g. gemma4/Firefly) declare
+    // different feed_forward_length per block; cfg_.n_ff is the stack maximum
+    // for workspace sizing, and n_ff_at() is the layer's own width.
+    std::vector<i32> n_ff_layer;
     // Per-head softplus output gate (laguna `attn_gate.weight`): one scalar per
     // query head, projected from the *same* hidden state q/k/v read, then
     // softplus'd and multiplied into the attention result before wo. Distinct
@@ -1219,6 +1224,15 @@ public:
             return cfg_.n_head_kv;
         return cfg_.n_head_kv_layer[static_cast<size_t>(layer)];
     }
+
+    // The layer's own dense FFN width (see cfg_.n_ff_layer).
+    i32 n_ff_at(i32 layer) const {
+        if (layer >= 0 && layer < static_cast<i32>(cfg_.n_ff_layer.size())) {
+            const i32 v = cfg_.n_ff_layer[static_cast<size_t>(layer)];
+            if (v > 0) return v;
+        }
+        return cfg_.n_ff;
+    }
     // True when this layer runs multi-head latent attention.
     bool layer_is_mla(i32 layer) const {
         return layer >= 0 && layer < static_cast<i32>(layers_.size()) &&
@@ -1311,8 +1325,33 @@ public:
     const std::vector<f32> &inv_freq_at(i32 layer) const {
         return is_swa(layer) && !inv_freq_swa_.empty() ? inv_freq_swa_ : inv_freq_;
     }
+    // The ROTATION FRACTION of the layer's own head, never a ratio against the
+    // stack maximum. `rope_frac_swa` is declared as rope_dim_swa / head_dim,
+    // and `head_dim` is the stack's widest head -- so a hybrid whose windowed
+    // layers are NARROWER than its global ones (gemma4: 256 against 512) gets a
+    // fraction of 0.5 where the file means 1.0. The kernel multiplies that
+    // fraction by the LAYER's hd/2 pairs and, in the NeoX convention, pairs
+    // channel i with i + rot -- so on every gemma4 windowed layer half the head
+    // was left unrotated and the other half rotated against the wrong partner.
+    // Measured against an independent numpy forward of llama.cpp's gemma4 graph
+    // on gemma-4-E4B: attn.qk (post qk-norm, pre-rope) agreed to rel 4.7e-3 and
+    // the POST-rope row to cos 0.608; forcing rot 64 of 128 pairs, offset 64
+    // (this arithmetic) reproduced the engine at cos 0.999989. Dividing by the
+    // layer's own width gives 1.0 here -- the whole 256-dim head rotates, as
+    // the file states -- and is bit-identical for every family whose windowed
+    // layers carry the stack's head width (gpt-oss, laguna, mellum), where the
+    // two expressions are the same number.
     f32 rope_frac_at(i32 layer) const {
-        return is_swa(layer) ? cfg_.rope_frac_swa : cfg_.rope_frac;
+        if (!is_swa(layer)) return cfg_.rope_frac;
+        const i32 hd = head_dim_at(layer);
+        if (hd > 0 && cfg_.rope_dim_swa > 0) {
+            const f32 f = static_cast<f32>(cfg_.rope_dim_swa) / static_cast<f32>(hd);
+            // A file that states more rotated dims than the layer has is
+            // clamped, not widened: a fraction above 1 would pair channel i
+            // with i + rot past the end of the head.
+            return f > 1.0f ? 1.0f : f;
+        }
+        return cfg_.rope_frac_swa;
     }
     // The position divisor this layer rotates with. See
     // ModelConfig::rope_scale_layer: empty means the stack-wide value, which
