@@ -2171,11 +2171,8 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
             // The block's cache is sized in BYTES, from the same row function
             // the trunk uses, so a packed format and the f16 fallback share one
             // number and the append/read cannot disagree with the allocation.
-            mtp_kv_row_ =
-                (kv_quant_of(cfg_) == KvQuant::F16)
-                    ? static_cast<i64>(static_cast<size_t>(bkv) * as)
-                    : static_cast<i64>(
-                          be_->kv_row_bytes(bkv, kv_quant_of(cfg_), m.head_dim));
+            mtp_kv_row_ = static_cast<i64>(
+                be_->kv_row_bytes(bkv, kv_quant_of(cfg_), m.head_dim));
             mtp_kv_k_ = alloc(static_cast<size_t>(kv_cap_) *
                               static_cast<size_t>(mtp_kv_row_));
             mtp_kv_v_ = alloc(static_cast<size_t>(kv_cap_) *
@@ -5813,7 +5810,9 @@ bool Engine::mtp_attn_body(const MtpBlock &m, i32 pos, bool norm_first, i32 wind
     d.n_tok = 1;
     d.pos0 = pos;
     d.layer_stride = 0;
-    d.pos_stride = mtp_kv_row_; // BYTES: packed rows, or kvw*act_size for f16
+    // Allocation uses bytes. The uncompressed CPU/HIP append uses element
+    // strides, while packed caches use byte strides, matching the trunk path.
+    d.pos_stride = kv_quant_of(cfg_) == KvQuant::F16 ? mtp_kv_dim_ : mtp_kv_row_;
     d.layer = 0;
     d.kv_int8 = kv_quant_of(cfg_) == KvQuant::Int8;
     d.kv_turbo = kv_quant_of(cfg_) == KvQuant::Turbo3;
@@ -7295,7 +7294,12 @@ bool Engine::configure_expert_cache(std::string *err) {
     // loading from the GGUF/mapping and leaving headroom for other work.
     if (be_ && !be_->has_device_memory() && mc.is_moe) {
         const size_t ram_cap = host_budget > 0 ? host_budget : warm;
-        if (cfg_.expert_cache_mb > 0) {
+        if (cfg_.expert_cache_slots > 0) {
+            // An explicit count is a contract, not an auto-sizing hint. Keep
+            // the byte budget and exact slot ceiling computed above.
+            budget = model_.max_expert_bytes() *
+                     static_cast<size_t>(cfg_.expert_cache_slots);
+        } else if (cfg_.expert_cache_mb > 0) {
             const size_t req =
                 static_cast<size_t>(cfg_.expert_cache_mb) * 1024u * 1024u;
             budget = ram_cap > 0 ? std::min(req, ram_cap) : req;
@@ -7309,10 +7313,12 @@ bool Engine::configure_expert_cache(std::string *err) {
             budget = std::min(total_bytes > 0 ? total_bytes : static_cast<size_t>(256) * 1024u * 1024u,
                               static_cast<size_t>(1024) * 1024u * 1024u);
         }
-        warm = 0;
-        slot_budget = 0;
-        cfg_.expert_warmup = 0;
-        cfg_.expert_warm_prefetch = 0;
+        // Automatic WARM stays off because the mapping is already host memory.
+        // A positive explicit request remains a real bounded read-through tier.
+        if (cfg_.expert_warm_mb <= 0) warm = 0;
+        if (cfg_.expert_warmup < 0) cfg_.expert_warmup = 0;
+        // Explicit warmup=1 and warm-prefetch remain valid with a requested
+        // host tier; only their automatic forms default off on CPU.
         KRK_INFO("expert cache: cpu host-resident pool %.0f MiB for %.0f MiB routed "
                  "set (bounded by live free RAM/reserves, lazy load, no VRAM tier)",
                  static_cast<f64>(budget) / (1024.0 * 1024.0),
@@ -9976,7 +9982,7 @@ bool Engine::expert_warmup_wanted() const {
     // CPU/no-device: no VRAM tier to stage into. The bounded host-resident pool
     // is filled on demand by acquire(); a full warmup pass would read the whole
     // routed set and thrash memory on laptops. Keep it opt-in.
-    if (be_ && !be_->has_device_memory()) return false;
+    if (be_ && !be_->has_device_memory() && cfg_.expert_warmup <= 0) return false;
     if (ec.warm_capacity_bytes() == 0 && !ec.warm_as_mapping())
         return false; // no second tier to fill
     bool on = cfg_.expert_warmup > 0;

@@ -326,6 +326,8 @@ otherwise make a failed build appear successful.
   model-specific implementation notes.
 - [Current implementation audit](docs/AUDIT-GOLI-MAT-DE-2026-11-11.md): audited
   scope, confirmed findings, fixes, and remaining work.
+- [Audit follow-up](docs/AUDIT-FOLLOWUP-2026-11-11.md): cache-safety fixes,
+  restored memory controls, sanitizer evidence, and remaining numerical gates.
 
 When documentation and `kraken --help` disagree, inspect the current parser and
 report the mismatch. Performance tables are historical unless they identify the
