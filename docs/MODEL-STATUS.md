@@ -75,7 +75,7 @@ Measured on the CPU fixture (2 GiB q8_0 MoE, 2 vCPU), before and after:
 | 695 | 19575 ms | 6760 ms | 2.90x |
 
 and on a 1 GiB f16 dense file, 3.8-4.3x (details and the bit-identity witnesses:
-[MOE-RESIDENCY.md §7](MOE-RESIDENCY.md)).
+[ARCHITECTURE-TIERED.md §7](ARCHITECTURE-TIERED.md)).
 
 The same defect **cannot be ruled out on the GPU arm** -- it would show up in
 this table as a prefill:decode ratio far below what the card can do, and several
@@ -110,7 +110,7 @@ this document claims a GPU number that was not measured on a GPU.
 
 This sweep measures throughput and the range-guard counters. It does not run the
 scalar `--cpu` reference, which is what the coherence column used to be. Text
-agreement is recorded per model in the sections of [more-info.md](../more-info.md)
+agreement is recorded per model in the sections of [technical reference](TECHNICAL-README.md)
 that name the file, and `scripts/coherence_check.sh` is the way to re-check one
 file. Three of the rows above were checked device against the CPU reference in
 the session that landed the 2026-10-26 changes: bitnet-2b-tq1_0, Qwen3-4B-Q8_0
@@ -206,5 +206,5 @@ would have kept a loadable family off the list.
 |---|---|
 | K2-Horizon-MoVA-36B-A4B-Q4_K_M | routed experts on the attention values (`attn_v_exps`) with a gate on them (`attn_v_gate`); Mixture-of-Values attention is not implemented |
 
-See `## Refused at load` in [more-info.md](../more-info.md) for the rest of the
+See `## Refused at load` in [technical reference](TECHNICAL-README.md) for the rest of the
 refusal list and the reasoning behind it.

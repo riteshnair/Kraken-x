@@ -1,12 +1,12 @@
 # The qwen4exp MTP head: 31 tensors, their shapes, and who reads them
 
-Plan step **1.1** of [PLAN-mtp-and-prefill.md](PLAN-mtp-and-prefill.md). This is
+Plan step **1.1** of [../TO-DO.md](../TO-DO.md). This is
 the tensor table the loader is written against: every row names a shape, the
 format the artifact stores it in, and the code that consumes it. A row without a
 consumer is a tensor the port would silently drop, and a consumer without a row
 is a guess.
 
-Read [AUDIT-mtp-drafter.md](AUDIT-mtp-drafter.md) first for what the head is and
+Read [../TO-DO.md](../TO-DO.md) first for what the head is and
 the three traps (the pairing, the per-stream hidden norm, the trunk's own LM
 head).
 

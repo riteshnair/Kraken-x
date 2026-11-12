@@ -163,10 +163,7 @@ this machine before relying on that file-level result.
 
 The mixed part is documentation: several files in this tree still describe
 `qwen4exp` as refused or naming-only. The ones seen from this checkout include
-`docs/AUDIT-qwen4exp-support.md`, `docs/STRATA-VS-KRAKEN.md`, `docs/TODO.md`,
-`docs/TODO-ANALYSIS.md`, `docs/DEEP-DIVE-MOE-PREFILL-DECODE-2026-10-22.md`,
-`docs/REVIEW-2026-10-20.md`, `docs/AUDIT-gpu-resident-expert-cache.md`,
-`docs/BENCH-LOADING.md`, `docs/REFERENCES.md`, `docs/model-inventory.md`, and
+`docs/USER-GUIDE.md`, `docs/REFERENCES.md`, `docs/model-inventory.md`, and
 `docs/perf_trace_report.md`. Those passages were written when the table entry was
 in a different state; they are not the loader's verdict and they are not what the
 reachable REAP files return here.
@@ -203,9 +200,8 @@ So the local disambiguation rule for `qwen4exp` is:
 - The tool that prints the loader's verdict the same way the sweep should read it:
   `tools/inspect_gguf.cpp` (`kraken-inspect`).
 - The cross-engine note that the same marketing family maps to different engines/
-  architectures: `docs/STRATA-VS-KRAKEN.md`.
 - The behaviour-level note that the Qwen3.8 names should not be conflated:
-  `docs/DEEP-DIVE-MOE-PREFILL-DECODE-2026-10-22.md` §"Qwen3.8 and DeepSeek-V4
+  `docs/ARCHITECTURE.md` §"Qwen3.8 and DeepSeek-V4
   status: do not conflate variants".
 
 ## Future corpus (present in the spec, absent from this checkout)

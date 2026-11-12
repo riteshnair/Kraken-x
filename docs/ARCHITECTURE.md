@@ -74,7 +74,7 @@ appends.
 `scripts/coherence_check.sh` is the acceptance gate that sits above it: for
 each runnable model it greedy-decodes the same prompt on both backends and
 compares the *text*, with a documented tie classification for fp16 rounding
-(see [docs/TODO.md](TODO.md)). A backend that matches every activation can
+(see [pending work](../TO-DO.md)). A backend that matches every activation can
 still print numbers, so the output being human-readable words is the test.
 
 One lesson from the bug this found, for anyone adding an op: **an activation
