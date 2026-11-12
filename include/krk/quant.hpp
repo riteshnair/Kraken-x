@@ -284,6 +284,12 @@ f32 vec_dot_wide1(DType t, const void *w, const f32 *x, i64 n);
 void set_vec_dot_wide(bool on);
 // The pieces the GEMM needs; xq is n int8 and dx is n/32 scales.
 void quantize_q8_row(const f32 *x, i64 n, i8 *xq, f32 *dx);
+// One-pass Q8 quantization plus activation-recovery telemetry. sx/sq4 are
+// optional format sidecars. Outputs are residual RMS/input RMS and the number
+// of nonzero values whose quantized code is zero. Does not alter Q8 values.
+void quantize_q8_row_risk(const f32 *x, i64 n, i8 *xq, f32 *dx,
+                          f32 *relative_residual, i64 *discarded,
+                          i32 *sx = nullptr, i32 *sq4 = nullptr);
 // Also emits sx[]: sum of the quantised values per 32-value sub-block. It is
 // activation-only, so the dmin term uses it instead of recomputing it for every
 // weight row.

@@ -21,7 +21,9 @@ only activation rounding relative to the quantized weights. In particular, it do
 compute `(W - Wq) * x`.
 
 Adaptive mode evaluates residual RMS relative to input RMS and the fraction of nonzero
-values discarded by activation quantization. Defaults are 0.35 relative residual and
+values discarded by activation quantization, fused into the Q8 quantization pass. The
+resulting Q8 activations and Q4_K/Q6_K sidecars are reused by the base GEMM rather than
+quantizing a second time. Defaults are 0.35 relative residual and
 0.05 discarded mass; either crossing selects F32. Tune with `KRK_ACT_RISK` and
 `KRK_ACT_DISCARD`. Both values must be nonnegative. The counters are printed at process
 exit as GEMM calls, residual corrections, and F32 fallbacks. Experimental grouped GEMMs
