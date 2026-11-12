@@ -1590,6 +1590,11 @@ size_t ExpertCache::preload(const ExpertSource &src, i32 layer) {
     return staged;
 }
 
+void ExpertCache::set_lease(i32 layer, i32 expert, bool held) {
+    auto it = slots_.find(slot_key(layer, expert));
+    if (it != slots_.end()) it->second.leased = held;
+}
+
 const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
                                            i32 expert) {
     if (!be_ || !src.present()) return nullptr;

@@ -492,12 +492,18 @@ static void test_q8_0_scale_array_row_keyed() {
     const int n_out = 8;    // exactly one eight-row tile: the grouping that broke
     const int nb = n_in / 32;
     const int row_bytes = nb * 34;
-    std::vector<u8> w(static_cast<size_t>(n_out) * row_bytes);
+    // The final call still reads a complete eight-row weight tile. Padding
+    // supplies those unused rows without changing any asserted output.
+    std::vector<u8> w(static_cast<size_t>(n_out + 8) * row_bytes, 0);
     std::vector<f32> x(static_cast<size_t>(n_in));
-    std::vector<i8> xq(static_cast<size_t>(n_in));
+    // x8 consumes an eight-row activation tile. Repeat the same input row so
+    // every output-row oracle still compares identical arithmetic, without
+    // letting the AVX-512 row loads run past a one-row fixture allocation.
+    std::vector<i8> xq(static_cast<size_t>(8 * n_in));
     for (int i = 0; i < n_in; i++) {
         x[i] = 0.01f * static_cast<f32>((i * 37) % 19 - 9);
-        xq[i] = static_cast<i8>((i * 13) % 41 - 20);
+        const i8 q = static_cast<i8>((i * 13) % 41 - 20);
+        for (int r = 0; r < 8; r++) xq[static_cast<size_t>(r * n_in + i)] = q;
     }
     // Scales that depend on BOTH the row and the block: no row shares a scale
     // with another, so any reuse across rows shows up immediately.
@@ -516,9 +522,11 @@ static void test_q8_0_scale_array_row_keyed() {
     }
     // The x8 kernels always write eight output rows at out + r*out_stride, so
     // the buffer has to hold them; row 0 of each call lands on index `o`.
-    std::vector<f32> dx(static_cast<size_t>(nb)),
+    std::vector<f32> dx(static_cast<size_t>(8 * nb)),
         ref(static_cast<size_t>(n_out) * 8), got(static_cast<size_t>(n_out) * 8);
-    for (int b = 0; b < nb; b++) dx[b] = 0.02f * static_cast<f32>(b + 1);
+    for (int b = 0; b < nb; b++)
+        for (int r = 0; r < 8; r++)
+            dx[static_cast<size_t>(r * nb + b)] = 0.02f * static_cast<f32>(b + 1);
     for (int o = 0; o < n_out; o++)
         dot_q8_0_q8_x8(w.data() + static_cast<size_t>(o) * row_bytes, xq.data(),
                        dx.data(), n_in, n_in, nb, ref.data() + o, n_out);
@@ -3264,15 +3272,17 @@ static void test_nvfp4_sidecar_scale() {
             c.model_path = p;
             c.n_ctx = 64;
             c.prefill_chunk = 8;
-            if (!e.init(be, c, &err)) return false;
+            if (!e.init(be, c, &err)) { delete be; return false; }
             GenerateParams gp;
             gp.prompt = "the";
             gp.max_tokens = 2;
             GenerateResult r;
-            if (!e.generate(gp, &r)) return false;
+            if (!e.generate(gp, &r)) { e.shutdown(); delete be; return false; }
             const i32 nv = e.model().cfg().n_vocab;
             lg.assign(e.last_logits(), e.last_logits() + nv);
             tok = r.tokens.empty() ? -1 : r.tokens.back();
+            e.shutdown();
+            delete be;
             return true;
         };
         std::vector<f32> a_lg, b_lg;
@@ -3453,6 +3463,8 @@ static void test_moe_latent() {
         CHECK(!loaded, what);
         CHECK(err.find("latent") != std::string::npos,
               "... and the refusal names the latent");
+        e.shutdown();
+        delete be;
     };
     CHECK(build_latent_moe_model("kraken-latent-half.gguf", 32, 16, 64, 4, 2, true,
                                  false),
@@ -3469,6 +3481,8 @@ static void test_moe_latent() {
           "wrote the narrow-bank-no-pair fixture");
     refuses("kraken-latent-nopair.gguf",
             "a narrow routed bank with no latent projection is refused");
+    engine.shutdown();
+    delete cpu;
 }
 
 // Per-layer expert counts and top-k. What this pins:
@@ -3539,7 +3553,11 @@ static void test_moe_per_layer_experts() {
                       u_engine.model().n_expert_at(1) == 4,
                   "... with the same count on every layer");
         }
+        u_engine.shutdown();
+        delete u_cpu;
     }
+    engine.shutdown();
+    delete cpu;
 }
 
 // ---------------------------------------------------------------------------
@@ -3745,14 +3763,16 @@ static bool plain_logits_of(const std::string &path, std::vector<f32> &lg,
     c.model_path = path;
     c.n_ctx = 64;
     c.prefill_chunk = 8;
-    if (!e.init(be, c, &err)) return false;
+    if (!e.init(be, c, &err)) { delete be; return false; }
     GenerateParams gp;
     gp.prompt = "the";
     gp.max_tokens = 2;
     GenerateResult r;
-    if (!e.generate(gp, &r)) return false;
+    if (!e.generate(gp, &r)) { e.shutdown(); delete be; return false; }
     const i32 nv = e.model().cfg().n_vocab;
     lg.assign(e.last_logits(), e.last_logits() + nv);
+    e.shutdown();
+    delete be;
     return true;
 }
 
@@ -4419,6 +4439,7 @@ static void test_gdn_group_matrix_types() {
         CHECK(diff > 0,
               "an F32 matrix read as F16 differs, so a type mix-up is visible");
     }
+    delete cpu;
 }
 
 // The two backend ops the batched MoE decode path is built from, and that path
@@ -5749,14 +5770,16 @@ static bool gemma4_logits(const std::string &p, std::vector<f32> &lg,
     c.model_path = p;
     c.n_ctx = 64;
     c.prefill_chunk = 8;
-    if (!e.init(be, c, &err)) return false;
+    if (!e.init(be, c, &err)) { delete be; return false; }
     GenerateParams gp;
     gp.prompt = "the";
     gp.max_tokens = 2;
     GenerateResult r;
-    if (!e.generate(gp, &r)) return false;
+    if (!e.generate(gp, &r)) { e.shutdown(); delete be; return false; }
     const i32 nv = e.model().cfg().n_vocab;
     lg.assign(e.last_logits(), e.last_logits() + nv);
+    e.shutdown();
+    delete be;
     return true;
 }
 
@@ -10598,6 +10621,7 @@ static void test_moe_schema_and_laziness() {
         CHECK(got == "<|start_header_id|>user<|end_header_id|>\n\nhi<|eot_id|>"
                      "<|start_header_id|>assistant<|end_header_id|>\n\n",
               "and it renders the layout the file declares");
+        m2.unload();
         delete cpu2;
     }
 
@@ -10619,6 +10643,7 @@ static void test_moe_schema_and_laziness() {
               "the builtin is used instead");
         CHECK(!m3.chat_template_or_builtin().empty(),
               "and there is still a layout to render with");
+        m3.unload();
         delete cpu3;
     }
         const ModelConfig &mc = m.cfg();
@@ -12104,6 +12129,7 @@ static void test_expert_cache_policy() {
               "and a repeated reading does not shrink it twice");
         CHECK(clamp.reclamp_vram_budget(3000, 2000) == budget - 4,
               "free VRAM above the floor never raises or lowers the budget");
+        clamp.clear();
     }
 
     cache.clear();
@@ -13869,6 +13895,7 @@ static void test_dspark_head_set() {
                 d.unload();
             }
         }
+        tm.unload();
     }
     delete cpu;
     std::remove(head.c_str());
@@ -14144,18 +14171,20 @@ static bool dflash_rows_of(const std::string &target, const std::string &head_pa
     EngineConfig cfg;
     cfg.model_path = target;
     cfg.n_ctx = 64;
-    if (!engine.init(cpu, cfg, &err)) return false;
-    if (!engine.load_dflash(head_path, &err)) return false;
+    if (!engine.init(cpu, cfg, &err)) { delete cpu; return false; }
+    if (!engine.load_dflash(head_path, &err)) {
+        engine.shutdown(); delete cpu; return false;
+    }
     GenerateParams p;
     p.prompt = "the";
     p.max_tokens = 1;
     p.sampler.greedy = true;
     GenerateResult gr;
-    if (!engine.generate(p, &gr)) return false;
+    if (!engine.generate(p, &gr)) { engine.shutdown(); delete cpu; return false; }
     std::vector<i32> ids;
     if (engine.tokenizer().encode("the", ids, true) <= 0 || ids.empty()) {
         err = "the fixture prompt does not encode";
-        return false;
+        engine.shutdown(); delete cpu; return false;
     }
     const Model &m = engine.model();
     const i32 nv = m.cfg().n_vocab;
@@ -14166,9 +14195,11 @@ static bool dflash_rows_of(const std::string &target, const std::string &head_pa
                                            static_cast<i32>(gr.prompt_tokens), dfr);
     if (nr <= 0) {
         err = "the block produced no rows";
-        return false;
+        engine.shutdown(); delete cpu; return false;
     }
     out = dfr.data;
+    engine.shutdown();
+    delete cpu;
     return true;
 }
 
@@ -14607,6 +14638,8 @@ static void test_alibi_refusal_names_the_bias() {
         c.n_ctx = 64;
         std::string err;
         CHECK(e.init(be, c, &err), "the real backend accepts an ALiBi model");
+        e.shutdown();
+        delete be;
     }
     {
         Backend *be = new CountingBackend(make_cpu_backend());
@@ -16297,6 +16330,7 @@ static void test_lfm2_shortconv() {
             CHECK(attn_layers == 1,
                   "and only the attention layer owns a KV cache");
         }
+        m.unload();
         delete cpu;
     }
 
@@ -16702,6 +16736,7 @@ static void group_attention_sinks() {
                    "prefill row t with a sink equals decode row t with the "
                    "sink (cpu)");
     }
+    delete cpu;
 }
 
 // One CLI generation. Returns stdout with the bracketed status lines
@@ -19376,6 +19411,7 @@ static void test_mtp_sidecar() {
         CHECK(err.find("qwen2") != std::string::npos &&
                   err.find("llama") != std::string::npos,
               "the refusal names both families");
+        m.unload();
     }
 
     // 3. A file with no block past the stack is refused with the reason, not
@@ -19387,7 +19423,9 @@ static void test_mtp_sidecar() {
         m.set_mtp_load(true);
         m.set_mtp_path(nob);
         CHECK(!m.load(*cpu, trunk, &err), "a file with no nextn block is refused");
+        m.unload();
         CHECK(err.find("blk.") != std::string::npos, "the refusal names what it looked for");
+        m.unload();
     }
 
     // 4. A block whose attention is a different width from the trunk's is
@@ -19400,6 +19438,7 @@ static void test_mtp_sidecar() {
         m.set_mtp_load(true);
         m.set_mtp_path(wide);
         CHECK(!m.load(*cpu, trunk, &err), "a block whose head count disagrees is refused");
+        m.unload();
         CHECK(err.find("head") != std::string::npos, "the refusal says it is the attention");
     }
 
@@ -19617,6 +19656,7 @@ static void test_mtp_head_qwen4() {
         CHECK(!m.load(*cpu, trunk, &err), "a bank of another width is refused");
         CHECK(err.find("gate_up_proj") != std::string::npos,
               "the refusal names the tensor that disagrees");
+        m.unload();
     }
 
     // 3. A half-written split prefix is refused, naming the missing half.
@@ -19632,6 +19672,7 @@ static void test_mtp_head_qwen4() {
         CHECK(!m.load(*cpu, trunk, &err), "fc_embedding without fc_hidden is refused");
         CHECK(err.find("fc_hidden") != std::string::npos,
               "the refusal names the missing half of the prefix");
+        m.unload();
     }
 
     // 4. The complete split prefix (the EXL3 spelling) loads and is reported as
@@ -19650,6 +19691,7 @@ static void test_mtp_head_qwen4() {
         CHECK(b.hf && b.eh_proj_split, "the split form is reported as such");
         CHECK(b.fc_embedding.present() && b.fc_hidden.present(),
               "both halves of the split prefix are uploaded");
+        m.unload();
     }
 
     std::remove(trunk.c_str());
@@ -22926,6 +22968,7 @@ static void test_mtp_sidecar_mla() {
               "the five shared-latent tables are staged f16, as the trunk's are");
         CHECK(m.mtp().n_expert == kMlaExpert && m.mtp().n_ff_exp == kMlaFFExp,
               "the routed bank is the block's own, at the geometry it declares");
+        m.unload();
     }
 
     // ---- 2. a trunk that is not the shared-latent stack is refused -------
@@ -22955,6 +22998,7 @@ static void test_mtp_sidecar_mla() {
                       err.find("V4 metadata") != std::string::npos,
                   "and the refusal names the trunk's own metadata, not a tensor "
                   "of the block");
+        m.unload();
             std::remove(lite.c_str());
         }
     }
@@ -22972,6 +23016,7 @@ static void test_mtp_sidecar_mla() {
             CHECK(!ok, "a block with no hyper-connection pair is refused");
             CHECK(err.find("hc_attn_fn") != std::string::npos,
                   "the refusal names the missing mixer");
+        m.unload();
             std::remove(nohc.c_str());
         }
     }
@@ -22992,6 +23037,7 @@ static void test_mtp_sidecar_mla() {
             CHECK(err.find(std::to_string(kMlaKeyLen - 1)) != std::string::npos &&
                       err.find(std::to_string(kMlaKeyLen)) != std::string::npos,
                   "... and both widths, so the file can be fixed without a guess");
+        m.unload();
             std::remove(narrow.c_str());
         }
     }
