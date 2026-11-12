@@ -83,6 +83,25 @@ static void runtime_recovery() {
     }
     std::vector<f32> x(256), reference(4);
     for (i32 i = 0; i < 256; i++) x[i] = std::sin(i * 0.17f) * 0.7f + (i % 29 == 0 ? 0.2f : 0.0f);
+    std::vector<i8> risk_q(256), plain_q(256);
+    std::vector<f32> risk_d(8), plain_d(8);
+    std::vector<i32> risk_sx(8), plain_sx(8), risk_sq4(64), plain_sq4(64);
+    f32 relative = -1.0f;
+    i64 discarded = -1;
+    quantize_q8_row_sx(x.data(), 256, plain_q.data(), plain_d.data(), plain_sx.data());
+    quantize_q8_row_risk(x.data(), 256, risk_q.data(), risk_d.data(), &relative,
+                         &discarded, risk_sx.data(), nullptr);
+    CHECK(relative > 0.0f && relative < 1.0f && discarded >= 0,
+          "fused Q8 risk telemetry is finite and meaningful");
+    CHECK(std::memcmp(risk_q.data(), plain_q.data(), 256) == 0 &&
+          std::memcmp(risk_d.data(), plain_d.data(), 8 * sizeof(f32)) == 0 &&
+          std::memcmp(risk_sx.data(), plain_sx.data(), 8 * sizeof(i32)) == 0,
+          "risk pass preserves Q8 values, scales, and Q4 side sums exactly");
+    quantize_q8_row_sq4(x.data(), 256, plain_q.data(), plain_d.data(), plain_sq4.data());
+    quantize_q8_row_risk(x.data(), 256, risk_q.data(), risk_d.data(), &relative,
+                         &discarded, nullptr, risk_sq4.data());
+    CHECK(std::memcmp(risk_sq4.data(), plain_sq4.data(), 64 * sizeof(i32)) == 0,
+          "risk pass preserves Q6 four-value side sums exactly");
     for (i32 o = 0; o < 4; o++) reference[o] = vec_dot(DType::TQ1_0, w.data() + o * 54, x.data(), 256);
     std::unique_ptr<Backend, void (*)(Backend *)> cpu(make_cpu_backend(), [](Backend *b) { delete b; });
     std::vector<f32> baseline(4), recovered(4), fallback(4);

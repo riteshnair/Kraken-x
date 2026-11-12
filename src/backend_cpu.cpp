@@ -1460,27 +1460,40 @@ public:
         const i64 nb = n_in / 32;
         std::vector<i8> qx(static_cast<size_t>(rows * n_in));
         std::vector<f32> dx(static_cast<size_t>(rows * nb));
+        const bool q6 = wt == DType::Q6_K;
+        const bool q4 = wt == DType::Q4_K;
+        std::vector<i32> xs(q4 ? static_cast<size_t>(rows * nb) : 0);
+        std::vector<i32> xs4(q6 ? static_cast<size_t>(rows * (n_in / 4)) : 0);
+        const bool needs_residual = recovery == ActivationRecoveryMode::Residual ||
+                                    recovery == ActivationRecoveryMode::Both;
+        std::vector<f32> residual(needs_residual ? static_cast<size_t>(rows * n_in) : 0);
         bool risky = false;
-        if (recovery == ActivationRecoveryMode::Adaptive || recovery == ActivationRecoveryMode::Both) {
-            const char *rtext = std::getenv("KRK_ACT_RISK");
-            const f32 threshold = rtext ? std::max(0.0, std::atof(rtext)) : 0.35;
-            const char *dtext = std::getenv("KRK_ACT_DISCARD");
-            const f32 discard_limit = dtext ? std::max(0.0, std::atof(dtext)) : 0.05;
-            for (i64 r = 0; r < rows && !risky; r++) {
-                quantize_q8_row(xf + r * n_in, n_in, qx.data() + r * n_in, dx.data() + r * nb);
-                double se = 0.0, sx = 0.0;
+        const char *rtext = std::getenv("KRK_ACT_RISK");
+        const f32 threshold = rtext ? std::max(0.0, std::atof(rtext)) : 0.35;
+        const char *dtext = std::getenv("KRK_ACT_DISCARD");
+        const f32 discard_limit = dtext ? std::max(0.0, std::atof(dtext)) : 0.05;
+        for (i64 r = 0; r < rows; r++) {
+            i8 *qr = qx.data() + r * n_in;
+            f32 *dr = dx.data() + r * nb;
+            i32 *sx = q4 ? xs.data() + r * nb : nullptr;
+            i32 *sq4 = q6 ? xs4.data() + r * (n_in / 4) : nullptr;
+            if (recovery == ActivationRecoveryMode::Adaptive || recovery == ActivationRecoveryMode::Both) {
+                f32 relative = 0.0f;
                 i64 discarded = 0;
-                for (i64 i = 0; i < n_in; i++) {
-                    const f32 v = xf[r * n_in + i];
-                    const f32 q = dx[r * nb + i / 32] * qx[r * n_in + i];
-                    const double d = static_cast<double>(v) - q;
-                    se += d * d;
-                    sx += static_cast<double>(v) * v;
-                    if (v != 0.0f && q == 0.0f) discarded++;
-                }
-                const double relative = std::sqrt(se / std::max(sx, 1e-30));
+                quantize_q8_row_risk(xf + r * n_in, n_in, qr, dr,
+                                     &relative, &discarded, sx, sq4);
                 if (relative > threshold || static_cast<f32>(discarded) > discard_limit * n_in)
                     risky = true;
+            } else if (q6) {
+                quantize_q8_row_sq4(xf + r * n_in, n_in, qr, dr, sq4);
+            } else if (q4) {
+                quantize_q8_row_sx(xf + r * n_in, n_in, qr, dr, sx);
+            } else {
+                quantize_q8_row(xf + r * n_in, n_in, qr, dr);
+            }
+            if (needs_residual) {
+                for (i64 i = 0; i < n_in; i++)
+                    residual[r * n_in + i] = xf[r * n_in + i] - dr[i / 32] * qr[i];
             }
         }
         if (risky) {
@@ -1488,17 +1501,10 @@ public:
             gemm_f32_activation(out, x, w, wt, n_out, n_in, rows);
             return;
         }
-        gemm_base(out, x, w, wt, n_out, n_in, rows);
-        if (recovery != ActivationRecoveryMode::Residual && recovery != ActivationRecoveryMode::Both)
-            return;
+        gemm_base(out, x, w, wt, n_out, n_in, rows, qx.data(), dx.data(),
+                  q4 ? xs.data() : nullptr, q6 ? xs4.data() : nullptr);
+        if (!needs_residual) return;
         g_act_corrections++;
-        std::vector<f32> residual(static_cast<size_t>(rows * n_in));
-        for (i64 r = 0; r < rows; r++) {
-            quantize_q8_row(xf + r * n_in, n_in, qx.data() + r * n_in, dx.data() + r * nb);
-            for (i64 i = 0; i < n_in; i++)
-                residual[r * n_in + i] = xf[r * n_in + i] -
-                    dx[r * nb + i / 32] * qx[r * n_in + i];
-        }
         std::vector<f32> correction(static_cast<size_t>(rows * n_out));
         gemm_f32_activation(correction.data(), residual.data(), w, wt, n_out, n_in, rows);
         f32 *of = static_cast<f32 *>(out);
@@ -1506,7 +1512,9 @@ public:
     }
 
     void gemm_base(void *out, const void *x, const void *w, DType wt, i64 n_out,
-                   i64 n_in, i64 rows) {
+                   i64 n_in, i64 rows, const i8 *pre_qx = nullptr,
+                   const f32 *pre_dx = nullptr, const i32 *pre_xs = nullptr,
+                   const i32 *pre_xs4 = nullptr) {
         // The virtual NPU computes this dot product block on its own SIMD
         // kernels. It returns false -- having written nothing -- for a shape or
         // weight type it cannot take, and the reference loop below then runs
@@ -1585,8 +1593,8 @@ public:
             // null dereference: par_for runs the body on pool workers, and a
             // worker's own thread_local vector has never been resized, so
             // data() is nullptr there. ASan caught the read at address 0.
-            std::vector<i8> xq(static_cast<size_t>(rows * n_in));
-            std::vector<f32> xd(static_cast<size_t>(rows * nb));
+            std::vector<i8> xq(pre_qx ? 0 : static_cast<size_t>(rows * n_in));
+            std::vector<f32> xd(pre_dx ? 0 : static_cast<size_t>(rows * nb));
             // The two auxiliary arrays are allocated ONLY for the format that
             // reads them. They used to be value-initialised unconditionally,
             // so every Q8_0 call -- the hot format, and the one that needs
@@ -1600,11 +1608,11 @@ public:
             // Q4_K kernel reads it; Q6_K does not. Computing it here means it is
             // done once per GEMM call instead of once per weight row.
             const i64 nq4 = n_in / 4;
-            std::vector<i32> xs(q6 || none_aux ? 0 : static_cast<size_t>(rows * nb), 0);
+            std::vector<i32> xs(pre_xs || q6 || none_aux ? 0 : static_cast<size_t>(rows * nb), 0);
             // Q6_K's scale changes every 16 values and its bias is 32*sum(16),
             // so it needs its own array; Q4_K's is per 32. Only one is filled.
-            std::vector<i32> xs4(q6 ? static_cast<size_t>(rows * nq4) : 0, 0);
-            for (i64 r = 0; r < rows; r++) {
+            std::vector<i32> xs4(pre_xs4 || !q6 ? 0 : static_cast<size_t>(rows * nq4), 0);
+            for (i64 r = 0; !pre_qx && r < rows; r++) {
                 if (none_aux)
                     // No sx[]: Q8_0's magnitude split is exact and the ternary
                     // formats have no bias term at all, so neither needs a
@@ -1621,10 +1629,10 @@ public:
                                        xq.data() + r * n_in, xd.data() + r * nb,
                                        xs.data() + r * nb);
             }
-            const i8 *xqp = xq.data();
-            const f32 *xdp = xd.data();
-            const i32 *xsp = xs.data();
-            const i32 *xs4p = xs4.data();
+            const i8 *xqp = pre_qx ? pre_qx : xq.data();
+            const f32 *xdp = pre_dx ? pre_dx : xd.data();
+            const i32 *xsp = pre_xs ? pre_xs : xs.data();
+            const i32 *xs4p = pre_xs4 ? pre_xs4 : xs4.data();
             const u8 *wb = static_cast<const u8 *>(w);
             // Which loop is outermost decides the memory traffic, and the
             // traffic was the whole cost.

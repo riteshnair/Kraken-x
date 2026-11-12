@@ -620,6 +620,10 @@ target_link_libraries(kraken-gemv-scale PRIVATE krk_core)
 # Is a ternary format actually faster for a CPU decode GEMV? q8_0 against the
 # LUT shape and a VNNI-native bit-plane decode, each reading its own format.
 add_executable(kraken-ternary-gemv tools/bench_ternary_gemv.cpp)
+add_executable(kraken-lowbit-vnni-bench tools/bench_lowbit_vnni.cpp)
+target_link_libraries(kraken-lowbit-vnni-bench PRIVATE krk_core)
+add_executable(kraken-act-recovery-bench tools/bench_act_recovery.cpp)
+target_link_libraries(kraken-act-recovery-bench PRIVATE krk_core)
 
 # Every block count, odd ones included: the 512-bit Q8_0 kernel advances two
 # blocks per iteration, so an odd count depends on the dispatcher refusing it.
