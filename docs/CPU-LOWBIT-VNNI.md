@@ -5,8 +5,14 @@
 - Q2_K/Q3_K have runtime-dispatched 128-bit VNNI integer dot cores. The AVX-VNNI
   rung serves CPUs such as Meteor Lake; an AVX512VL+AVX512VNNI rung executes the
   same algorithm on AVX-512 hosts. Scalar/SSSE3 remains available.
-- Q2_K decode uses the VNNI rung automatically. Its x8 VNNI kernel measured no
-  benefit and is opt-in with `KRK_CPU_Q23_VNNI=1`; `=0` disables Q2_K/Q3_K VNNI.
+- Q2_K scalar decode unpacks each 16-value plane directly into a register and
+  dots it immediately, avoiding the 256-byte temporary value array. It uses
+  AVX2/FMA automatically and the VNNI rung where available. Its x8 VNNI kernel
+  measured no benefit and is opt-in with `KRK_CPU_Q23_VNNI=1`; `=0` disables
+  Q2_K/Q3_K VNNI. `KRK_CPU_Q23_DIRECT=0` retains the previous scalar decode.
+- TQ2_0 x8 computes `q*x - sum(x)` directly from packed codes. It never
+  materializes the old positive/negative arrays, handles code 3 as +2, and does
+  not negate x (so -128 is exact). Dispatch is outside the row/chunk loops.
 - TQ1_0/PTQ1_0 use an immutable byte-to-trit lookup table instead of repeating
   base-3 decode arithmetic per value. TQ2_0 unpacks its bit planes with AVX2.
 - Ternary and 2-bit code dots use VNNI where available and retain eight F32 FMA
@@ -36,26 +42,36 @@ to imply AVX-512.
 ## Isolated kernel measurements
 
 Host: Intel Xeon 2.60 GHz, AVX512VL+AVX512VNNI, no AVX-VNNI. Release build,
-4096 inputs x 512 outputs, four alternating runs of 40 repetitions, median
+4096 inputs x 512 outputs, three alternating runs of 40 repetitions, median
 GMAC/s. This host exercises the AVX-512VL encoding, so these are not claimed
 Meteor Lake measurements.
 
-| Kernel | Rows | Fallback | New | Ratio |
-| --- | ---: | ---: | ---: | ---: |
-| Q2_K | 1 | 4.374 | 4.405 | 1.01x (neutral) |
-| Q2_K | 8 | 7.419 | 7.503 | 1.01x (original x8 default) |
-| Q3_K | 1 | 4.993 | 5.712 | 1.14x |
-| Q3_K | 8 | 15.412 | 17.572 | 1.14x |
-| TQ1_0 | 1 | 3.051 | 3.586 | 1.18x |
-| TQ1_0 | 8 | 6.353 | 9.867 | 1.55x |
-| TQ2_0 | 1 | 8.322 | 11.733 | 1.41x |
-| TQ2_0 | 8 | 8.567 | 14.034 | 1.64x |
+**Correction:** an earlier table here is withdrawn. The benchmark allocated one
+weight block per row although its kernels consumed sixteen blocks, causing an
+out-of-bounds read and eventually heap corruption. ASan identified the fixture
+error. It now allocates and initializes all sixteen blocks. Do not compare the
+old numbers with these corrected runs.
 
-Run `kraken-lowbit-vnni-bench TYPE ROWS REPS`. The fallback arm sets
-`KRK_CPU_Q23_VNNI=0 KRK_CPU_TERNARY_LANES=0 KRK_CPU_NO_AVXVNNI=1
-KRK_CPU_NO_VLVNNI=1`; it still includes the LUT/SIMD unpackers. Earlier
-pre-LUT/pre-SIMD measurements were much slower, so the table prices the VNNI
-and lane-reduction stage, not the entire improvement from the original branch.
+| Kernel | Rows | Previous path | Optimized | Ratio |
+| --- | ---: | ---: | ---: | ---: |
+| Q2_K direct decode | 1 | 3.551 | 4.345 | 1.22x |
+| TQ2_0 raw-code x8 | 8 | 7.068 | 35.594 | 5.04x |
+
+The TQ2 control is `KRK_CPU_TERNARY_LANES=0`; the optimized control is the
+default raw-code path. Q2 uses `KRK_CPU_Q23_DIRECT=0` for its control. These
+ratios are kernel-only and must not be read as model-wide speedups.
+
+Portable `-mavx2 -mfma -mf16c` with target-dispatched AVX-VNNI, same controls:
+Q2_K scalar median 3.442 -> 3.862 GMAC/s (1.12x), and TQ2_0 x8 median 6.465 ->
+15.296 GMAC/s (2.37x). The hardware still executes VNNI; this validates the
+portable build, not native Zen 3 throughput.
+
+Direct-register Q3_K scalar and x8 variants were also implemented and measured
+but rejected: both were slower, and x8 loses the benefit of sharing one unpack
+across eight activation rows. Raw-code TQ2 scalar was slower too, so its
+expanded-buffer scalar kernel remains. Existing Q3_K VNNI and TQ1/TQ2 SIMD
+work is retained, but the withdrawn fixture means it needs a fresh corrected
+benchmark before quoting a new ratio.
 
 ## Residual recovery cost
 
