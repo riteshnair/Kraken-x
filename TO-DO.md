@@ -89,9 +89,10 @@ Status labels:
   for the f16-KV fixture, nested forks, slot/refusal handling, and confirms
   the parent continuation is not inherited. A CPU int8 probe changed greedy
   branch tokens under the different prefill partitioning, so forks currently
-  refuse lossy KV modes rather than claim parity. This is a correct
-  independent-slot baseline, not yet Flide's shared branch stream: it duplicates
-  KV storage and copies the full trunk per branch. Remaining: KV pages/refcounts/CoW, the
+  refuse lossy KV modes rather than claim parity. On the tested ordinary-
+  attention f16 fixture, this is an independent-slot baseline, not yet Flide's
+  shared branch stream: it duplicates KV storage and copies the full trunk per
+  branch. Remaining: KV pages/refcounts/CoW, the
   `(trunk, branch, position)` visibility mask, compressed-state fork support,
   and the two-call recurrent path (trunk segments produce state, branch segments
   continue from it by index, no copy). Keep this item open until those land.
