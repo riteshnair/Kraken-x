@@ -2,7 +2,10 @@
 # Run Kraken's built-in MoE benchmark under several planned host-RAM classes.
 # This is a measurement driver, not a hard OS memory limiter: use a native
 # machine with the target RAM for RSS claims. --ram-tier changes the engine's
-# tier policy but does not constrain unrelated process/system allocations.
+# tier policy but does not constrain process/system allocations. On Linux, run
+# the whole script inside a dedicated cgroup to enforce a ceiling and capture
+# its cgroup high-water counters, for example:
+#   systemd-run --user --scope -p MemoryMax=16G -p MemorySwapMax=0 -- scripts/bench_bounded_moe.sh MODEL.gguf ./build/kraken results-16g
 #
 # Usage:
 #   scripts/bench_bounded_moe.sh MODEL.gguf [KRAKEN_EXE] [OUTPUT_DIR]
@@ -12,6 +15,7 @@
 #   KRK_BENCH_TOKENS=128          greedy decode tokens per run
 #   KRK_BENCH_EXPERT_SLOTS=N      resident (layer,expert) slot cap (default 1);
 #                                 use "auto" for Kraken's normal budget
+#   KRK_BENCH_HASH_MODEL=1        include a full SHA-256 model hash (extra I/O)
 #   KRK_PYTHON=python3            Python used to read child peak RSS
 #
 # The driver deliberately disables eager warmup, WARM duplication and pinning.
@@ -71,6 +75,75 @@ fi
 
 mkdir -p "$outdir"
 model_name=$(basename "$model")
+metadata="$outdir/${model_name}.metadata.txt"
+model_bytes=$(wc -c <"$model" | tr -d ' ')
+{
+    printf 'Bounded-memory MoE benchmark metadata\n'
+    printf 'timestamp_utc: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf 'model: %s\n' "$model"
+    printf 'model_bytes: %s\n' "$model_bytes"
+    printf 'executable: %s\n' "$exe"
+    printf 'planned_ram_tiers_gib: %s\n' "$tiers"
+    printf 'expert_slot_cap: %s\n' "$slots"
+    printf 'tokens: %s\n' "$tokens"
+    printf 'measurement_mode: one process startup plus one fixed-prompt --bench request per tier; not a repeated warm-request measurement\n'
+    printf 'host_uname: %s\n' "$(uname -a)"
+    if [ -r /proc/meminfo ]; then
+        grep -E '^(MemTotal|MemAvailable|SwapTotal|SwapFree):' /proc/meminfo || true
+        printf 'cpu_model: '
+        awk -F: '/model name[[:space:]]*:/ {sub(/^[[:space:]]+/, "", $2); print $2; exit}' /proc/cpuinfo
+        if [ -r /proc/self/cgroup ]; then
+            printf 'cgroup_membership:\n'
+            cat /proc/self/cgroup
+            cgroup_path=$(awk -F: '$1 == "0" { print $3; exit }' /proc/self/cgroup)
+            if [ -n "$cgroup_path" ]; then
+                for field in memory.max memory.current memory.peak memory.swap.max memory.events; do
+                    file="/sys/fs/cgroup$cgroup_path/$field"
+                    if [ -r "$file" ]; then
+                        printf 'cgroup_start_%s: ' "$field"
+                        tr '\n' ' ' <"$file"
+                        printf '\n'
+                    fi
+                done
+            fi
+        fi
+    elif command -v sysctl >/dev/null 2>&1; then
+        printf 'host_memory_bytes: %s\n' "$(sysctl -n hw.memsize 2>/dev/null || echo unavailable)"
+    fi
+    if [ "${KRK_BENCH_HASH_MODEL:-0}" = 1 ]; then
+        if command -v sha256sum >/dev/null 2>&1; then
+            printf 'model_sha256: '
+            sha256sum "$model" | awk '{print $1}'
+        elif command -v shasum >/dev/null 2>&1; then
+            printf 'model_sha256: '
+            shasum -a 256 "$model" | awk '{print $1}'
+        else
+            echo 'model_sha256: unavailable (need sha256sum or shasum)'
+        fi
+    else
+        echo 'model_sha256: not computed (set KRK_BENCH_HASH_MODEL=1; reads the whole model)'
+    fi
+} >"$metadata"
+write_cgroup_end() {
+    if [ -r /proc/self/cgroup ]; then
+        cgroup_path=$(awk -F: '$1 == "0" { print $3; exit }' /proc/self/cgroup)
+        if [ -n "$cgroup_path" ]; then
+            {
+                echo 'cgroup_end_note: high-water counters are process-specific only in a dedicated cgroup'
+                for field in memory.max memory.current memory.peak memory.swap.max memory.swap.current memory.swap.peak memory.events; do
+                    file="/sys/fs/cgroup$cgroup_path/$field"
+                    if [ -r "$file" ]; then
+                        printf 'cgroup_end_%s: ' "$field"
+                        tr '\n' ' ' <"$file"
+                        printf '\n'
+                    fi
+                done
+            } >>"$metadata"
+        fi
+    fi
+}
+trap write_cgroup_end EXIT
+printf 'metadata: %s\n' "$metadata"
 # Keep this identical to run_bench()'s fixed prompt in src/main_cli.cpp so the
 # generation-parity pass exercises the same workload as the timing pass.
 bench_prompt='The history of computing is a history of abstraction: from relays to vacuum tubes, from transistors to integrated circuits, and now from monolithic kernels to distributed accelerators. In each transition the same question returns — what is the smallest primitive that still expresses the computation?'
@@ -80,6 +153,7 @@ printf 'Bounded-memory MoE benchmark\nmodel: %s\nexe: %s\n' "$model" "$exe"
 printf 'planned tiers (GiB): %s\ntokens: %s\n' "$tiers" "$tokens"
 printf 'resident expert slots: %s\n' "${slots:-automatic}"
 echo "NOTE: --ram-tier is a policy simulation, not a hard RSS cap."
+echo "NOTE: cgroup limits are observed, not created; use a dedicated systemd scope for enforcement."
 echo "NOTE: output is not a low-memory validation until run on matching native RAM."
 
 for tier in $tiers; do

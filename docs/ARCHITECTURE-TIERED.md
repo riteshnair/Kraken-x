@@ -48,8 +48,12 @@ sizes do not define Kraken's budgets.
 These are distinct guarantees: an expert-slot or WARM-byte limit is not a hard
 limit on process RSS, page cache, or total machine memory. For a deployment that
 must not exceed a system ceiling, run under an OS-enforced limit (and record
-swap/OOM counters) in addition to measuring RSS. A simulated `--ram-tier` is
-planner input, not enforcement.
+swap/OOM counters) in addition to measuring RSS. On Linux, the bounded-MoE
+driver can be launched inside a dedicated scope, for example
+`systemd-run --user --scope -p MemoryMax=16G -p MemorySwapMax=0 -- ...`; its
+metadata records cgroup limits and end-of-run high-water/event counters when
+visible. Use a dedicated scope for process-specific cgroup peaks. A simulated
+`--ram-tier` is planner input, not enforcement.
 
 ### Safe ideas to carry forward
 
@@ -69,10 +73,13 @@ planner input, not enforcement.
   prove exact output parity. GGUF payload layout must be inspected rather than
   assuming adjacent experts are physically contiguous.
 - Make cold-start, first-request, and repeated warm-request measurements
-  separate. Report peak RSS, VRAM peak, swap/OOM, resident slots/bytes, cold
-  bytes/read time, hit/eviction counts, prefill, decode, and output parity on
-  the same named model and workload. Never transplant another project's token
-  rates or cache sizes.
+  separate. The bounded-MoE script records host/cgroup metadata, model size,
+  settings, and process peak RSS; its `--bench` run is one startup plus one
+  request, and the separate generation pass is only a parity check. It does not
+  yet measure repeated warm requests. Report peak RSS, VRAM peak, swap/OOM,
+  resident slots/bytes, cold bytes/read time, hit/eviction counts, prefill,
+  decode, and output parity on the same named model and workload. Never
+  transplant another project's token rates or cache sizes.
 
 ### Ideas not adopted as defaults
 
