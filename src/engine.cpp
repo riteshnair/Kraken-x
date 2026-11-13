@@ -15732,7 +15732,8 @@ struct Engine::BatchRun {
     struct Seq {
         const GenerateParams *p = nullptr;
         GenerateResult *res = nullptr;
-        std::vector<i32> ids;      // prompt + accepted tokens
+        std::vector<i32> ids;      // full visible history + accepted tokens
+        std::vector<i32> prefill_ids; // only the not-yet-cached prompt rows
         std::vector<f32> logits;   // this sequence's logits row
         Sampler sampler;
         std::unique_ptr<TokenEmitter> emit;
@@ -15745,6 +15746,13 @@ struct Engine::BatchRun {
         // skip it.
         bool prefill = false;
         i64 pf_off = 0;            // prompt tokens already written to the slot
+        // Position the prompt's first token goes to. 0 for a joined sequence; a
+        // forked branch starts after the trunk it inherited.
+        i64 pf_base = 0;
+        // Rows the PROMPT wrote, i.e. where a fork of this sequence starts.
+        // Tokens this sequence generated are deliberately not inherited: a
+        // branch must not continue from somebody else's continuation.
+        i64 prompt_rows = 0;
         bool done = false;         // finalized: result complete, slot released
         i64 steps = 0;
         f64 prefill_ms = 0.0;
@@ -15838,6 +15846,7 @@ bool Engine::batch_join(const GenerateParams &p, GenerateResult *res,
                  static_cast<long long>(kv_cap_), static_cast<int>(slot));
     }
     res->prompt_tokens = static_cast<i32>(s.ids.size());
+    s.prefill_ids = s.ids;
     s.sampler.reset(p.sampler);
     s.sampler.accept(s.ids.data(), static_cast<int>(s.ids.size()));
     s.emit.reset(new TokenEmitter(p, tok_, s.sampler, res, s.ids));
@@ -15850,6 +15859,8 @@ bool Engine::batch_join(const GenerateParams &p, GenerateResult *res,
     // tokenization and a slot reservation.
     s.prefill = true;
     s.pf_off = 0;
+    s.pf_base = 0;
+    s.prompt_rows = s.pos;
     s.decode_t0 = std::chrono::steady_clock::now();
     batch_run_->slot_used[static_cast<size_t>(slot)] = true;
     batch_run_->seqs.push_back(std::move(owned));
@@ -15868,7 +15879,7 @@ bool Engine::batch_prefill_slice(i32 index) {
     if (!s.active || !s.prefill) return false;
     const GenerateParams &p = *s.p;
     GenerateResult *res = s.res;
-    const i64 total = static_cast<i64>(s.ids.size());
+    const i64 total = static_cast<i64>(s.prefill_ids.size());
 
     // Cancellation is checked per chunk, so a cancelled request stops within
     // one chunk of the caller asking, and its slot comes back at the next
@@ -15882,8 +15893,11 @@ bool Engine::batch_prefill_slice(i32 index) {
     const i32 n = static_cast<i32>(std::min<i64>(chunk_, total - s.pf_off));
     batch_run_->row_slot.assign(static_cast<size_t>(n), s.slot);
     batch_run_->row_pos.resize(static_cast<size_t>(n));
+    // A forked branch's prompt is appended after the trunk it inherited, so its
+    // rows are at pf_base + i, and the forward is told to rotate and address
+    // from there. For a joined sequence pf_base is 0 and this is the plain case.
     for (i32 t = 0; t < n; t++)
-        batch_run_->row_pos[static_cast<size_t>(t)] = s.pf_off + t;
+        batch_run_->row_pos[static_cast<size_t>(t)] = s.pf_base + s.pf_off + t;
 
     expert_phase(ExpertCache::PhasePrefill);
     krk::HostTime::set_phase(krk::HostTime::kPrefill);
@@ -15894,7 +15908,8 @@ bool Engine::batch_prefill_slice(i32 index) {
         BatchRowsGuard guard{&fwd_row_slot_, &fwd_row_pos_};
         fwd_row_slot_ = batch_run_->row_slot.data();
         fwd_row_pos_ = batch_run_->row_pos.data();
-        ok = forward(s.ids.data() + s.pf_off, n, static_cast<i32>(s.pf_off), last);
+        ok = forward(s.prefill_ids.data() + s.pf_off, n,
+                     static_cast<i32>(s.pf_base + s.pf_off), last);
         fwd_row_slot_ = nullptr;
         fwd_row_pos_ = nullptr;
     }
@@ -15918,6 +15933,180 @@ bool Engine::batch_prefill_slice(i32 index) {
         s.steps = 0;
         s.decode_t0 = std::chrono::steady_clock::now();
     }
+    return true;
+}
+
+// One plane, one slot's worth of rows, copied to another slot. A slot owns rows
+// [slot*kv_cap_, (slot+1)*kv_cap_) of every layer's plane, so a range within a
+// slot is contiguous and this is one copy per layer per plane -- not one per row.
+bool Engine::batch_copy_slot_rows(i32 from_slot, i32 to_slot, i64 rows) {
+    if (rows <= 0) return true;
+    if (from_slot < 0 || to_slot < 0 || from_slot >= n_slots_ || to_slot >= n_slots_)
+        return false;
+    if (from_slot == to_slot) return true;
+    if (rows > kv_cap_) return false;
+    const ModelConfig &mc = model_.cfg();
+    const KvQuant kvq = kv_quant_of(cfg_);
+    bool any = false;
+    for (i32 l = 0; l < mc.n_layer; l++) {
+        // A shared-KV or KV-free layer has no plane of its own. Its source
+        // layer is copied once under that source's index.
+        if (!model_.layer_writes_kv(l)) continue;
+        const i64 lkv = model_.kv_dim_at(l);
+        const i64 stride = static_cast<i64>(
+            be_->kv_row_bytes(lkv, kvq, model_.head_dim_at(l)));
+        char *kb = static_cast<char *>(kvt_k_.base(l));
+        char *vb = static_cast<char *>(kvt_v_.base(l));
+        if (!kb || !vb) return false;
+        const i64 slot_bytes = kv_cap_ * stride;
+        const size_t n_bytes = static_cast<size_t>(rows * stride);
+        const i64 src_off = static_cast<i64>(from_slot) * slot_bytes;
+        const i64 dst_off = static_cast<i64>(to_slot) * slot_bytes;
+        be_->copy_device(kb + dst_off, kb + src_off, n_bytes);
+        be_->copy_device(vb + dst_off, vb + src_off, n_bytes);
+        any = true;
+    }
+    // The branch's prefill reads these rows as its trunk, so the copies have to
+    // have landed before the next forward is submitted.
+    if (any) be_->sync();
+    return true;
+}
+
+bool Engine::batch_fork(i32 index, const std::vector<GenerateParams> &branches,
+                        std::vector<GenerateResult> *outs, std::string *err) {
+    auto fail_all = [&](const std::string &msg) {
+        if (outs) {
+            for (GenerateResult &r : *outs) {
+                r.finish = FinishError;
+                r.error = msg;
+            }
+        }
+        if (err) *err = msg;
+        return false;
+    };
+    if (!outs) {
+        if (err) *err = "no results to fill";
+        return false;
+    }
+    outs->assign(branches.size(), GenerateResult{});
+    if (!batch_run_) return fail_all("no batch session is open");
+    if (branches.empty()) return true;
+    if (branches.size() > static_cast<size_t>(n_slots_))
+        return fail_all("the fork has more branches than this engine has KV slots");
+    if (index < 0 || static_cast<size_t>(index) >= batch_run_->seqs.size())
+        return fail_all("no sequence at index " + std::to_string(index) + " to fork");
+    BatchRun::Seq &parent = *batch_run_->seqs[static_cast<size_t>(index)];
+    if (parent.done) return fail_all("the sequence to fork has already finished");
+    if (!parent.active) return fail_all("the sequence to fork is not attached");
+    if (parent.prefill)
+        return fail_all("the sequence to fork is still prefilling its prompt");
+    if (!comp_nblocks_.empty())
+        return fail_all("compressed-attention state is not fork-copyable yet");
+    if (kv_quant_of(cfg_) != KvQuant::F16)
+        return fail_all("forking currently requires f16 KV; quantized-cache parity is not established");
+    // The fork point, and the rows that exist behind it.
+    const i64 base = std::min<i64>(parent.prompt_rows, parent.pos);
+    if (base <= 0) return fail_all("the sequence to fork has no prompt rows to inherit");
+
+    // Validate every branch BEFORE allocating anything: a fork that half
+    // happens would leave slots held by sequences the caller never asked for.
+    std::vector<std::vector<i32>> bids(branches.size());
+    for (size_t b = 0; b < branches.size(); b++) {
+        const GenerateParams &p = branches[b];
+        GenerateResult &res = (*outs)[b];
+        // Branches carry the COMPLETE prompt text. Tokenize it as a standalone
+        // request (including BOS where appropriate), then require its token prefix
+        // to be the parent's prompt. This avoids assuming tokenization is
+        // compositional across a text boundary (BPE merges can cross it).
+        if (p.prompt.empty()) {
+            res.finish = FinishError;
+            res.error = "branch " + std::to_string(b) + ": prompt encoded to zero tokens";
+            return fail_all(res.error);
+        }
+        if (tokenize_prompt(p.prompt, bids[b]) < 0) {
+            res.finish = FinishError;
+            res.error = "branch " + std::to_string(b) + ": prompt could not be tokenized";
+            return fail_all(res.error);
+        }
+        if (static_cast<i64>(bids[b].size()) <= base ||
+            !std::equal(parent.ids.begin(), parent.ids.begin() + static_cast<size_t>(base),
+                        bids[b].begin())) {
+            res.finish = FinishError;
+            res.error = "branch " + std::to_string(b) +
+                        ": full prompt does not preserve the parent's prompt token prefix";
+            return fail_all(res.error);
+        }
+        const i64 room = kv_cap_ - base;
+        if (room <= 0) {
+            res.finish = FinishError;
+            res.error = "branch " + std::to_string(b) + ": the fork point is already at "
+                        "the context limit";
+            return fail_all(res.error);
+        }
+        const i64 suffix = static_cast<i64>(bids[b].size()) - base;
+        if (suffix > room) {
+            bids[b].resize(static_cast<size_t>(base + room));
+            KRK_WARN("branch %zu: prompt truncated to the %lld-token context after a "
+                     "%lld-row trunk", b, static_cast<long long>(room),
+                     static_cast<long long>(base));
+        }
+        bids[b].erase(bids[b].begin(), bids[b].begin() + static_cast<ptrdiff_t>(base));
+    }
+
+    const i32 need = static_cast<i32>(branches.size());
+    const i32 have = batch_free_slots();
+    if (have < need) {
+        return fail_all("a fork of " + std::to_string(need) + " branch(es) needs " +
+                        std::to_string(need) + " free KV slot(s) and " +
+                        std::to_string(have) + " are free");
+    }
+
+    // Reserve the chosen destination indices as a local plan first. Copy all
+    // trunks before attaching any sequence, so a backend refusal cannot leave a
+    // half-created fork holding slots the caller believes were rolled back.
+    std::vector<i32> fork_slots;
+    fork_slots.reserve(static_cast<size_t>(need));
+    for (i32 i = 0; i < n_slots_ && static_cast<i32>(fork_slots.size()) < need; i++)
+        if (!batch_run_->slot_used[static_cast<size_t>(i)]) fork_slots.push_back(i);
+    if (static_cast<i32>(fork_slots.size()) != need)
+        return fail_all("the free KV slot count changed while preparing the fork");
+    for (i32 slot : fork_slots) {
+        if (!batch_copy_slot_rows(parent.slot, slot, base))
+            return fail_all("the trunk's KV rows could not be copied into every branch slot");
+    }
+
+    for (size_t b = 0; b < branches.size(); b++) {
+        const GenerateParams &p = branches[b];
+        GenerateResult &res = (*outs)[b];
+        const i32 slot = fork_slots[b];
+        std::unique_ptr<BatchRun::Seq> owned(new BatchRun::Seq());
+        BatchRun::Seq &s = *owned;
+        s.p = &p;
+        s.res = &res;
+        s.slot = slot;
+        // The history is the trunk the branch inherited plus its own prompt, so
+        // the sampler's repetition window sees exactly what the model read --
+        // the same thing an isolated run of the concatenation would see.
+        s.ids.assign(parent.ids.begin(), parent.ids.begin() + static_cast<size_t>(base));
+        s.ids.insert(s.ids.end(), bids[b].begin(), bids[b].end());
+        s.prefill_ids = bids[b];
+        res.prompt_tokens = static_cast<i32>(s.ids.size());
+        s.sampler.reset(p.sampler);
+        s.sampler.accept(s.ids.data(), static_cast<int>(s.ids.size()));
+        s.emit.reset(new TokenEmitter(p, tok_, s.sampler, &res, s.ids));
+        s.logits.assign(static_cast<size_t>(n_vocab_), 0.0f);
+        s.pos = base + static_cast<i64>(bids[b].size());
+        s.active = true;
+        s.prefill = true;
+        s.pf_off = 0;
+        s.pf_base = base;   // this branch's prompt starts where the trunk ended
+        s.prompt_rows = s.pos;
+        s.decode_t0 = std::chrono::steady_clock::now();
+        batch_run_->slot_used[static_cast<size_t>(slot)] = true;
+        batch_run_->seqs.push_back(std::move(owned));
+    }
+    KRK_DEBUG("fork of sequence %d: %zu branch(es) from %lld trunk row(s)",
+              static_cast<int>(index), branches.size(), static_cast<long long>(base));
     return true;
 }
 
