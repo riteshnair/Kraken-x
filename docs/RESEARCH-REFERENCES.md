@@ -1,12 +1,14 @@
 # Research references, with what this repo has measured about each
 
-Where the external plans' papers meet this code. Each entry states the paper's
-idea, then **what is already true here** with the number that settles it, then what
-is genuinely open. Numbers are measured on this box (RX 9070 XT, gfx1201, 15.92 GiB
-VRAM) unless a file is cited.
+This is a historical research and measurement note. Its implementation statements
+are snapshots, not the current support matrix. Use
+[Model support](MODEL-SUPPORT-MATRIX.md) and [TO-DO.md](../TO-DO.md) for current
+capability and pending work.
 
-Source documents: `NATIVE_LLM_ENGINE_RESEARCHED_MASTER_PLAN.md` (§7 primary list),
-the Aug-2026 cs.LG digest, and the RDNA2/RDNA4 ISA PDFs.
+Numbers were measured on the stated RX 9070 XT, gfx1201, 15.92 GiB VRAM host
+unless another host is named. The original master plan and several raw reports
+were removed during consolidation, so these values are historical observations
+rather than reproducible current-build results.
 
 ---
 
@@ -54,9 +56,9 @@ So the ranking is *conditional*, and the condition is where the working set sits
    tok/s), with `xfer` 2815 -> 31 ms. Shrinking HOT by 37x still costs 2.6x the
    step (38.7 -> 14.8 tok/s) — that part of the old conclusion holds — but the
    fix it pointed at was the source's pinning, not a slot plan.
-3. **The per-layer barrier is not in this list.** It is the *hybrid CPU* arm's
-   cost (3.1x, `docs/test-results.md` §9): the device-only path never waits on a
-   host merge.
+3. **The per-layer barrier is not in this list.** The removed historical report
+   measured it as the *hybrid CPU* arm's cost: the device-only path never waits
+   on a host merge.
 
 ### llama.cpp's GPU-resident expert cache (#29887, #30112, #29949) -- decision and copy moved onto the card
 **What it is:** three pieces of upstream work on the same problem this tier solves, and the
@@ -103,8 +105,7 @@ planner's shape (longest context first, best cache that fits) -- which is what
 `configure_expert_cache` and the KV tier already do against measured free VRAM rather
 than a static heap. Its reported numbers (20.3 tok/s on a 27B UD-Q2_K_XL, 9.2 GiB) are
 console numbers on unified memory and do not compare to a discrete-card arm.
-Sources: <https://github.com/abhi245y/PS5LM-Plus>,
-`docs/RESEARCH.md` and `docs/ROADMAP.md` there, `ps5/app/model_plan.cpp`.
+Sources: <https://github.com/abhi245y/PS5LM-Plus> and its `ps5/app/model_plan.cpp`.
 
 ### SSD-LLaMA (2609.18110) — aligned per-(layer,expert) records, manifest, checksums
 **Measured here:** the tier is already HOT/WARM/COLD with byte budgets, and on
@@ -179,7 +180,7 @@ regenerated with `--expert-scan`.
 ### Tied Trit-Planes (2608.08910) — folded 1.6-bit format for disk-streamed MoE
 **Measured here:** the engine already runs the two ternary layouts (`Q2_0` as the
 fork's 128/34 and `Q2_0_64` as 48) and the local review of the ternary storage
-question is `docs/compressed-expert-spec-review.md` §3.3 (BITCOS), which decides
+question was covered by the earlier BITCOS review, which addressed
 the *lossless*-side question this format sits next to. Nothing of the folded
 9-level plane is implemented.
 
@@ -188,7 +189,7 @@ the *lossless*-side question this format sits next to. Nothing of the folded
 ## KV cache
 
 ### AnchorKV (2608.02901), HiSparse (2608.07009), OasisKV (2608.08097), KVFetch (2610.08811)
-**Measured here:** KV is flat and per-layer packed (`sum(len) * 2`; **24 MiB at
+**Measured in the historical run:** the flat layout was per-layer packed (`sum(len) * 2`; **24 MiB at
 ctx 4096** on the Nemotron 30B-A3B where 208 MiB was charged before), it tiers
 HOT/WARM/COLD with a cold-dir spill, and every tier knob is proven byte-identical
 to the flat cache on the small models (7 decode arms, `scripts/kv_tier_geometry_check.sh`).
@@ -197,7 +198,7 @@ two KV planes sharing one cold-file namespace spilled 1916 pages, restored 1860,
 reported 0 dropped, and produced fluent text that differed from the flat cache.
 That is why every compression scheme above needs the verbatim-copy gate the plan
 per-layer geometry rather than an addition beside it.
-**Open:** page tables, refcounts, prefix hashes, any KV quantisation.
+**Current correction:** KV quantization and HOT/WARM/COLD tiers are implemented. Per-sequence page ownership for batching and general radix prefix reuse remain open.
 
 ---
 
@@ -250,20 +251,18 @@ only as good as its cheapest path -- and it is why any tree/token-count extensio
 must be priced per proposal, not per token.
 
 **The artifact this repo does not have:** on the locally-installed sibling engine
-the drafter is not trained, it is *shipped*. `C:\Strata-HIP-data\mtp\` holds
-`mtp-inventory.md` ("MTP block in the BF16 checkpoint -- 31 tensors, 5.214 GB, in 28
+the drafter is not trained, it is *shipped*. `C:\Strata-HIP-data\mtp\` held
+an inventory ("MTP block in the BF16 checkpoint, 31 tensors, 5.214 GB, in 28
 shards"), `mtp-q2_0.gguf` (889,014,272 bytes, with a per-tensor format report) and
 the `--mtp .../rt` directory its configs pass beside `--spec 4 --spec-min-p 0.5`.
-kraken recognizes `mtp.*` shards only to refuse them (`src/arch.cpp:113`). See
+Current Kraken code implements several embedded and sidecar MTP paths. Real matched-head acceptance remains a separate measurement. See
 
 ---
 
 ## Quantisation
 
 ### BITCOS (2609.16338), Disaggregated Quantization (2609.26333)
-**Measured here:** BITCOS is analysed in `docs/compressed-expert-spec-review.md`
-§3.3 (lossless with respect to an already-ternary tensor; degenerate for anything
-else), with open items named and a correctness bug blocking one of them. No custom
+**Historical analysis:** BITCOS was assessed as lossless only with respect to an already-ternary tensor and degenerate for other inputs. No custom
 W4/W6/W8 format exists; the engine runs GGUF formats, including NVFP4 with
 per-matrix `.scale` sidecars.
 

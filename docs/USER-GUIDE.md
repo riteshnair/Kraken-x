@@ -196,7 +196,35 @@ Speculative decoding:
 ```
 
 A greedy target verifies draft proposals. Test the specific model pair and
-backend before assuming that speculation is faster.
+backend before assuming that speculation is faster. Sampled generation does not
+use the greedy verify-and-accept contract.
+
+Probe a compatible embedded or sidecar MTP head before using it for speculation:
+
+```sh
+./build-cpu/kraken -m target.gguf --intel \
+  --mtp mtp-head.gguf --mtp-probe
+./build-cpu/kraken -m target.gguf --intel \
+  --mtp mtp-head.gguf --mtp-spec --draft-tokens 4 \
+  -p "Explain multi-token prediction." -n 128 --greedy
+```
+
+The head must match the target architecture and tensor contract. Fixture-tested
+loading does not establish a useful acceptance rate. Record proposals, accepted
+tokens, acceptance rate, and end-to-end latency on the real matched pair.
+
+Run a supported masked-diffusion model with an explicit denoising schedule:
+
+```sh
+./build-cpu/kraken -m llada.gguf --intel \
+  -p "Explain masked diffusion." \
+  --max-tokens 128 --diffusion-steps 32 --diffusion-block 32 --greedy
+```
+
+The prompt and diffusion generation region must fit in `--ctx`. This path uses
+cacheless bidirectional forwards rather than the causal KV decode loop. Measure
+steps per second, committed tokens, and total latency. See
+[LLaDA and masked diffusion](LLaDA.md) for the evidence boundary.
 
 ## 6. HTTP server
 
@@ -228,8 +256,30 @@ The example binds to loopback on the local machine. If you expose the server to
 a network, add appropriate access control and transport security at the deployment
 boundary. Do not assume that a development server provides authentication.
 
-Prefix reuse can avoid repeated prefill for matching prompts. Cached token usage
-is an execution metric. It does not establish response correctness.
+Stream chat deltas with SSE:
+
+```sh
+curl -N http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "model.gguf",
+    "messages": [{"role": "user", "content": "What is quantized inference?"}],
+    "temperature": 0,
+    "max_tokens": 128,
+    "stream": true
+  }'
+```
+
+A failed streaming write raises the request cancellation flag and stops decoding
+at the next token. Prefix reuse can avoid repeated prefill for matching prompts.
+Cached token usage is an execution metric, not evidence of response correctness.
+The held prefix is not a general radix tree.
+
+Available endpoints are `/`, `/health`, `/v1/models`, `/v1/tools/rv32`,
+`/v1/completions`, and `/v1/chat/completions`. The service loads one model and
+serializes generation. The engine also has a constrained multi-sequence API, but
+it excludes incompatible per-sequence state and is not exposed as unrestricted
+continuous batching by this server.
 
 ## 7. Testing
 
@@ -333,7 +383,11 @@ that the latest source compiled.
 - [README](../README.md): build and quick-start overview.
 - [Architecture](ARCHITECTURE.md): major components and execution flow.
 - [CPU low-bit VNNI](CPU-LOWBIT-VNNI.md): optimized quantized CPU kernels.
-- [Benchmark loading](USER-GUIDE.md): resident and streamed weight measurements.
-- [Engineering notes](TECHNICAL-README.md): historical implementation detail.
-- [Implementation audit](../TO-DO.md): verified findings and
-  remaining gaps.
+- [Tiered execution](ARCHITECTURE-TIERED.md): residency, ownership, and historical
+  measurements with their scope.
+- [Model support](MODEL-SUPPORT-MATRIX.md): architecture, quantization, and
+  evidence levels.
+- [Model status](MODEL-STATUS.md): historical checkpoint runs and current
+  corrections.
+- [Engineering notes](TECHNICAL-README.md): implementation details.
+- [Pending work](../TO-DO.md): verified gaps and blocked validation.

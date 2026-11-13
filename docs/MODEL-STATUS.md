@@ -1,7 +1,15 @@
 # Model status
 
-Device benchmark sweep taken on 2026-10-26, one run per model, on the machine in
-this checkout.
+This file separates current source support from historical checkpoint runs. Use
+[Model support](MODEL-SUPPORT-MATRIX.md) for the current architecture matrix and
+[TO-DO.md](../TO-DO.md) for open verification.
+
+## Historical device sweep, 2026-10-26
+
+The table below records one run per model on the original measurement machine.
+It is not a current-build performance claim. The exact source revision and raw
+per-run artifacts are not retained with this table, so the rows cannot be
+independently reproduced from this checkout alone.
 
 Command:
 
@@ -14,10 +22,10 @@ else. One run each, so treat a row as an indicator and not as a tight number.
 The first load after a build reads the file cold; every other row here used the
 warm file cache.
 
-Raw rows: `docs/traces/results.tsv`. Re-run instructions: `docs/traces/README.md`,
-and `tools/sweep_models.sh` is the sweep itself. The table below was re-run the
-same day after the prefill GEMM's activation prefetch, so its prefill column is
-one build newer than the rest of the record.
+The original raw rows and trace instructions were removed during repository
+consolidation. `tools/sweep_models.sh` remains the sweep driver. The table below
+was re-run the same day after the prefill GEMM's activation prefetch, so its
+prefill column is one build newer than the rest of the record.
 
 **Radeon RX 9070 XT (gfx1201, RDNA4, 64 CU, 15.9 GiB VRAM), HIP 7.12.60602
 runtime, SDK 7.16.26331, Release.**
@@ -75,7 +83,7 @@ Measured on the CPU fixture (2 GiB q8_0 MoE, 2 vCPU), before and after:
 | 695 | 19575 ms | 6760 ms | 2.90x |
 
 and on a 1 GiB f16 dense file, 3.8-4.3x (details and the bit-identity witnesses:
-[ARCHITECTURE-TIERED.md §7](ARCHITECTURE-TIERED.md)).
+[tiered execution](ARCHITECTURE-TIERED.md)).
 
 The same defect **cannot be ruled out on the GPU arm** -- it would show up in
 this table as a prefill:decode ratio far below what the card can do, and several
@@ -109,102 +117,80 @@ this document claims a GPU number that was not measured on a GPU.
 ## Not coherence-tested in this sweep
 
 This sweep measures throughput and the range-guard counters. It does not run the
-scalar `--cpu` reference, which is what the coherence column used to be. Text
-agreement is recorded per model in the sections of [technical reference](TECHNICAL-README.md)
-that name the file, and `scripts/coherence_check.sh` is the way to re-check one
-file. Three of the rows above were checked device against the CPU reference in
+scalar `--cpu` reference, which is what the coherence column used to be.
+`scripts/coherence_check.sh` is the way to re-check one file. Three of the rows
+above were checked device against the CPU reference in
 the session that landed the 2026-10-26 changes: bitnet-2b-tq1_0, Qwen3-4B-Q8_0
 and Qwen3.5-9B-Q4_K_M. Qwen3-30B-A3B was checked the same way and is not a row
 in this table.
 
 ## Files that have left this box
 
-These rows were in the previous revision of `docs/traces/results.tsv` and their
-files are no longer in `G:/More-models` or `H:/OLLAMA-Models/GGUF`, so they could
+These rows were in the previous sweep and their files are no longer in
+`G:/More-models` or `H:/OLLAMA-Models/GGUF`, so they could
 not be re-measured: `SmolLM2-135M-Instruct.Q4_K_M`, `SmolLM2-135M-Instruct.IQ4_XS`,
 `Qwen3.5-0.8B.Q4_K_M`, `Qwen3-MOE-4x0.6B-2.4B-Q4_K_M`, `Qwen3-4B-Instruct-2507-Q6_K`,
 `qwen3-1.7b-coder-distilled-sft-f16`, `qwen3-1.7b-stem-proof-f16`,
 `qwen3.5-4b-nvfp4`, `qwen3.5-9b-nvfp4` and `Qwen3.5-9b-Sushi-Coder-RL.Q4_K_M`.
 Their old numbers are in the commit history of this file.
 
+## Current support corrections
+
+The historical table records what the old binary did. Several refusal and support
+states have changed:
+
+| Family or file | Current source state | Evidence boundary |
+| --- | --- | --- |
+| K2-Horizon MoVA, `k2-horizon` | Text graph implemented, including routed attention values and grouped band normalization | `test_k2_horizon_mova` is synthetic; the old load refusal is not the current verdict |
+| DeepSeek-V4.1, `deepseek41` | Shared-latent MLA, compressed attention, Sinkhorn hyper-connections, hash routing, and Engram are implemented | Backend capability gates apply; real-checkpoint verification remains open |
+| Qwen3.8 Flash-Next, `qwen4exp` | HC, PLE, QSA, GDN, and MoE paths are implemented | Synthetic whole-graph coverage exists; real-model coherence remains open |
+| MiniMax-M3.1, `minimax-m3` | Schema and sparse-attention graph are implemented | `test_minimax_m3_msa` uses a fixture; no 428B checkpoint run is claimed |
+| `diffuse` | Bidirectional cacheless forward and block denoising are implemented | Real LLaDA reference agreement remains unverified here |
+| `nemotron_h_moe` | Mamba-2 and MoE forward paths are implemented | Synthetic forward tests do not establish named-checkpoint quality |
+| Routed Gemma4 | Supported layouts run through the implemented routed path | A file with an unimplemented branch layout is refused by name |
+| Ornith with no established GGUF schema | No family support is claimed | Do not infer a graph from the filename |
+
+The full family list and draft-only states are in
+[Model support](MODEL-SUPPORT-MATRIX.md).
+
 ## How a file is judged
 
-`kraken-inspect FILE` answers "will this run, and if not, why" **without loading
-the weights**. It runs the same verdict the loader runs, so its answer and the
-engine's answer are the same answer — that agreement is a test
-(`test_load_verdict`), and it is the point of the tool.
+`kraken-inspect FILE --quant` evaluates the file without running generation. The
+loader and inspector share the architecture and tensor verdict logic, covered by
+`test_load_verdict`.
 
-The pipeline, in order. The first rule that fires decides:
+The decision includes:
 
-1. **Architecture.** `general.architecture` is looked up in the table in
-   `src/arch.cpp` (~31 entries). Each entry carries a shape (dense, MoE,
-   recurrent, recurrent-MoE, diffusion), a support level, a role, and — for
-   anything that is not a plain `Yes` — a sentence naming the gap.
-2. **Shape.** A file needs a token table to look anything up in, and a target
-   needs attention or SSM tensors to be a transformer. A table pack with neither
-   is refused for what it is, and the reason names the tensors the file *does*
-   carry.
-3. **Role.** A draft head set (`dflash`, `dspark`, `qwen4-mtp`,
-   `deepseek4-dspark`, `qwen35-dflash-draft`, `dflash-draft`) is not a model; it
-   is refused unless a target is given to attach it to.
-4. **Tensor level.** The refused-tensor table names each unimplemented tensor
-   kind (`attn_qkv`, `attn_gate`, `attn_v_exps`, `attn_kv_a/b`, `ssm_conv1d`,
-   `ssm_out`, …). A file carrying one is refused **by tensor name** rather than
-   loaded and decoded as nonsense.
-5. **Support level.** `Partial` architectures load and run, leaving the named
-   feature out; `No` architectures refuse. `KRK_ARCH_ALLOW_EXPERIMENTAL=1` is a
-   *loader* switch — it lets the tensors of a refused schema be read so a
-   half-ported architecture can be checked stage by stage, and it does not admit
-   the graph: an arch whose attention has no implementation is refused after the
-   load and before generation. There is no switch that makes a `No` run.
+1. **Architecture and geometry.** `src/arch.cpp` supplies family flags, shape,
+   role, and support state. A file without a recognized architecture needs enough
+   explicit metadata for the supported fallback to establish its geometry.
+2. **Target or draft role.** Draft head sets require a compatible target and
+   cannot generate as standalone models.
+3. **Tensor schema.** Unsupported computations are refused by tensor or feature
+   name rather than silently omitted.
+4. **Backend capability.** A graph that loads can still refuse initialization or
+   generation when the selected backend lacks a required operation.
+5. **Runtime configuration.** Batching, KV tiering, speculation, and numerical
+   options have their own compatibility checks.
 
-**Unlisted architectures are refused.** They used to be read against llama
-defaults, which meant `kraken-inspect` printed
-`zzz9moxx — unknown (llama-like defaults)` and `verdict runnable` while
-`kraken` failed later with `GGUF metadata is missing core geometry`. The verdict
-was wrong and the engine was right. Now the verdict refuses first, with the
-reason that actually applies:
+`KRK_ARCH_ALLOW_EXPERIMENTAL=1` exposes partial loader work for development. It
+does not implement missing attention or bypass a backend refusal.
 
-```
-verdict    refused
-           - architecture 'zzz9moxx' is not in the architecture table and the
-             file carries no 'zzz9moxx.block_count' key, so the layer stack
-             cannot be determined. Known architectures: llama, qwen2, qwen3, ...
-```
+## Evidence limits
 
-The rule asks the *file*, not the name: an unlisted label whose file still
-carries a usable `<arch>.block_count` keeps its geometry and stays runnable with
-a note, because that file can load. Verified on `fix/unknown-arch.gguf` — the
-MoE fixture with only its `general.architecture` string rewritten.
+A row marked `ran` means that the old benchmark executed. It does not prove:
 
-## Family coverage
+- Correct tensor semantics for the whole model.
+- Agreement with an independent runtime.
+- Good answer quality.
+- Current-build throughput.
+- Support on another backend or GPU.
 
-The four families that were open, and the exact state of each. An arch string
-that llama.cpp does not define is not invented here; those files are refused as
-unlisted, which is now a named refusal rather than a silent llama-default load.
+Three rows were historically checked against the CPU reference for a fixed
+prompt: bitnet-2b-tq1_0, Qwen3-4B-Q8_0, and Qwen3.5-9B-Q4_K_M. Qwen3-30B-A3B was
+also checked and is not in the table. These are bounded execution comparisons,
+not general model-quality evaluations.
 
-| Family | GGUF arch | State | What is missing |
-|---|---|---|---|
-| DeepSeek-V4.1-Flash | `deepseek41` | **Partial** — loads as the deepseek4 graph | compressed attention, the sparse indexer, hyper-connections (`hc_*`), Engram sidecar tensors. A checkpoint carrying them is refused by tensor name |
-| MiniMax-M3.1-Flash | `minimax-m3` | **supported** — schema and graph | nothing: the schema is llama.cpp's own (`src/models/minimax-m3.cpp`), the block selector is `Engine::msa_select_block`, and the whole graph prefills and decodes a synthetic file of the family (`test_minimax_m3_msa`). No 428B checkpoint has been run — the file is a fixture — and two deviations are stated rather than hidden: block sets are unioned across group heads, and a prefill chunk wider than 8 rows attends densely |
-| Qwen3.8-Flash-Next | `qwen4exp` | **supported, gated** — every component has a kernel | not a missing kernel but a missing **whole-graph coherence gate** against an independently verified reference on the real GGUF: one recorded REAP-288 prompt matched 24/24 and another coding prompt historically diverged. Serving fluent wrong output is the failure this engine exists to avoid, so it stays gated until that gate exists (see [TECHNICAL-README.md §4](TECHNICAL-README.md)) |
-| Ornith-1.5-122B | none (unlisted) | **refused as unlisted** | no published GGUF arch string to read it against; refused rather than guessed |
-
-`minimax-m3` matters for a specific reason: the fallback path read unlisted
-files against llama defaults, and a 428B sparse-attention MoE is the worst
-possible candidate for a schema nobody checked. The schema is now read off
-llama.cpp's own loader rather than guessed from safetensors names, and the block
-selector it needs is the MSA work from the release before this one. The
-vision/video tower the earlier note named is **not in the released file**: the
-reference creates no vision tensors for this arch, so refusing the model for it
-would have kept a loadable family off the list.
-
-
-## Refused at load
-
-| File | Reason |
-|---|---|
-| K2-Horizon-MoVA-36B-A4B-Q4_K_M | routed experts on the attention values (`attn_v_exps`) with a gate on them (`attn_v_gate`); Mixture-of-Values attention is not implemented |
-
-See `## Refused at load` in [technical reference](TECHNICAL-README.md) for the rest of the
-refusal list and the reasoning behind it.
+For new runs, retain raw output and the complete benchmark record described in
+the [user guide](USER-GUIDE.md). Do not replace missing evidence with values from
+this historical table.

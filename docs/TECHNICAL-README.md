@@ -9,7 +9,7 @@ or kernels are missing rather than "not supported".
 Detailed records live beside this file and are linked per section. The short
 version of the honest position: **the CPU reference path is fast and exact, the
 NPU path is measured and opt-in, and four of the newest model families are
-partly or wholly unimplemented, with the reason named.**
+partially verified on real checkpoints, with each evidence boundary named.**
 
 ---
 
@@ -21,8 +21,8 @@ implementation of the math:
 | backend | state | role |
 |---|---|---|
 | **CPU** (`src/backend_cpu.cpp`) | always available | the **scalar reference**. Every other backend is validated against it. Being exact matters more than being fast — but see §5, it is also the only backend this box can run, and it is now 4-6x faster than it was |
-| **HIP / ROCm** (`src/hip/`) | needs a gfx1031/gfx1201 device | the throughput path: WMMA tiles, DP4A int8, fused epilogues, tiered expert cache |
-| **Virtual NPU** (`src/npu/`) | opt-in at build time (`-DKRK_ENABLE_NPU=ON`) | rides the **CPU** path, not a GPU; a software "device" over AVX2/VVVNI. Rode the CPU path by design — see §7 |
+| **HIP / ROCm** (`src/hip/`) | needs a supported AMD HIP device | the throughput path: WMMA tiles, DP4A int8, fused epilogues, tiered expert cache |
+| **Virtual NPU** (`src/npu/`) | opt-in at build time (`-DKRK_ENABLE_NPU=ON`) | rides the **CPU** path, not a GPU; a software "device" over AVX2/VNNI. It rides the CPU path by design; see §7 |
 
 The design constraint throughout: **a path that cannot compute something
 correctly refuses by name.** There is no silent fallback that produces
@@ -104,7 +104,7 @@ in the same order as the path it replaces. `test_gemm_batched_bit_identical`
 and an unchanged `--prefill-hash` end to end on both a q8_0 MoE and an f16 dense
 file. The first attempt -- widening each weight row to f32 and reusing it -- was
 1.9x SLOWER and was reverted; it is written up in
-[ARCHITECTURE-TIERED.md §7](ARCHITECTURE-TIERED.md) because it is the obvious first idea.
+[tiered execution](ARCHITECTURE-TIERED.md) because it is the obvious first idea.
 
 **This also changed the residency conclusion.** Prefill used to look immune to
 expert residency (13.68 s against 13.95 s). It looked that way because compute
@@ -138,7 +138,7 @@ On the virtual NPU the asymmetry becomes a cliff rather than a slope: with
 `KRK_NPU_W8A8=1` decode is 32.8 ms/token resident against 416–719 ms/token when
 experts stream, because the int8 pack is memoized per weight address and a
 streaming slot changes address on every visit. The mechanism, the rejected fix
-and the numbers are in [ARCHITECTURE-TIERED.md §5](ARCHITECTURE-TIERED.md).
+and the numbers are in [tiered execution](ARCHITECTURE-TIERED.md).
 
 Prefetch and prediction, all opt-in and all measured before being believed:
 
@@ -153,47 +153,32 @@ Prefetch and prediction, all opt-in and all measured before being believed:
 
 ## 4. Model families
 
-The table is `src/arch.cpp`'s `kTable`, and `kraken-inspect file.gguf` prints
-the verdict for a specific file — including, for a file that cannot run, which
-tensor classes it could not take. A family verdict is about the *architecture*;
-individual files are still checked at load, because several families ship in
-more than one layout.
+The authoritative family table is `src/arch.cpp`. `kraken-inspect file.gguf
+--quant` evaluates a specific file, including unsupported tensor classes and
+quantization formats. A family entry does not bypass file or backend checks.
 
-### Runs today
+[Model support](MODEL-SUPPORT-MATRIX.md) is the complete support and evidence
+matrix. The table below highlights paths whose evidence is easy to overstate.
 
-| family | arch string | shape | notes |
-|---|---|---|---|
-| Llama / Mistral-style | `llama` | dense | the baseline schema |
-| Qwen2 / Qwen3 | `qwen2`, `qwen3` | dense | QK-norm, per-head rope conventions |
-| Qwen3-MoE | `qwen3moe` | moe | the MoE schema this repo benchmarks against |
-| OLMoE | `olmoe` | moe | wide per-head QK-norm |
-| Qwen3.5 / 3.5-MoE | `qwen35`, `qwen35moe` | recurrent / recurrent-moe | Gated DeltaNet hybrid |
-| LFM2-MoE | `lfm2moe` | recurrent-moe | |
-| DeepSeek-V2 / V2-Lite / Coder-V2-Lite | `deepseek2` | moe | MLA, lite layout |
-| Nemotron-H / -MoE | `nemotron_h`, `nemotron_h_moe` | recurrent(-moe) | Mamba-2 SSD blocks |
-| Laguna | `laguna` | moe | sliding-window pattern |
-| gpt-oss | `gpt-oss` | moe | partial: see the gap list below |
-| Qwen3.8 Flash-Next class (`qwen4exp`) | `qwen4exp` | recurrent-moe | HC / PLE / QSA / GDN implemented; a file is refused at load if it carries a piece that is not, and whole-graph coherence against a real checkpoint is **not** established |
-| Draft/MTP heads | `dflash`, `qwen35-dflash-draft`, `dflash-draft` | dense | speculative heads extracted by `tools/mtp_extract.py` |
+| Family | Current implementation | Verification boundary |
+| --- | --- | --- |
+| Dense Llama, Qwen, Gemma, Phi, GLM, and related variants | Implemented target paths with architecture-specific schema flags | Named-checkpoint correctness is established separately for each file and reference run |
+| Qwen3.5 and other recurrent hybrids | Gated DeltaNet or architecture-specific recurrent state | General batching excludes recurrent state |
+| DeepSeek-V2, V4, and V4.1 | Lite or shared-latent MLA, compression, Sinkhorn residual, hash routing, and Engram as applicable | Backend capability gates apply; real checkpoints remain unverified here |
+| Qwen4Exp | HC, PLE, QSA, GDN, and MoE | Synthetic whole-graph tests exist; real-model coherence remains open |
+| MiniMax-M3 | Sparse attention and MoE schema | Synthetic file only; no 428B checkpoint run is claimed |
+| K2-Horizon | Text MoVA graph and grouped band normalization | Vision support is not claimed |
+| Nemotron-H and Nemotron-H-MoE | Mamba-2, attention, and MoE layer paths | Synthetic forward tests, not named-checkpoint verification |
+| `diffuse` | Bidirectional cacheless forward and block denoising | Real LLaDA reference agreement remains open |
+| DFlash, DSpark, and MTP files | Draft-only paths for compatible targets | Proposal quality, acceptance, and speedup need real matched artifacts |
 
-### The four families asked about, with the actual blocker
+No current support claim is based on a model filename. For an unmapped family
+such as an Ornith export without a validated GGUF schema, the engine must not
+guess a Llama-like graph.
 
-These are real models (August–October 2026) and none of them can be downloaded
-into this sandbox: HuggingFace is not reachable from it, and the smallest is
-122 B parameters. Nothing below claims to have *run* one of them.
-
-| model | arch string | state | what stands in the way |
-|---|---|---|---|
-| **DeepSeek-V4.1-Flash-1017** (552 B backbone / 763 B weights, 40 layers, hidden 5120, 384 routed experts top-6 + 1 shared) | `deepseek41` | **recognised, Partial** — added this pass | The graph is `deepseek4`'s and maps onto it: shared-latent MLA, the grouped low-rank output projection and the `tid2eid` hash route run (`test_dsv4_whole_graph` pins the dense-core case). Runs: **CSA/HCA compressed attention** (`attn_compressor_*`, with the lightning indexer's per-layer tables) and `attn_sinks` — the arithmetic is `src/dsv4_compress.cpp`, driven by `Engine::mla_shared_forward_compressed`, pinned end to end by `test_dsv4_compressed_end_to_end`. That op is a host f32 reference, so it answers on the CPU backend and is refused **by capability** elsewhere. Missing: **Engram** conditional memory (196 B params, a token-hash lookup) and the 4-wide **hyper-connections** |
-| **Qwen3.8-Flash-Next** (125 B MoE + 51 B n-gram head, 512 routed experts top-10 + 1 shared, 48 layers, Gated DeltaNet + QSA hybrid) | `qwen4exp` | **implemented, gated** | Every component has a kernel (HC, PLE, QSA, GDN, experts) and component tests pass. What is missing is a **whole-graph coherence gate** against an independently verified reference on the real GGUF: one recorded REAP-288 prompt matched 24/24 and another coding prompt historically diverged. Serving fluent wrong output is the failure this engine exists to avoid, so the family stays gated until that gate is built |
-| **MiniMax-M3.1-Flash** (428 B MoE, 23 B active, 1M context, MSA sparse attention throughout, DSpark draft head) | `minimax-m3` | **supported** | The schema is llama.cpp's own minimax-m3 loader (tensor names, the five `attention.indexer.*` keys, `leading_dense_block_count`, `expert_shared_count`), and the graph is GQA with per-head QK-norm and partial rotary, sigmoid routing with a scale and a norm, a wide shared expert on swiglu-oai, and MSA on every layer after the dense lead. `test_minimax_m3_msa` runs a synthetic file of the family: the selection changes the tokens at a 2-block budget and reproduces dense attention bit for bit when the budget covers every block |
-| **Ornith-1.5** (122 B, released 2026-10-20) | not mapped | **not supported** | Same position: no schema validated, no architecture reference to implement against |
-
-**What would move these:** a `kraken-inspect` run on a real file (it prints the
-tensor set and the gap map), then the missing kernels in the order that
-`ARCHITECTURE.md` describes. For V4.1 the compressors and the indexer are the
-whole task — the surrounding graph is already here.
-
+The current suite establishes broad synthetic and differential coverage. It does
+not replace independent real-model reference logits, output-quality evaluation,
+or native HIP validation.
 ## 5. Performance: what changed, and the number behind it
 
 The headline of this pass is one finding: **the CPU dot product was calling an
@@ -243,7 +228,7 @@ streaming tier, and that is a genuine gap for dense models larger than RAM.
 every weight row was decoded once per row of the batch. `vec_dot_tiled()` decodes
 each block once into registers and reuses it across eight rows; 2.28-3.35x on
 the q8_0 MoE and 3.83-4.29x on f16 dense, bit-identical, decode untouched. Full
-write-up and the rejected first attempt: [ARCHITECTURE-TIERED.md §7](ARCHITECTURE-TIERED.md).
+write-up and the rejected first attempt: [tiered execution](ARCHITECTURE-TIERED.md).
 
 ## 6. The NPU path
 

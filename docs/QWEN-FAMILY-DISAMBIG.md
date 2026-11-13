@@ -20,7 +20,7 @@ least three of them.
 ## The disambiguation table (what this box actually has, file by file)
 
 These rows are recorded in the earlier machine inventory and
-`docs/model-inventory.md`. They are not all present in the latest checkout-local
+the earlier machine inventory. They are not all present in the latest checkout-local
 `tools/kraken_inventory.log`. Where reachable, the "loader verdict" is the
 engine's metadata-based result, not a guess from the filename.
 
@@ -39,7 +39,7 @@ Files recorded as loading as `qwen35 — supported (recurrent)`:
 - `H:/OLLAMA-Models/GGUF/NeoHorse-1-9B-Q4_K_M.gguf`
 - `H:/OLLAMA-Models/GGUF/Qwable-27b_Q4_K_M.gguf`
 
-From the earlier `docs/model-inventory.md` inventory of `G:/More-models`:
+From the earlier the earlier machine inventory inventory of `G:/More-models`:
 
 - `G:/More-models/Qwen3.5-9b-Sushi-Coder-RL.Q4_K_M.gguf`
 - `G:/More-models/Qwen3.5-9B-DeepSeek-V4-Flash-MTP-Q3_K_M.gguf` (carries `blk.32`, still `qwen35`)
@@ -71,7 +71,7 @@ in this bucket.
 
 Files recorded as loading as `qwen35moe — supported (recurrent-moe)`:
 
-From `docs/model-inventory.md`:
+From the earlier machine inventory, which is not retained in this checkout:
 
 - `G:/More-models/Qwen3.8-Distill-35B-A3B-Coder-Abliterated-Q2KXL_ROCMFPX.gguf`
 - `G:/More-models/Tiel-Coder-35B-A3B-UD-Q5_K_XL.gguf`
@@ -106,7 +106,7 @@ Even within "Qwen3.8 Flash-Next", architecture is file-specific.
 Files present here that load as draft objects or head shards, not runnable
 targets:
 
-From `docs/model-inventory.md`:
+From the earlier machine inventory, which is not retained in this checkout:
 
 - `G:/More-models/Qwen3.8-27B-DFlash-bootstrap-Q8_0.gguf` → `dflash`
 - `G:/More-models/Qwen3.8-27B-DFlash2-Q2_K.gguf` → `dflash`
@@ -126,7 +126,7 @@ sets or MTP shards; this engine uses them beside a target through `--draft` or
 ### Multipart / split / non-model objects that must not be merged with models
 
 - `G:/More-models/dllm/llada/LLaDA2.2-flash-Q4_K_S.gguf` and its two `*.part-*` shards
-  — the parts are unreadable on this box; the assembled file is `diffuse`, refused.
+  : the parts are unreadable on this box. The assembled `diffuse` schema now has an implemented and fixture-tested path; real-file verification remains open.
 - `H:/Models/gguf-exp/imatrix*.gguf` — `general.type` is `imatrix`, not a model.
 - `H:/OLLAMA-Models/GGUF/mmproj-qwen35-9b-f16.gguf` — `clip`, a projector shard, not a model.
 - `H:/OLLAMA-Models/GGUF/mtp-Nemotron-3.5-Lightning-30B-A3B-NVFP4.gguf` — `nemotron_h_moe`
@@ -161,10 +161,10 @@ The code on this checkout has `qwen4exp` in the architecture table
 not in the latest project-local scan. Refresh file inventory to verify them on
 this machine before relying on that file-level result.
 
-The mixed part is documentation: several files in this tree still describe
+The earlier documentation mixed these states. Current support is defined by
 `qwen4exp` as refused or naming-only. The ones seen from this checkout include
-`docs/USER-GUIDE.md`, `docs/REFERENCES.md`, `docs/model-inventory.md`, and
-`docs/perf_trace_report.md`. Those passages were written when the table entry was
+`docs/USER-GUIDE.md`, `docs/REFERENCES.md`, the earlier machine inventory, and
+the earlier performance report. Those passages were written when the table entry was
 in a different state; they are not the loader's verdict and they are not what the
 reachable REAP files return here.
 
@@ -188,21 +188,18 @@ So the local disambiguation rule for `qwen4exp` is:
 - Do not treat the stale "qwen4exp is refused" lines in some docs as the
   disambiguation rule for this checkout.
 
-## Where this is verified from in the tree
+## Where current support is verified
 
-- Architecture rows and flags: `include/krk/arch.hpp`, `src/arch.cpp`
-  (`kTable`, `kGapTensors`, `arch_tensor_gap`).
-- The shallow loader verdict, which is what a sweep should actually use:
-  `src/verdict.cpp` (`assess_model`), `include/krk/verdict.hpp`
-  (`ModelVerdict`, `headline()`).
-- The machine-readable reachable-file verdicts: `tools/kraken_inventory.log`.
-- The human-readable reachable-file table: `docs/model-inventory.md`.
-- The tool that prints the loader's verdict the same way the sweep should read it:
-  `tools/inspect_gguf.cpp` (`kraken-inspect`).
-- The cross-engine note that the same marketing family maps to different engines/
-- The behaviour-level note that the Qwen3.8 names should not be conflated:
-  `docs/ARCHITECTURE.md` §"Qwen3.8 and DeepSeek-V4
-  status: do not conflate variants".
+- Architecture rows and flags: `include/krk/arch.hpp` and `src/arch.cpp`.
+- Loader verdicts: `src/verdict.cpp` and `include/krk/verdict.hpp`.
+- Inspector implementation: `tools/inspect_gguf.cpp`.
+- Current family and evidence matrix: `docs/MODEL-SUPPORT-MATRIX.md`.
+- Historical checkpoint observations: `docs/MODEL-STATUS.md`.
+
+The earlier generated inventory and performance report are not retained. The
+filenames above are historical observations, not a current reachable-file
+inventory. Run `kraken-inspect FILE --quant` on an available checkpoint before
+using a file-level verdict.
 
 ## Future corpus (present in the spec, absent from this checkout)
 

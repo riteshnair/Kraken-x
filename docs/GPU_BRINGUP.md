@@ -142,7 +142,8 @@ Reports prefill tok/s and decode tok/s separately.
 * On `gfx1201` the WMMA builtin **must** use the `_gfx12` suffix, fragments
   are 8 fp16 per lane, and the two lane groups cover different K positions
   interleaved in groups of four. On `gfx11xx` fragments mirror across lane
-  groups instead. See `docs/RESEARCH.md`.
+  groups instead. The implementation guards and fragment layouts are in
+  `src/hip/kernels/gemm.hpp`; validate them on the actual target.
 
 ---
 
@@ -201,12 +202,19 @@ repository (no ROCm, no RDNA card in CI):
 * Tiled online-softmax attention.
 * `dequant_chunk<T>` for every K-quant plane on device.
 
-Structural gaps that are knowingly absent (see `docs/ARCHITECTURE.md`):
+Current boundaries to test during bring-up (see `docs/ARCHITECTURE.md`):
 
-* No split-K attention (poor occupancy on 32-head models at decode).
-* Sampling runs on the host — a 150k-vocab logits download per token.
-* Prefill tile is 32x64; a larger BM would help long prompts on the 9070 XT.
-* No prefix cache, radix tree or paged KV; the engine is single-sequence.
+* Split decode attention exists. Validate its threshold, reduction, and output
+  against the CPU reference on each target.
+* Device candidate selection exists through `Backend::logits_topk`. Exercise
+  both device and host sampler paths and record any fallback.
+* Prefill tile geometry needs target-specific measurement. Do not carry a tuning
+  conclusion from one GFX family to another without a matched run.
+* Held-prefix reuse, quantized and tiered KV, cancellation, and constrained
+  multi-sequence generation exist. A general radix tree and batching with
+  tiered KV remain open.
+* Native execution is still required for every kernel listed above. Their
+  presence in source and passing CPU fixtures do not verify a GPU target.
 
 ---
 
