@@ -126,10 +126,17 @@ fallback.
 
 ### 5. Add paged KV storage and copy-on-write
 
-The current KV storage is contiguous per slot and the fork path copies rows. Add
-fixed-size pages, a per-sequence block table, page ownership/refcounts, and
-copy-on-write when a shared page gets a second writer. This should reduce KV
-reservation/duplication; it does not reduce expert-weight residency directly.
+The engine's active KV storage is still contiguous per slot and the fork path
+still copies rows. A bounded page arena and sequence block-table primitive now
+exist in `include/krk/kv_pages.hpp` / `src/kv_pages.cpp`; the primitive covers
+shared references, write-time COW, truncation/reset, exhaustion, and reuse. It is
+not yet wired into Engine allocation or backend attention, so it does not yet
+reduce runtime KV allocation or fork copies. Treat this as groundwork, not the
+paged-KV feature being complete. The next work is physical page addressing in
+KV append/attention (including the supported quantized formats and backend
+capability refusal), then wiring sequence slot lifecycle and forks through the
+tables. This should reduce KV reservation/duplication; it does not reduce
+expert-weight residency directly.
 
 **Acceptance:** existing batch and prefill exactness tests remain green; add
 page-boundary, allocation-failure, reset/close, slot reuse, and refcount-balance

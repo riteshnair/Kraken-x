@@ -52,6 +52,7 @@ static inline int krk_test_unsetenv(const char *name) { return _putenv_s(name, "
 #include <fstream>
 #include <sstream>
 #include <functional>
+#include <limits>
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -2216,6 +2217,7 @@ static std::string self_path();
 // one the tests exercise.
 //
 #include "krk/kv_tier.hpp"
+#include "krk/kv_pages.hpp"
 
 // A sparse-KV fixture: 4 layers, n_kv_heads = 2, head_dim = 8, ctx = 16.
 // Layers 0 and 3 carry q/k/v; layers 1 and 2 are pure MoE FFN blocks with no
@@ -2477,6 +2479,60 @@ static void test_kv_quant_int8() {
     }
 
     delete cpu;
+}
+
+static void test_kv_page_cow() {
+    KvPagePool pool;
+    CHECK(pool.init(16, 2), "bounded KV page arena initialises");
+    KvBlockTable parent(&pool, 2); // two logical KV rows per page
+    CHECK(!parent.writable_page(std::numeric_limits<size_t>::max()) &&
+              parent.block_count() == 0,
+          "an unrepresentable page index fails without modifying the table");
+    u8 *page = parent.writable_page(0);
+    CHECK(page, "first write allocates the first page");
+    const KvPagePool::PageId parent_page = parent.block(0);
+    CHECK(pool.live_pages() == 1 && pool.ref_count(parent_page) == 1,
+          "an allocated page has exactly one owner");
+    if (page) {
+        page[0] = 0x31;
+        page[8] = 0x42;
+    }
+
+    KvBlockTable child(&pool, 2);
+    CHECK(child.clone_from(parent), "fork clones the block table by retaining pages");
+    CHECK(child.block(0) == parent_page && pool.ref_count(parent_page) == 2,
+          "the fork initially shares the trunk page");
+    page = child.writable_page(1);
+    CHECK(page, "writing a shared partial page detaches it with copy-on-write");
+    const KvPagePool::PageId child_page = child.block(0);
+    CHECK(child_page != parent_page && pool.ref_count(parent_page) == 1 &&
+              pool.ref_count(child_page) == 1,
+          "COW gives the writer a private page and balances references");
+    if (page) page[8] = 0x99;
+    CHECK(pool.data(parent_page)[8] == 0x42 && pool.data(child_page)[8] == 0x99,
+          "a branch write cannot change the parent's KV bytes");
+
+    // The arena is full now: COW has consumed the only free page. Failed page
+    // growth must not append an invalid block or disturb the existing table.
+    CHECK(!child.writable_page(2) && child.block_count() == 1 &&
+              pool.live_pages() == 2,
+          "page exhaustion fails closed without partially extending the table");
+    child.reset();
+    CHECK(pool.live_pages() == 1 && pool.ref_count(parent_page) == 1,
+          "reset releases branch ownership without touching the trunk");
+    CHECK(parent.writable_page(2) && parent.block_count() == 2,
+          "a released page is reusable at the next page boundary");
+    CHECK(parent.truncate(2) && parent.block_count() == 1 && pool.live_pages() == 1,
+          "truncate releases whole pages beyond the retained logical rows");
+    parent.reset();
+    CHECK(pool.live_pages() == 0,
+          "closing the final sequence releases all pages");
+
+    KvBlockTable reused(&pool, 2);
+    CHECK(reused.writable_page(0) && pool.live_pages() == 1,
+          "a closed slot can allocate from the reclaimed page pool");
+    reused.reset();
+    CHECK(pool.live_pages() == 0, "slot reuse leaves no outstanding page references");
 }
 
 static void test_kv_tier_per_layer_widths() {
@@ -34083,6 +34139,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_http_listener_lifetime)
     TEST_GROUP(test_par_pool_covers_every_block)
     TEST_GROUP(test_kv_quant_int8)
+    TEST_GROUP(test_kv_page_cow)
     TEST_GROUP(test_kv_tier_per_layer_widths)
     TEST_GROUP(test_kv_tier_no_kv_layers)
     TEST_GROUP(test_kv_tier_drop_vs_spill)
