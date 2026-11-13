@@ -31680,6 +31680,189 @@ static void test_cli_arg_refusal() {
 #define TEST_GROUP_SERIAL(fn, why) {#fn, fn, why},
 
 // ---------------------------------------------------------------------------
+// B2.3a -- prefill interleaved with decode
+// ---------------------------------------------------------------------------
+//
+// A join used to run the whole prompt before returning, so a long prompt froze
+// every sequence already decoding for its duration: admission and liveness pull
+// in opposite directions, and the wave design resolved that by not admitting.
+// The session prefills one chunk per step instead.
+//
+// With `prefill_chunk = 1` every prompt spans several steps, which is what makes
+// the scheduling visible to a test: after one step the new sequence must still
+// have no token, and the sequence that was already decoding must have advanced
+// by exactly one. A design that drained the prefill first fails the second
+// check; a design that starved the prefill fails the first.
+static void test_batch_prefill_interleave() {
+    Backend *cpu = make_cpu_backend();
+    const std::string path = "kraken-batch-interleave.gguf";
+    MoeSpec s;
+    s.dense = false;
+    s.n_expert = 4;
+    s.n_expert_used = 2;
+    s.shared = true;
+    s.varied = true;
+    CHECK(build_tiny_moe_model(path, s), "wrote a MoE fixture for the interleave test");
+
+    auto open = [&](Engine *engine, i32 chunk, std::string *err) {
+        EngineConfig cfg;
+        cfg.model_path = path;
+        cfg.n_ctx = 32;
+        cfg.prefill_chunk = chunk;
+        cfg.n_slots = 2;
+        return engine->init(cpu, cfg, err);
+    };
+    auto params = [](const char *prompt, i32 max_tokens) {
+        GenerateParams p;
+        p.prompt = prompt;
+        p.max_tokens = max_tokens;
+        p.sampler.greedy = true;
+        p.sampler.temp = 0.0f;
+        p.sample_host = true;
+        return p;
+    };
+    const char *long_prompt = "a a the a";
+    const char *short_prompt = "the a";
+
+    // Solos at both chunk sizes: chunking must not change a single token.
+    std::vector<i32> solo_long, solo_short, solo_long_chunk8;
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 1, &err)) {
+            CHECK(false, "the interleave oracle engine initialises");
+            delete cpu;
+            return;
+        }
+        GenerateParams p = params(long_prompt, 6);
+        GenerateResult r;
+        CHECK(engine.generate(p, &r), "the long prompt runs alone at chunk 1");
+        solo_long = r.tokens;
+        CHECK(r.prompt_tokens >= 3,
+              "the long prompt spans several chunks at chunk 1 (" +
+                  std::to_string(r.prompt_tokens) + " tokens)");
+        p = params(short_prompt, 4);
+        CHECK(engine.generate(p, &r), "the short prompt runs alone at chunk 1");
+        solo_short = r.tokens;
+    }
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 8, &err)) {
+            CHECK(false, "the chunk-8 oracle engine initialises");
+            delete cpu;
+            return;
+        }
+        GenerateParams p = params(long_prompt, 6);
+        GenerateResult r;
+        CHECK(engine.generate(p, &r), "the long prompt runs alone at chunk 8");
+        solo_long_chunk8 = r.tokens;
+        CHECK(solo_long_chunk8 == solo_long,
+              "a prefill chunk size does not change the tokens it produces");
+    }
+
+    // --- decode keeps advancing while another prompt prefills ----------------
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 1, &err)) {
+            CHECK(false, "the interleave engine initialises");
+            delete cpu;
+            return;
+        }
+        std::string why;
+        CHECK(engine.batch_open(&why), std::string("a session opens: ") + why);
+
+        GenerateParams pa = params(long_prompt, 6);
+        GenerateResult ra;
+        CHECK(engine.batch_join(pa, &ra, &why), std::string("A joins: ") + why);
+        // Admission itself does no forward: the prompt is still in the queue of
+        // work, which is what keeps a join cheap.
+        CHECK(ra.generated == 0 && ra.tokens.empty(),
+              "a join tokenizes but does not generate");
+
+        std::vector<i32> finished;
+        int guard = 0;
+        // Drive A alone until it has a first token, i.e. until its prefill is
+        // done -- with nobody decoding, the prompt drains in that one call.
+        while (ra.generated == 0 && guard++ < 32) {
+            finished.clear();
+            CHECK(engine.batch_step(&finished), "A's prefill steps run");
+        }
+        CHECK(ra.generated >= 1, "A reached its first token");
+
+        // B arrives with a prompt that needs several chunks, while A decodes.
+        GenerateParams pb = params(long_prompt, 6);
+        GenerateResult rb;
+        CHECK(engine.batch_join(pb, &rb, &why), std::string("B joins: ") + why);
+        const i32 a_before = ra.generated;
+
+        finished.clear();
+        CHECK(engine.batch_step(&finished), "one step with A decoding and B prefilling");
+        CHECK(ra.generated == a_before + 1,
+              "the decoding sequence advanced by one token");
+        CHECK(rb.generated == 0 && rb.tokens.empty(),
+              "the new prompt got one chunk, not the whole prompt");
+
+        // A second step must do the same: the prefill is not allowed to finish
+        // in one go while a decoder is waiting on it.
+        finished.clear();
+        CHECK(engine.batch_step(&finished), "a second interleaved step");
+        CHECK(ra.generated == a_before + 2, "the decoding sequence advanced again");
+        CHECK(rb.generated == 0,
+              "the joining sequence is still prefilling after two steps");
+
+        guard = 0;
+        while (engine.batch_active() > 0 && guard++ < 64) {
+            finished.clear();
+            CHECK(engine.batch_step(&finished), "the session keeps stepping");
+        }
+        CHECK(engine.batch_active() == 0, "the session drains");
+        CHECK(rb.generated >= 1, "the joining sequence did produce tokens");
+        CHECK(ra.tokens == solo_long,
+              "the interleaved run produced the solo tokens for A");
+        CHECK(rb.tokens == solo_long,
+              "the interleaved run produced the solo tokens for B");
+        engine.batch_close();
+    }
+
+    // --- two prompts prefilling at once do not interleave with each other ---
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 1, &err)) {
+            CHECK(false, "the two-prompt engine initialises");
+            delete cpu;
+            return;
+        }
+        std::string why;
+        CHECK(engine.batch_open(&why), "a session opens for the two-prompt arm");
+        GenerateParams pa = params(long_prompt, 6);
+        GenerateParams pb = params(short_prompt, 4);
+        GenerateResult ra, rb;
+        CHECK(engine.batch_join(pa, &ra, &why), "the first prompt joins");
+        CHECK(engine.batch_join(pb, &rb, &why), "the second prompt joins");
+        // Nothing is decoding, so the first step may drain both prompts: one
+        // arrival must not be delayed by another arrival's prompt.
+        std::vector<i32> finished;
+        CHECK(engine.batch_step(&finished), "one step with two prompts waiting");
+        CHECK(!ra.tokens.empty() && !rb.tokens.empty(),
+              "both prompts produced a token in the first step");
+        int guard = 0;
+        while (engine.batch_active() > 0 && guard++ < 64) {
+            finished.clear();
+            CHECK(engine.batch_step(&finished), "the two-prompt session drains");
+        }
+        CHECK(ra.tokens == solo_long, "the first prompt kept its solo tokens");
+        CHECK(rb.tokens == solo_short, "the second prompt kept its solo tokens");
+        engine.batch_close();
+    }
+
+    std::remove(path.c_str());
+    delete cpu;
+}
+
+// ---------------------------------------------------------------------------
 // B2.3b -- iteration-level admission
 // ---------------------------------------------------------------------------
 //
@@ -32861,6 +33044,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_kv_tier_per_plane_cold_files)
     TEST_GROUP(test_moe_batch_ops)
     TEST_GROUP(test_batch_decode)
+    TEST_GROUP(test_batch_prefill_interleave)
     TEST_GROUP(test_batch_admission)
     TEST_GROUP_SERIAL(test_batch_throughput,
                       "times the machine: four sequences batched vs serial")

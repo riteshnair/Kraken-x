@@ -316,7 +316,11 @@ Available endpoints are `/`, `/health`, `/v1/models`, `/v1/tools/rv32`,
 
 With more than one KV slot it decodes several requests in one pass and admits a
 new request between steps, so a request arriving mid-generation waits for one
-step rather than for the running set to drain. The batch is constrained: the
+step rather than for the running set to drain. The admitted prompt is prefilled
+one `--chunk` slice per step: while anything is decoding, a step spends one
+slice on the waiting prompt and the rest of its time on the decoders, so a long
+prompt costs them one chunk of delay, not one prompt. With nothing decoding, the
+prompt is drained in the same call, because then there is nobody to starve. The batch is constrained: the
 engine refuses models and features whose state is per sequence rather than per
 row, and prefix reuse applies only to the serial path. This is iteration-level
 admission over that constrained batch, not unrestricted continuous batching.

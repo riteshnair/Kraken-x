@@ -244,7 +244,9 @@ response is written, so they cannot provide the same early cancellation signal.
 
 With more than one KV slot the service decodes requests together and admits a
 new one at the next decode step: a request that arrives mid-generation waits for
-one step of the work in progress, not for it to finish. The batch itself remains
+one step of the work in progress, not for it to finish. Its prompt is then
+prefilled a chunk at a time between decode steps, so a long prompt delays the
+sequences already decoding by one chunk rather than by its whole prefill. The batch itself remains
 constrained (the engine refuses shapes it cannot run per row, and prefix reuse is
 serial-mode only), so this is iteration-level admission over a constrained batch,
 not unrestricted continuous batching.

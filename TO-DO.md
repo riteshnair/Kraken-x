@@ -56,8 +56,6 @@ Status labels:
   the number: time to first token for a request arriving mid-generation over
   HTTP, with one slot against several, on a model whose steps are long enough to
   measure.
-- [ ] **Per-slot prefill scheduling** (CODE). Interleave chunked prefill with
-  active decode without starving either class.
 - [ ] **Request cancellation audit** (CODE). Exercise cancellation during
   admission, prefill, decode, speculation, and teardown.
 - [ ] **Radix prefix reuse** (CODE). Reuse shared prefixes shorter than the
@@ -186,7 +184,9 @@ Status labels:
 - Release and full ASan correctness gates are green.
 - Continuous batching, per-row MLA addressing, and HOT/WARM/COLD KV tiers exist.
 - Iteration-level admission exists: a batch session keeps its slots and the
-  server admits a request between decode steps instead of per wave.
+  server admits a request between decode steps instead of per wave. A joined
+  prompt is prefilled one chunk per step while anything is decoding, and drained
+  in one call when nothing is.
 - Do not describe them as missing.
 - Wide CPU reduction is opt-in, not the bit-exact default.
 - Self-draft for speed, default CPU experts, missing-expert zero contribution,

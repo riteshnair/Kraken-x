@@ -318,9 +318,11 @@ void OpenAiService::scheduler_loop() {
                 done_cv_.notify_all();
                 continue;
             }
-            // The prefill runs outside the queue lock: it is the longest thing
-            // this thread does, and holding the lock through it would stop a new
-            // connection from even ENQUEUEING while it runs.
+            // Joining is a tokenization and a slot reservation, so this stays
+            // cheap -- the prompt itself is prefilled inside batch_step, one
+            // chunk per step. The step below runs outside the lock for the same
+            // reason the join does: a connection that arrives during a forward
+            // pass should be able to enqueue for the next boundary.
             lk.unlock();
             std::string why;
             const bool joined_ok = engine_->batch_join(*j->p, j->r, &why);

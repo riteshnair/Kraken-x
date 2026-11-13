@@ -445,15 +445,20 @@ public:
     // sequence's tokens do not depend on who else was in the pass or on when it
     // joined. What changes is only WHEN it is admitted.
     bool batch_open(std::string *err);
-    // Prefill `p` into a free slot and attach it. False, with `err` set, when
-    // the session is not open, no slot is free, or the prompt cannot run; a
-    // prompt-level failure also fills `res` so the caller can report it.
+    // Attach `p` to a free slot: tokenize the prompt, reserve the slot and
+    // return. The prompt itself is prefilled by the following batch_step()
+    // calls, one chunk per step, so admission costs a tokenization rather than
+    // a whole prompt. False, with `err` set, when the session is not open, no
+    // slot is free, or the prompt cannot be tokenized; a prompt-level failure
+    // also fills `res` so the caller can report it.
     bool batch_join(const GenerateParams &p, GenerateResult *res, std::string *err);
-    // One iteration over every attached sequence. The join indices of the
-    // sequences that finished during it are appended to `finished`; the caller
-    // reads them with batch_seq_result(). Returns false only when the forward
-    // pass itself failed, in which case every attached sequence is finished
-    // with that error.
+    // One iteration over every attached sequence: one prefill chunk for a
+    // waiting prompt, then one decode step for every sequence already
+    // generating. The join indices of the sequences that finished during it --
+    // by generation, cancellation, or a failed forward -- are appended to
+    // `finished`; the caller reads them with batch_seq_result(). Returns false
+    // only when the forward pass failed, in which case every attached sequence
+    // is finished with that error.
     bool batch_step(std::vector<i32> *finished);
     i32 batch_active() const;
     i32 batch_free_slots() const;
@@ -836,6 +841,11 @@ private:
     // Finalizes one sequence of the session: closes its stream, decodes its
     // text, records its timings and releases its slot.
     void batch_finalize(i32 index);
+    // One chunk of one sequence's prompt, so a prefill can be interleaved with
+    // other sequences' decode steps instead of blocking them for a whole
+    // prompt. Sets the sequence's first-token logits when it consumes the last
+    // chunk; returns false when the chunk failed or the request was cancelled.
+    bool batch_prefill_slice(i32 index);
 
     // Cooperative cancellation (see GenerateParams::cancel). Read once per
     // prefill chunk and once per generated token; the decode loops stop through
