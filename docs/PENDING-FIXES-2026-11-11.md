@@ -31,7 +31,11 @@ work. It is not a claim that the papers' reported performance has been reproduce
   built-in CPU MoE benchmark at planned 16/24/32 GiB tiers. By default it caps
   the expert pool at one `(layer, expert)` slot, disables eager warmup, WARM
   duplication, and pinning, records process peak RSS with
-  `scripts/measure_peak_rss.py`, and compares greedy output across tiers.
+  `scripts/measure_peak_rss.py`, writes host/cgroup and benchmark-setting
+  metadata, and compares greedy output across tiers. A full model hash is
+  optional (`KRK_BENCH_HASH_MODEL=1`) because it reads the entire checkpoint.
+  Each `--bench` run is one process startup and one request; the separate
+  generation pass is a parity check, not a repeated warm-request measurement.
   `KRK_BENCH_EXPERT_SLOTS=auto` selects the normal automatic slot budget.
 - The driver passed a smoke test on the synthetic tiny-MoE fixture, including
   exact output equality at the three planned tiers. `test_moe_schema_and_laziness`
