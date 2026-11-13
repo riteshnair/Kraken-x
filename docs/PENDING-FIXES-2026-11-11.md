@@ -96,8 +96,12 @@ expert slots is not a system memory limit.
 **Acceptance:** one-slot mode completes without OOM or quality drift; logs show
 resident expert count never exceeds the requested slot cap, peak RSS stays within
 the declared target on the matching host, and generated output is identical
-across cache policies. Report any unsupported memory class plainly rather than
-claiming it fits.
+across cache policies. Where the target requires a hard process/system ceiling,
+run under the OS memory controller with swap disabled, and record cgroup peak,
+swap, and OOM counters as well as process RSS; `--ram-tier` is never presented
+as enforcement. Separate cold-start, first-request/cold-cache, and repeated
+warm-request results. Report unsupported memory classes plainly rather than
+claiming they fit.
 
 ### 4. Preserve and broaden f16 prompt-boundary snapshot validation
 
