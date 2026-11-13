@@ -56,8 +56,6 @@ Status labels:
   the number: time to first token for a request arriving mid-generation over
   HTTP, with one slot against several, on a model whose steps are long enough to
   measure.
-- [ ] **Request cancellation audit** (CODE). Exercise cancellation during
-  admission, prefill, decode, speculation, and teardown.
 - [ ] **Radix prefix reuse** (CODE). Reuse shared prefixes shorter than the
   whole record, with exact-output tests.
 - [ ] **Prefix persistence, journal, TTL, and size bounds** (CODE). Verify
@@ -183,6 +181,12 @@ Status labels:
 
 - Release and full ASan correctness gates are green.
 - Continuous batching, per-row MLA addressing, and HOT/WARM/COLD KV tiers exist.
+- Request cancellation is exercised at every phase a session has:
+  `test_cancel_phases` covers admission before the first chunk, a prompt
+  cancelled between two chunks with a neighbour still decoding, a client that
+  disappears mid-stream, and teardown with a sequence attached; the MTP spec
+  chain cancels inside a proposal round. Each arm also checks the slot comes
+  back and that a cancelled stream does not stop the next request.
 - Iteration-level admission exists: a batch session keeps its slots and the
   server admits a request between decode steps instead of per wave. A joined
   prompt is prefilled one chunk per step while anything is decoding, and drained

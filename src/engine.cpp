@@ -15220,10 +15220,14 @@ bool Engine::cancel_requested(const GenerateParams &p) const {
 void Engine::mark_cancelled(const GenerateParams &p, GenerateResult *res, i64 held) {
     res->cancelled = true;
     res->finish = FinishStop;
-    kv_pos_ = std::max<i64>(0, held);
+    // The cursor is a property of the whole KV cache, so only a serial run owns
+    // it. In a session it is a high-water mark over several sequences with their
+    // own positions, and one sequence stopping must not drag it back under the
+    // rows another sequence is still reading.
+    if (!batch_run_) kv_pos_ = std::max<i64>(0, held);
     p.sink.emit(nullptr, -1, true);
     KRK_DEBUG("run cancelled by the caller after %lld prompt row(s) and %d generated token(s)",
-              static_cast<long long>(kv_pos_), res->generated);
+              static_cast<long long>(held), res->generated);
 }
 
 bool Engine::generate(const GenerateParams &p, GenerateResult *res) {

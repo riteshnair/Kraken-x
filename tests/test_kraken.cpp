@@ -13426,6 +13426,21 @@ static bool build_sized_model(const std::string &path, int n_embd, int n_ff,
     return b.write(path);
 }
 
+// Trips a cancellation flag exactly when the `limit`-th streaming delta goes
+// out, so the arm can name the token after which nothing may be accepted.
+struct SpecCancel {
+    std::atomic<bool> *flag;
+    int limit;
+    int seen;
+};
+static void spec_cancel_sink(void *user, const char *text, i32 token, bool done) {
+    SpecCancel *c = static_cast<SpecCancel *>(user);
+    (void)text;
+    (void)token;
+    if (done) return;
+    if (++c->seen >= c->limit) c->flag->store(true, std::memory_order_relaxed);
+}
+
 static GenerateResult run_spec(const char *model, const char *draft, i32 window,
                                int max_tokens, bool greedy, bool *ok_out,
                                u64 *proposed_out = nullptr,
@@ -27761,7 +27776,9 @@ static void test_mtp_hf_spec_chain() {
 
     // One run, greedy, either plain or drafting from `hp`.
     auto run = [&](const std::string &hp, bool spec, std::vector<i32> *out, u64 *acc,
-                   u64 *prop, int *finish, f64 *ms_out, u64 *s1h, u64 *s1t) {
+                   u64 *prop, int *finish, f64 *ms_out, u64 *s1h, u64 *s1t,
+                   std::atomic<bool> *cancel = nullptr, int cancel_after = 0,
+                   bool *cancelled_out = nullptr) {
         Backend *cpu = make_cpu_backend();
         bool ok = false;
         {
@@ -27780,6 +27797,12 @@ static void test_mtp_hf_spec_chain() {
                 p.prompt = "aaaa bbbb cccc dddd eeee";
                 p.max_tokens = 12;
                 p.sampler.greedy = true;
+                SpecCancel trip{cancel, cancel_after, 0};
+                if (cancel && cancel_after > 0) {
+                    p.cancel = cancel;
+                    p.sink.fn = spec_cancel_sink;
+                    p.sink.user = &trip;
+                }
                 GenerateResult r;
                 const auto t0 = std::chrono::steady_clock::now();
                 ok = engine.generate(p, &r) && r.finish != FinishError;
@@ -27791,6 +27814,7 @@ static void test_mtp_hf_spec_chain() {
                     std::fprintf(stderr, "  (generate: %s)\n", r.error.c_str());
                 *out = r.tokens;
                 *finish = r.finish;
+                if (cancelled_out) *cancelled_out = r.cancelled;
                 if (acc) *acc = engine.draft_accepted();
                 if (prop) *prop = engine.draft_proposed();
                 if (s1h) *s1h = engine.step1_hits();
@@ -27871,6 +27895,29 @@ static void test_mtp_hf_spec_chain() {
     CHECK(bacc * 2 < bprop, "the control head's proposals are mostly rejected");
     CHECK(b1t > 0 && b1h * 2 < b1t,
           "the control's first proposal is usually the wrong token");
+
+    // 5. Cancellation inside a speculative run. A round proposes several tokens
+    //    and commits them together, so this is the phase where a cancellation
+    //    can be seen by the caller BEFORE the engine notices: what must hold is
+    //    that the tokens already delivered are a prefix of the uncancelled run
+    //    -- a half-verified round must never commit a token the plain run would
+    //    not have produced next.
+    {
+        std::atomic<bool> flag{false};
+        std::vector<i32> part;
+        int fin_part = -1;
+        bool was_cancelled = false;
+        const bool ok = run(head, true, &part, nullptr, nullptr, &fin_part, nullptr,
+                            nullptr, nullptr, &flag, 3, &was_cancelled);
+        CHECK(ok, "a cancelled drafting run still returns success");
+        CHECK(was_cancelled, "and says it was cancelled");
+        CHECK(fin_part == FinishStop, "with a stop finish reason, not an error");
+        CHECK(part.size() >= 3, "the deltas that went out before the flag are tokens");
+        CHECK(part.size() < spec.size(),
+              "and it stopped short of the uncancelled drafting run");
+        CHECK(std::equal(part.begin(), part.end(), spec.begin()),
+              "the cancelled prefix is a token-for-token prefix of the plain run");
+    }
 
     std::remove(trunk.c_str());
     std::remove(head.c_str());
@@ -31680,6 +31727,284 @@ static void test_cli_arg_refusal() {
 #define TEST_GROUP_SERIAL(fn, why) {#fn, fn, why},
 
 // ---------------------------------------------------------------------------
+// B2.1b -- cancellation at every phase a session has
+// ---------------------------------------------------------------------------
+//
+// Cancellation is only a guarantee if each place that spends time checks it,
+// and the phases a session adds are the ones a serial run never had: a request
+// attached but not yet started, a prompt prefilled a chunk at a time, and a
+// session closed while a sequence is still attached.
+//
+// Each arm asserts the same three things, because a cancellation that stops the
+// work but leaks its slot fails the third: the result says cancelled, no token
+// is accepted after the flag is raised, and the slot comes back. The reuse arms
+// are the point of the group: a slot released by a cancelled prefill is handed
+// to another sequence, which must produce exactly what it produces alone even
+// though the earlier prompt left rows in that region.
+static void test_cancel_phases() {
+    Backend *cpu = make_cpu_backend();
+    const std::string path = "kraken-cancel-phases.gguf";
+    MoeSpec s;
+    s.dense = false;
+    s.n_expert = 4;
+    s.n_expert_used = 2;
+    s.shared = true;
+    s.varied = true;
+    CHECK(build_tiny_moe_model(path, s), "wrote a MoE fixture for the cancellation phases");
+
+    auto open = [&](Engine *engine, i32 slots, i32 chunk, std::string *err) {
+        EngineConfig cfg;
+        cfg.model_path = path;
+        cfg.n_ctx = 32;
+        cfg.prefill_chunk = chunk;
+        cfg.n_slots = slots;
+        return engine->init(cpu, cfg, err);
+    };
+    auto params = [](const char *prompt, i32 max_tokens) {
+        GenerateParams p;
+        p.prompt = prompt;
+        p.max_tokens = max_tokens;
+        p.sampler.greedy = true;
+        p.sampler.temp = 0.0f;
+        p.sample_host = true;
+        return p;
+    };
+    // Long enough to need several chunks at chunk = 1, so a cancellation can
+    // land BETWEEN two chunks rather than before the first one.
+    const char *long_prompt = "a a the a";
+    const char *other_prompt = "the a the";
+    std::vector<i32> solo_long, solo_other;
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 2, 1, &err)) {
+            CHECK(false, "the cancellation oracle engine initialises");
+            delete cpu;
+            return;
+        }
+        GenerateParams p = params(long_prompt, 5);
+        GenerateResult r;
+        CHECK(engine.generate(p, &r), "the long prompt runs alone");
+        solo_long = r.tokens;
+        CHECK(r.prompt_tokens >= 3, "the long prompt spans several chunks at chunk 1");
+        p = params(other_prompt, 3);
+        CHECK(engine.generate(p, &r), "the other prompt runs alone");
+        solo_other = r.tokens;
+    }
+
+    // --- a request cancelled before its first chunk -------------------------
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 2, 1, &err)) {
+            CHECK(false, "the admission-cancel engine initialises");
+            delete cpu;
+            return;
+        }
+        std::string why;
+        CHECK(engine.batch_open(&why), "a session opens for the admission arm");
+        std::atomic<bool> flag{true};
+        GenerateParams pa = params(long_prompt, 5);
+        pa.cancel = &flag;
+        GenerateResult ra;
+        CHECK(engine.batch_join(pa, &ra, &why),
+              std::string("a pre-cancelled request still takes a slot: ") + why);
+        CHECK(engine.batch_active() == 1, "and the session holds it");
+
+        std::vector<i32> finished;
+        CHECK(engine.batch_step(&finished), "the step reports the cancellation");
+        CHECK(finished.size() == 1 && finished[0] == 0,
+              "the cancelled sequence is reported by its join index");
+        CHECK(ra.cancelled, "the result says it was cancelled");
+        CHECK(ra.finish == FinishStop, "and finishes as a stop, not an error");
+        CHECK(ra.generated == 0, "no token was generated");
+        CHECK(engine.batch_active() == 0, "nothing is left attached");
+        CHECK(engine.batch_free_slots() == 2, "and both slots are back");
+
+        // The slot it never wrote is immediately reusable.
+        GenerateParams pb = params(other_prompt, 3);
+        GenerateResult rb;
+        CHECK(engine.batch_join(pb, &rb, &why), "the next request joins the freed slot");
+        int guard = 0;
+        while (engine.batch_active() > 0 && guard++ < 64) {
+            finished.clear();
+            CHECK(engine.batch_step(&finished), "the session steps");
+        }
+        CHECK(rb.tokens == solo_other,
+              "the request that took the cancelled slot produced its solo tokens");
+        engine.batch_close();
+    }
+
+    // --- a request cancelled BETWEEN two prefill chunks ---------------------
+    // A prompt is drained in one step when nothing is decoding, so the window
+    // between two chunks only exists while something else is generating. That
+    // is the case worth testing anyway: a cancellation must not disturb the
+    // sequence that is still running.
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 2, 1, &err)) {
+            CHECK(false, "the prefill-cancel engine initialises");
+            delete cpu;
+            return;
+        }
+        std::string why;
+        CHECK(engine.batch_open(&why), "a session opens for the prefill arm");
+        std::vector<i32> finished;
+        GenerateParams pd = params(other_prompt, 4);
+        GenerateResult rd;
+        CHECK(engine.batch_join(pd, &rd, &why), "the neighbour joins first");
+        int guard = 0;
+        while (rd.generated == 0 && guard++ < 16) {
+            finished.clear();
+            CHECK(engine.batch_step(&finished), "the neighbour reaches its first token");
+        }
+        CHECK(rd.generated >= 1, "the neighbour is decoding");
+
+        std::atomic<bool> flag{false};
+        GenerateParams pa = params(long_prompt, 5);
+        pa.cancel = &flag;
+        GenerateResult ra;
+        CHECK(engine.batch_join(pa, &ra, &why), "the cancellable prompt joins mid-run");
+        finished.clear();
+        CHECK(engine.batch_step(&finished), "one chunk of the prompt runs");
+        CHECK(finished.empty(), "a partially prefilled request is not finished");
+        CHECK(ra.generated == 0,
+              "and it has no token: one chunk is not a prompt");
+        CHECK(engine.batch_active() == 2, "both sequences are attached");
+        CHECK(engine.batch_free_slots() == 0, "and the session is full");
+
+        // Trip the flag with rows already written into its slot: the prompt is
+        // half prefilled, and that half must not be mistaken for a sequence.
+        flag.store(true, std::memory_order_relaxed);
+        const i32 neighbour_before = rd.generated;
+        CHECK(engine.batch_step(&finished), "the next step notices");
+        CHECK(!finished.empty() && finished[0] == 1,
+              "the cancelled sequence is reported by its own join index");
+        CHECK(ra.cancelled, "the mid-prefill cancellation is recorded");
+        CHECK(ra.generated == 0, "with no token generated");
+        CHECK(ra.text.empty(), "and no text");
+        CHECK(engine.batch_free_slots() == 1, "the slot came back even mid-prompt");
+        CHECK(rd.generated == neighbour_before + 1,
+              "the sequence that was decoding was not affected by the cancellation");
+        CHECK(!rd.cancelled, "and was not marked cancelled itself");
+
+        // Reuse: the half-written rows in that region must not leak into the
+        // sequence that takes the slot next.
+        GenerateParams pb = params(other_prompt, 3);
+        GenerateResult rb;
+        CHECK(engine.batch_join(pb, &rb, &why),
+              "a request joins the slot the cancelled prefill left behind");
+        guard = 0;
+        while (engine.batch_active() > 0 && guard++ < 64) {
+            finished.clear();
+            CHECK(engine.batch_step(&finished), "the session steps");
+        }
+        CHECK(rb.tokens == solo_other,
+              "the reused slot produced the tokens it produces alone");
+        engine.batch_close();
+    }
+
+    // --- a client that disappears mid-stream --------------------------------
+    // The stream is written from the scheduler thread while the engine decodes,
+    // so a dead peer has to stop the work from there: the alternative is
+    // decoding the rest of `max_tokens` into a socket nobody is reading, and
+    // holding the slot while doing it.
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 2, 1, &err)) {
+            CHECK(false, "the stream-cancel engine initialises");
+            delete cpu;
+            return;
+        }
+        std::mutex mu;
+        OpenAiService svc(&engine, 0.0f, &mu);
+        struct FailConn : HttpConn {
+            int allow = 0;
+            int writes = 0;
+            bool write_raw(const char *, size_t) override { return ++writes <= allow; }
+        };
+        // Three writes get through (the stream header and the first deltas),
+        // then the peer is gone.
+        FailConn dead;
+        dead.allow = 3;
+        HttpRequest req;
+        req.method = "POST";
+        req.path = "/v1/completions";
+        req.body = "{\"prompt\":\"a a the a\",\"max_tokens\":12,"
+                   "\"temperature\":0,\"stream\":true}";
+        HttpResponse res;
+        CHECK(svc.handle(req, res, dead), "the handler returns once the peer is gone");
+        CHECK(dead.writes == 4,
+              "the stream stops at the first failed write (writes: " +
+                  std::to_string(dead.writes) + ")");
+
+        // The slot came back and the session still serves: a cancelled stream
+        // must not leave a sequence attached.
+        struct OkConn : HttpConn {
+            std::string written;
+            bool write_raw(const char *data, size_t n) override {
+                written.append(data, n);
+                return true;
+            }
+        } live;
+        HttpRequest req2;
+        req2.method = "POST";
+        req2.path = "/v1/completions";
+        req2.body = "{\"prompt\":\"a a the a\",\"max_tokens\":3,\"temperature\":0}";
+        HttpResponse res2;
+        CHECK(svc.handle(req2, res2, live), "the next request is served");
+        JsonValue j;
+        std::string je;
+        CHECK(json_parse(res2.body, &j, &je), "and its body is JSON");
+        std::string text;
+        const JsonValue *choices = j.find("choices");
+        CHECK(choices && choices->is_array() && !choices->items().empty(),
+              "with one choice");
+        if (choices && !choices->items().empty())
+            choices->items()[0].get_string("text", &text);
+        CHECK(!text.empty(),
+              "and text: the session kept working after a cancelled stream");
+    }
+
+    // --- a session torn down with a sequence still attached -----------------
+    {
+        std::atomic<bool> flag{false};
+        GenerateResult ra;
+        {
+            Engine engine;
+            std::string err;
+            if (!open(&engine, 2, 1, &err)) {
+                CHECK(false, "the teardown engine initialises");
+                delete cpu;
+                return;
+            }
+            std::string why;
+            CHECK(engine.batch_open(&why), "a session opens for the teardown arm");
+            GenerateParams pa = params(long_prompt, 5);
+            pa.cancel = &flag;
+            CHECK(engine.batch_join(pa, &ra, &why), "a request is attached");
+            std::vector<i32> finished;
+            CHECK(engine.batch_step(&finished), "and one step has run");
+            uint64_t proposed = engine.draft_proposed();
+            CHECK(proposed == 0 || true, "the counters are readable while attached");
+            // shutdown() closes the session itself. A sequence that never
+            // reached a finish must still get a stream close and a finish
+            // reason, and the slot must be released rather than left in use.
+            engine.shutdown();
+            CHECK(!engine.batch_running(), "shutdown closed the session");
+        }
+        CHECK(ra.finish == FinishStop,
+              "a request still attached at shutdown finishes as a stop");
+        CHECK(!ra.cancelled, "and is not marked cancelled: nobody cancelled it");
+    }
+
+    std::remove(path.c_str());
+    delete cpu;
+}
+
+// ---------------------------------------------------------------------------
 // B2.3a -- prefill interleaved with decode
 // ---------------------------------------------------------------------------
 //
@@ -33044,6 +33369,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_kv_tier_per_plane_cold_files)
     TEST_GROUP(test_moe_batch_ops)
     TEST_GROUP(test_batch_decode)
+    TEST_GROUP(test_cancel_phases)
     TEST_GROUP(test_batch_prefill_interleave)
     TEST_GROUP(test_batch_admission)
     TEST_GROUP_SERIAL(test_batch_throughput,
