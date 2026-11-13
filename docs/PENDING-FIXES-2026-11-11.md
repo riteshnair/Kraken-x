@@ -34,13 +34,21 @@ work. It is not a claim that the papers' reported performance has been reproduce
   `scripts/measure_peak_rss.py`, writes host/cgroup and benchmark-setting
   metadata, and compares greedy output across tiers. A full model hash is
   optional (`KRK_BENCH_HASH_MODEL=1`) because it reads the entire checkpoint.
-  Each `--bench` run is one process startup and one request; the separate
-  generation pass is a parity check, not a repeated warm-request measurement.
+  `KRK_BENCH_REPEATS` runs multiple requests in one process: a first request
+  followed by repeats. Per-request HOT/WARM hits and COLD reads reveal whether
+  repeats are actually warm; exact token/text/finish parity is required. The
+  separate generation pass checks output across RAM tiers.
   `KRK_BENCH_EXPERT_SLOTS=auto` selects the normal automatic slot budget.
-- The driver passed a smoke test on the synthetic tiny-MoE fixture, including
-  exact output equality at the three planned tiers. `test_moe_schema_and_laziness`
-  passed 45/45 checks, including one-slot residency and equality with a larger
-  cache.
+- The driver passed a repeat-enabled smoke test on the synthetic tiny-MoE
+  fixture: each tier ran one first request plus two same-process repeats, the
+  repeat outputs matched exactly, all three planned tiers matched, and the pool
+  stayed at one resident slot. The fixture emitted only one token before EOG
+  and retained no useful expert hits: each repeat had 0 HOT/WARM hits and 4
+  COLD reads. This validates honest cold-versus-repeat reporting, not a warm-cache
+  speedup; its rate/RSS is not a real-model performance or fit result.
+  `test_moe_schema_and_laziness` passed 45/45 checks, including one-slot
+  residency and equality with a larger cache. `test_cli_arg_refusal` passed
+  129/129 checks including repeat-option validation.
 - **No real 30B-A3B bounded-memory result exists yet.** The sandbox used for the
   smoke test had 3.8 GiB RAM and no 30B checkpoint. Planned `--ram-tier` values
   are policy simulations, not hard OS limits; the engine clamps them to installed

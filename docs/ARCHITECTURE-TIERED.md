@@ -74,9 +74,11 @@ visible. Use a dedicated scope for process-specific cgroup peaks. A simulated
   assuming adjacent experts are physically contiguous.
 - Make cold-start, first-request, and repeated warm-request measurements
   separate. The bounded-MoE script records host/cgroup metadata, model size,
-  settings, and process peak RSS; its `--bench` run is one startup plus one
-  request, and the separate generation pass is only a parity check. It does not
-  yet measure repeated warm requests. Report peak RSS, VRAM peak, swap/OOM,
+  settings, and process peak RSS. With `--bench-repeats`, one startup is followed
+  by a first request and same-process repeats. Per-request HOT/WARM hit and
+  COLD-read counters show whether those repeats are actually warm, and generated
+  tokens must match the first request; a separate generation pass checks parity
+  across RAM tiers. Report peak RSS, VRAM peak, swap/OOM,
   resident slots/bytes, cold bytes/read time, hit/eviction counts, prefill,
   decode, and output parity on the same named model and workload. Never
   transplant another project's token rates or cache sizes.

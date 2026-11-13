@@ -161,6 +161,7 @@ bool kv_quant_explicit = false; // --kv-quant was given, so a refusal is a refus
     bool chat = false;
     bool info = false;
     bool bench = false;
+    int bench_repeats = 1; // first request plus same-process repeats
     bool profile = false;
     bool trace = false;
     std::string trace_path;
@@ -453,6 +454,9 @@ void usage() {
         "                        which is exact and costs O(prompt) host FLOP\n"
         "  --info                print model and device info, then exit\n"
         "  --bench               prefill/decode benchmark on a fixed prompt\n"
+        "  --bench-repeats N     repeat the request in-process; report each tier's\n"
+        "                        cache warmth and require exact output parity\n"
+        "                        requests (1..100, requires --bench; default 1)\n"
         "  --trace [PATH]        Chrome-trace timeline (Perfetto/tracing):\n"
         "                        host functions, backend ops, device spans,\n"
         "                        transfers, syncs and counters. PATH sets\n"
@@ -692,6 +696,7 @@ bool parse(int argc, char **argv, Args *a) {
         else if (f == "--npu-cpu") a->npu_cpu = true;
         else if (f == "--info") a->info = true;
         else if (f == "--bench") a->bench = true;
+        else if (f == "--bench-repeats") a->bench_repeats = next_i("--bench-repeats");
         else if (f == "--profile") a->profile = true;
         else if (f == "--kprof") {
             // Per-COMPONENT device time, ranked, for every backend. --profile
@@ -734,6 +739,14 @@ bool parse(int argc, char **argv, Args *a) {
     }
     if (a->model.empty()) {
         std::fprintf(stderr, "kraken: --model is required\n");
+        return false;
+    }
+    if (a->bench_repeats < 1 || a->bench_repeats > 100) {
+        std::fprintf(stderr, "kraken: --bench-repeats must be in 1..100\n");
+        return false;
+    }
+    if (a->bench_repeats > 1 && !a->bench) {
+        std::fprintf(stderr, "kraken: --bench-repeats greater than 1 requires --bench\n");
         return false;
     }
     return true;
@@ -1465,42 +1478,126 @@ int run_bench(Engine &engine, Backend *be, const Args &a, f64 load_ms,
     // work (Compute 0 / 3D / Copy) instead of leaving it to a profiler.
     EngineUsage usage;
     usage.start();
+    std::printf("\nmodel          %s\n", engine.model().cfg().name.c_str());
+    std::printf("device         %s\n", engine.device().name.c_str());
 
     GenerateResult r;
-    if (!engine.generate(p, &r)) {
-        usage.stop();
-        std::fprintf(stderr, "kraken: benchmark run failed\n");
-        return 1;
+    std::vector<i32> reference_tokens;
+    std::string reference_text;
+    int reference_finish = FinishLength;
+    f64 prefill_sum = 0.0, decode_sum = 0.0;
+    f64 repeat_prefill_sum = 0.0, repeat_decode_sum = 0.0;
+    i64 repeat_prompt_tokens = 0, repeat_decode_tokens = 0;
+    u64 repeat_hot_hits = 0, repeat_warm_hits = 0, repeat_cold_reads = 0;
+    const int repeats = a.bench_repeats;
+    for (int run = 0; run < repeats; ++run) {
+        const ExpertCache &cache_before = engine.model().experts();
+        const u64 hot_before = cache_before.hits();
+        const u64 warm_before = cache_before.warm_hits();
+        const u64 cold_before = cache_before.cold_misses();
+        GenerateResult current;
+        if (!engine.generate(p, &current)) {
+            usage.stop();
+            std::fprintf(stderr, "kraken: benchmark request %d/%d failed\n",
+                         run + 1, repeats);
+            return 1;
+        }
+        const ExpertCache &cache_after = engine.model().experts();
+        const u64 hot_hits = cache_after.hits() - hot_before;
+        const u64 warm_hits = cache_after.warm_hits() - warm_before;
+        const u64 cold_reads = cache_after.cold_misses() - cold_before;
+        const bool spec_run =
+            (engine.has_draft() || engine.mtp_spec_active()) && engine.spec_steps() > 0;
+        const i64 decode_count = spec_run ? current.generated : current.decode_steps;
+        const f64 prefill_tps = current.prompt_tokens > 0 && current.prefill_ms > 0
+                                    ? current.prompt_tokens / (current.prefill_ms / 1000.0)
+                                    : 0;
+        const f64 decode_tps = decode_count > 0 && current.decode_ms > 0
+                                   ? decode_count / (current.decode_ms / 1000.0)
+                                   : 0;
+
+        if (run == 0) {
+            reference_tokens = current.tokens;
+            reference_text = current.text;
+            reference_finish = current.finish;
+            std::printf("prefill        %d tokens in %.1f ms  (%.1f tok/s)\n",
+                        current.prompt_tokens, current.prefill_ms, prefill_tps);
+            std::printf("decode         %d tokens in %.1f ms  (%.1f tok/s)\n",
+                        current.generated, current.decode_ms, decode_tps);
+            std::printf("first cache    HOT hits %llu, WARM hits %llu, COLD reads %llu\n",
+                        static_cast<unsigned long long>(hot_hits),
+                        static_cast<unsigned long long>(warm_hits),
+                        static_cast<unsigned long long>(cold_reads));
+        } else {
+            if (current.tokens != reference_tokens || current.text != reference_text ||
+                current.finish != reference_finish) {
+                size_t at = 0;
+                while (at < current.tokens.size() && at < reference_tokens.size() &&
+                       current.tokens[at] == reference_tokens[at])
+                    ++at;
+                std::fprintf(stderr,
+                             "kraken: benchmark repeated output mismatch at request %d, "
+                             "token %zu (first=%d, repeat=%d; lengths %zu/%zu)\n",
+                             run + 1, at,
+                             at < reference_tokens.size() ? reference_tokens[at] : -1,
+                             at < current.tokens.size() ? current.tokens[at] : -1,
+                             reference_tokens.size(), current.tokens.size());
+                usage.stop();
+                return 1;
+            }
+            std::printf("repeat %d prefill %d tokens in %.1f ms  (%.1f tok/s); "
+                        "decode %d tokens in %.1f ms  (%.1f tok/s); "
+                        "HOT hits %llu, WARM hits %llu, COLD reads %llu\n",
+                        run + 1, current.prompt_tokens, current.prefill_ms, prefill_tps,
+                        current.generated, current.decode_ms, decode_tps,
+                        static_cast<unsigned long long>(hot_hits),
+                        static_cast<unsigned long long>(warm_hits),
+                        static_cast<unsigned long long>(cold_reads));
+            repeat_prefill_sum += current.prefill_ms;
+            repeat_decode_sum += current.decode_ms;
+            repeat_prompt_tokens += current.prompt_tokens;
+            repeat_decode_tokens += decode_count;
+            repeat_hot_hits += hot_hits;
+            repeat_warm_hits += warm_hits;
+            repeat_cold_reads += cold_reads;
+        }
+        prefill_sum += current.prefill_ms;
+        decode_sum += current.decode_ms;
+        r = std::move(current);
     }
     usage.stop();
-    const f64 prefill_tps = r.prompt_tokens > 0 ? r.prompt_tokens / (r.prefill_ms / 1000.0) : 0;
-    const bool spec_run =
-        (engine.has_draft() || engine.mtp_spec_active()) && engine.spec_steps() > 0;
-    const f64 decode_count = spec_run ? r.generated : r.decode_steps;
-    const f64 decode_tps = decode_count > 0
-                               ? decode_count / (r.decode_ms / 1000.0)
-                               : 0;
-    std::printf("\n");
-    std::printf("model          %s\n", engine.model().cfg().name.c_str());
-    std::printf("device         %s\n", engine.device().name.c_str());
-    std::printf("prefill        %d tokens in %.1f ms  (%.1f tok/s)\n", r.prompt_tokens,
-                r.prefill_ms, prefill_tps);
-    std::printf("decode         %d tokens in %.1f ms  (%.1f tok/s)\n", r.generated,
-                r.decode_ms, decode_tps);
+    if (repeats > 1) {
+        const int repeat_runs = repeats - 1;
+        const f64 repeat_prefill_tps = repeat_prefill_sum > 0
+                                           ? repeat_prompt_tokens /
+                                                 (repeat_prefill_sum / 1000.0)
+                                           : 0;
+        const f64 repeat_decode_tps = repeat_decode_sum > 0
+                                          ? repeat_decode_tokens /
+                                                (repeat_decode_sum / 1000.0)
+                                          : 0;
+        std::printf("repeat average %d runs; prefill %.1f tok/s, decode %.1f tok/s; "
+                    "HOT hits %llu, WARM hits %llu, COLD reads %llu; "
+                    "output identical to first request\n",
+                    repeat_runs, repeat_prefill_tps, repeat_decode_tps,
+                    static_cast<unsigned long long>(repeat_hot_hits),
+                    static_cast<unsigned long long>(repeat_warm_hits),
+                    static_cast<unsigned long long>(repeat_cold_reads));
+    }
     // The load phase is a third of start-to-end on every model measured (8B:
     // 1531 ms of load against 2973 ms of decode), and it stays invisible here
     // unless it is printed. Reporting only prefill and decode invites
     // optimising two thirds of the process.
     if (load_ms >= 0) {
-        // start_ms is the uptime before the load began (argument parsing plus
-        // backend creation), so total_ms is start-to-end minus only the tail
-        // after the last decode token. Without this line the report covers two
-        // thirds of the process and the load phase is invisible.
-        const f64 total_ms = start_ms + load_ms + r.prefill_ms + r.decode_ms;
+        // Include every request in the process total. `prefill` and `decode`
+        // above remain the first-request cold-cache measurements; warm repeats
+        // are reported separately and have their own average.
+        const f64 total_ms = start_ms + load_ms + prefill_sum + decode_sum;
         std::printf("startup        %.1f ms  (arg parse + backend create)\n", start_ms);
         std::printf("load           %.1f ms  (%.0f%% of start-to-end)\n", load_ms,
                     total_ms > 0 ? 100.0 * load_ms / total_ms : 0.0);
-        std::printf("total          %.1f ms  (startup + load + prefill + decode)\n", total_ms);
+        std::printf("total          %.1f ms  (startup + load + %d request(s))\n",
+                    total_ms, repeats);
     }
     usage.report(stdout);
     // The bench report says nothing about device memory, but it must not claim
