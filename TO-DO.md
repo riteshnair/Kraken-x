@@ -90,11 +90,13 @@ Status labels:
   and reuse the copied trunk rows; recurrent decode remains serialized per
   sequence. `test_batch_fork` checks these paths against standalone runs,
   including nested and sibling recurrent forks, while preserving the parent's
-  continuation. This is fixture correctness, not a speedup claim. Int8
-  multi-slot sessions are refused at `batch_open`: a direct full-prompt
-  nonzero-slot probe diverged from slot zero (`5 5 5 5` vs `5 5 3 1`). Forks
-  remain gated for all lossy formats; other quantized batch-session modes need
-  per-format solo-output tests before drawing a parity conclusion. Remaining for
+  continuation. This is fixture correctness, not a speedup claim. CPU int8
+  multi-slot decode now matches standalone outputs for four distinct prompts of
+  different lengths. The bug was a missing per-slot base on the CPU int8
+  attention value read; the corresponding key read already used that base.
+  Backends without per-row attention remain refused, and forks remain gated for
+  all lossy formats. Other quantized batch-session modes still need per-format
+  solo-output tests before drawing a parity conclusion. Remaining for
   Flide: KV pages/refcounts/CoW and `(trunk, branch, position)`
   visibility masks. The current API still duplicates KV rows, and state snapshots
   copy data; there is no shared branch stream or measured throughput result. See
