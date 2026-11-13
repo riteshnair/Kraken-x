@@ -222,9 +222,14 @@ Status labels:
 
 ## P2: measurements and observability
 
-- [ ] **Real bounded-memory MoE promise** (FILE and HARDWARE). Run a 30B-A3B
-  class model at 16, 24, and 32 GB RAM. Report throughput, RSS, hot-set hit
-  rate, and cold bytes per token for each budget.
+- [ ] **Real bounded-memory MoE promise** (FILE and HARDWARE). A driver now
+  exists at `scripts/bench_bounded_moe.sh` to run the built-in benchmark under
+  16/24/32 GiB RAM-planning tiers with eager warmup, WARM duplication, and expert
+  pinning disabled; each run retains engine RSS, resident-slot, hit-rate, cold
+  read, and throughput diagnostics. Run it on a named 30B-A3B checkpoint and
+  matching native 16/24/32 GiB hosts. `--ram-tier` alone is a policy simulation,
+  not a hard memory limit. This item stays open until the measured runs and raw
+  logs establish both the memory ceiling and quality/performance trade-offs.
 - [ ] **Matched llama.cpp comparisons** (MEASURE). Match model, hardware,
   prompt, generated length, sampler, and residency.
 - [ ] **Per-format throughput table** (MEASURE). Rotate formats through one
