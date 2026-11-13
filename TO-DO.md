@@ -1,7 +1,8 @@
 # Kraken pending work
 
-Status: 2026-11-11, after the scheduler work: iteration-level admission,
-prefill interleaved with decode, a cancellation audit, and prefix-reuse tests.
+Status: 2026-11-13, after an eight-paper evaluation: the register now carries the
+pages/forks/scoring path the evaluation recommends, and the papers it refuses with
+reasons. See `docs/PAPER-EVALUATION-2026-11.md`.
 
 This is the only pending-work list. Historical plans, audits, campaign logs, and
 transcripts were removed because their claims and line references had become
@@ -62,21 +63,46 @@ Status labels:
   the number: time to first token for a request arriving mid-generation over
   HTTP, with one slot against several, on a model whose steps are long enough to
   measure.
-- [ ] **More than one resident prefix** (CODE, needs the KV tier with batching).
+- [ ] **More than one resident prefix** (CODE, blocked by the two items below).
   The cache is one linear KV region, so the longest prefix that can be resident
   is the last run's; reuse of prefixes SHORTER than that record works and is
   pinned by `test_prefix_partial_reuse` (same prompt, a branch diverging
   mid-prompt, an extension, and nothing shared -- each compared against a cold
-  engine). Reusing two branches at once needs per-sequence page ownership, which
-  is the same work as the KV-tier-with-batching item below, so the two are one
-  job rather than two.
+  engine). Two branches resident at once is not a tree structure but storage plus
+  addressing: KV pages with copy-on-write, and row metadata that names a branch.
+  Those are the next two items; this one closes when both are in.
+- [ ] **KV pages, refcounts, and copy-on-write** (CODE). Replace the contiguous
+  per-slot region (`n_slots` x `kv_cap_` rows, `src/engine.cpp:1226`) with
+  fixed-size pages, a per-sequence block table, and shared pages that are copied
+  only when a second writer appears. Supersedes the "KV tier with batching" item
+  below, which is the same work seen from the tier's side, and is what makes a
+  fork cost pages instead of a region. Gate: bit-identical output on the existing
+  exactness arms (`test_batch_decode`, `test_batch_admission`,
+  `test_prefill_chunk_bitexact`) plus a measured non-regression on the
+  single-sequence path, where one page lookup per block is the cost.
+  See `docs/PAPER-EVALUATION-2026-11.md` section 1 (PagedAttention).
+- [ ] **Exact branch forking** (CODE). Generalise the row metadata from
+  `(slot, position)` to `(trunk, branch, position)` and build the attention mask
+  from it, so sibling branches cannot see each other and each branch is
+  bit-identical to an isolated run; add the two-call recurrent path (trunk
+  segments produce the state, branch segments continue from it by index, no copy).
+  This is the shared primitive behind multi-branch prefix reuse, beam/tree
+  speculation, and the recurrent half of the speculation item below.
+  See `docs/PAPER-EVALUATION-2026-11.md` section 2 (Flide).
+- [ ] **Per-option scoring surface** (CODE). A request that returns the output
+  head normalised over a caller-supplied option set (Flide's Eq. 1), on both the
+  serial and the session path, so a decision model can be served and measured at
+  all. Small next to the two items above, and the consumer that makes them worth
+  building.
 - [ ] **Prefix persistence, journal, TTL, and size bounds** (CODE). Verify
   restart recovery, expiry, corruption handling, and bounded storage.
 - [ ] **KV tier with batching** (CODE). Replace whole-layer, single-sequence
-  paging with per-sequence page ownership. Require tier-forced batch versus
-  solo equality.
+  paging with per-sequence page ownership -- the tier's half of the KV-pages
+  item above. Require tier-forced batch versus solo equality.
 - [ ] **Beam, tree, and sampling speculation** (CODE). Specify accepted-token
-  and sampler contracts before implementation.
+  and sampler contracts before implementation. A candidate tree is the branch
+  mask of the forking item above, so the contract work starts from that
+  primitive rather than from a new mechanism.
 
 ## P1: model and generation capabilities
 
@@ -140,6 +166,30 @@ Status labels:
   and the cache size for one real file from one recorded trace, then check the
   prediction against a live run. The tuner exists
   (`scripts/moe_cache_tune.py`); what is unverified is its prediction error.
+- [ ] **Incremental expert stack** (CODE). Keep the previous step's per-expert
+  views and pin stack and rewrite only the slots whose expert changed, instead
+  of rebuilding the stack every step. Output cannot change, so the gate is
+  bit-identical tokens plus a measured step-time difference with the existing
+  host-phase profile. See `docs/PAPER-EVALUATION-2026-11.md` section 3 (Edge0,
+  the assembly tax).
+- [ ] **Unmerged adapter delta** (CODE). Serve `y = W(x) + (alpha/r) * B A x`
+  from a sidecar with the quantised base untouched. Merging an adapter into a
+  group-quantised base and re-quantising erases most of it, because the delta is
+  smaller than the group step -- the same arithmetic the paper reports, and the
+  same reason it would be lost here. Independent of the paper: it is what makes
+  any adapter servable at all.
+- [ ] **Trained routing predictor, staging only** (FILE). A learned per-layer
+  next-layer predictor as a prefetch signal, with the existing contract (a wrong
+  guess is a wasted read, never a different output) and the existing evidence
+  (candidate precision plus bit-identical tokens). Needs a training artifact this
+  repository does not have. Prediction-as-routing is deliberately refused -- see
+  the rejected section.
+- [ ] **Value amortisation for the KV cache** (CODE, experimental, needs a named
+  checkpoint). Per-head key-to-value map fitted during prefill with residuals for
+  the worst-reconstructed tokens, keys unchanged, opt-in only. Evidence required:
+  reconstruction error at a fixed ratio, then greedy-text agreement against the
+  uncompressed run, then throughput. Compression ratio alone is not evidence.
+  See `docs/PAPER-EVALUATION-2026-11.md` section 4 (LowRAM).
 - [ ] **Multi-device expert residency** (CODE and HARDWARE). The cache is one
   pool on one device; a per-GPU split (as llama.cpp's `--moe-cache-mib` does)
   would need tensor-sharded multi-device model loading first, which this engine
@@ -173,6 +223,10 @@ Status labels:
   not prove that an example runs.
 - [ ] **Current real-model inventory** (FILE). Record available checkpoints and
   new reference runs without reviving deleted filename-based support claims.
+- [ ] **Decision-model benchmark** (FILE). MMDM-style option scoring, parked
+  behind two preconditions: the per-option scoring surface in P1 and a named
+  decision checkpoint with reference outputs. Until both exist the benchmark
+  would only measure other engines.
 - [ ] **Historical measurement provenance** (MEASURE). Replace tables that lack
   raw evidence with new controlled runs when the required model and hardware are
   available. Keep the old values explicitly historical.
@@ -204,6 +258,15 @@ Status labels:
   prompt is prefilled one chunk per step while anything is decoding, and drained
   in one call when nothing is.
 - Do not describe them as missing.
+- Prediction-as-routing is refused (Edge0): replacing the model's router makes
+  the checkpoint's own routing no longer what runs, and the quality payment for
+  it is training we do not do. Staging-only prediction is the accepted form.
+- Weight repair by discrete optimisation is refused (Tree-Ising): the deliverable
+  is a modified checkpoint, which is outside an inference engine's scope and
+  would violate the read-only rule for weights.
+- Agent-side sparse reading (SparseRead) and offline EMA k-means (e-means) have
+  no engine surface: recorded in `docs/PAPER-EVALUATION-2026-11.md`, not work
+  items.
 - Wide CPU reduction is opt-in, not the bit-exact default.
 - Self-draft for speed, default CPU experts, missing-expert zero contribution,
   historical-rank seeding, and previously rejected kernel repacks remain closed

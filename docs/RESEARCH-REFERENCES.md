@@ -1,6 +1,8 @@
 # Research references, with what this repo has measured about each
 
-This is a historical research and measurement note. Its implementation statements
+For the eight papers evaluated in November 2026 and what this repository decided
+to take from each, see [Paper evaluation](PAPER-EVALUATION-2026-11.md). This file
+remains a historical research and measurement note. Its implementation statements
 are snapshots, not the current support matrix. Use
 [Model support](MODEL-SUPPORT-MATRIX.md) and [TO-DO.md](../TO-DO.md) for current
 capability and pending work.
