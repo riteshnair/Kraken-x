@@ -19,6 +19,8 @@
 #include "par_pool.hpp"
 
 #include <ctime>
+#include <new>
+#include <stdexcept>
 
 #if defined(_WIN32)
 // A hard ceiling on this process's working set. The host policy plans in bytes,
@@ -733,6 +735,7 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     krk::HostTime::set_phase(krk::HostTime::kLoad);
     be_ = be;
     cfg_ = cfg;
+    kv_paged_ = cfg.kv_paged;
     // The activation-range counters are process-wide device state; zero them so
     // the line this run prints describes this run.
     be_->reset_activation_saturation();
@@ -1223,6 +1226,30 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     kv_cap_ = std::min<i64>(cfg_.n_ctx > 0 ? cfg_.n_ctx : mc.n_ctx_train,
                             mc.n_ctx_train > 0 ? mc.n_ctx_train : 32768);
     if (kv_cap_ <= 0) kv_cap_ = 2048;
+    if (kv_paged_) {
+        if (!be_->attn_paged_kv_supported()) {
+            if (err) *err = "paged KV requested, but this backend does not support page tables";
+            shutdown();
+            return false;
+        }
+        if (mc.diffusion || mc.mla || mc.msa || mc.qsa || mc.dsv4 ||
+            model_.is_recurrent() || model_.mtp().dspark ||
+            !comp_nblocks_.empty()) {
+            if (err) *err = "paged KV currently supports ordinary dense causal-attention models only";
+            shutdown();
+            return false;
+        }
+        for (i32 l = 0; l < mc.n_layer; ++l) {
+            if (!model_.layer_writes_kv(l) || model_.kv_source_layer(l) != l ||
+                model_.is_swa(l)) {
+                if (err) *err = "paged KV refuses shared, recurrent, sliding-window, or selected-attention layers";
+                shutdown();
+                return false;
+            }
+        }
+        kv_page_rows_ = 16;
+        kv_page_table_stride_ = (kv_cap_ + kv_page_rows_ - 1) / kv_page_rows_;
+    }
     // Slots are sequences served concurrently, each with its own KV region of
     // kv_cap_ rows. 1 is the historical engine and changes nothing: every plane
     // is sized for one context and every address is what it always was.
@@ -2536,6 +2563,53 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
             kv_len[static_cast<size_t>(mc.n_layer)] = b;
             kv_plane += b;
         }
+        if (kv_paged_) {
+            try {
+                const size_t blocks = static_cast<size_t>(kv_page_table_stride_);
+                const size_t page_capacity = static_cast<size_t>(n_slots_) * (blocks + 1u);
+                kv_page_k_.resize(static_cast<size_t>(mc.n_layer));
+                kv_page_v_.resize(static_cast<size_t>(mc.n_layer));
+                serial_page_k_.resize(static_cast<size_t>(mc.n_layer));
+                serial_page_v_.resize(static_cast<size_t>(mc.n_layer));
+                for (i32 l = 0; l < mc.n_layer; ++l) {
+                    if (!model_.layer_writes_kv(l)) continue;
+                    const size_t row = be_->kv_row_bytes(model_.kv_dim_at(l), kvq,
+                                                         model_.head_dim_at(l));
+                    if (row > SIZE_MAX / static_cast<size_t>(kv_page_rows_)) {
+                        if (err) *err = "paged KV page geometry overflows size_t";
+                        shutdown();
+                        return false;
+                    }
+                    const size_t page_bytes = row * static_cast<size_t>(kv_page_rows_);
+                    for (int plane = 0; plane < 2; ++plane) {
+                        auto pool = std::unique_ptr<KvPagePool>(new KvPagePool());
+                        if (!pool->init(page_bytes, page_capacity)) {
+                            if (err) *err = "could not initialize bounded paged-KV arena";
+                            shutdown();
+                            return false;
+                        }
+                        if (plane == 0) kv_page_k_[static_cast<size_t>(l)] = std::move(pool);
+                        else kv_page_v_[static_cast<size_t>(l)] = std::move(pool);
+                    }
+                    if (!serial_page_k_[static_cast<size_t>(l)].bind(
+                            kv_page_k_[static_cast<size_t>(l)].get(), kv_page_rows_) ||
+                        !serial_page_v_[static_cast<size_t>(l)].bind(
+                            kv_page_v_[static_cast<size_t>(l)].get(), kv_page_rows_)) {
+                        if (err) *err = "could not bind serial paged-KV block tables";
+                        shutdown();
+                        return false;
+                    }
+                }
+            } catch (const std::bad_alloc &) {
+                if (err) *err = "paged KV metadata allocation failed";
+                shutdown();
+                return false;
+            } catch (const std::length_error &) {
+                if (err) *err = "paged KV metadata size is not representable";
+                shutdown();
+                return false;
+            }
+        }
         const size_t kv_total = kv_plane * 2u;
         kv_load_bytes = kv_total;
         kv_bytes_ = kv_total;
@@ -2602,7 +2676,8 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         // The plane tag is not decoration: both caches share one cold
         // directory, so without it they spill to the same file name and a
         // restore returns the other plane's KV.
-        if (!kvt_k_.init(be_, mc.n_layer + mtp_kv, kv_len, hot / 2u, warm / 2u,
+        if (!kv_paged_ &&
+            !kvt_k_.init(be_, mc.n_layer + mtp_kv, kv_len, hot / 2u, warm / 2u,
                          cfg_.kv_cold_dir, "k", err)) {
             shutdown();
             return false;
@@ -2622,7 +2697,8 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
             shutdown();
             return false;
         }
-        if (!kvt_v_.init(be_, mc.n_layer + mtp_kv, kv_len, hot / 2u, warm / 2u,
+        if (!kv_paged_ &&
+            !kvt_v_.init(be_, mc.n_layer + mtp_kv, kv_len, hot / 2u, warm / 2u,
                          cfg_.kv_cold_dir, "v", err)) {
             shutdown();
             return false;
@@ -2712,7 +2788,9 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         }
         KvTierStats ks;
         kvt_k_.stats(&ks);
-        kv_tiered_ = ks.tiered;
+        kv_tiered_ = kv_paged_ ? false : ks.tiered;
+        if (kv_paged_)
+            KRK_INFO("paged KV: bounded CPU page pools are active; contiguous KV tiers are not allocated");
     }
     if (model_.is_recurrent()) {
         recurrent_reset();
@@ -2747,6 +2825,9 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
                      static_cast<long long>(kvt_k_.warm_slots()),
                      static_cast<double>(ks.layer_bytes) / 1048576.0,
                      static_cast<double>(ks.hot_bytes) / 1048576.0);
+        else if (kv_paged_)
+            KRK_INFO("workspaces ready: chunk=%d ctx=%lld with paged KV (lazy page payloads; load %.0f ms)",
+                     chunk_, static_cast<long long>(kv_cap_), load_ms);
         else
             KRK_INFO("workspaces ready: chunk=%d ctx=%lld KV=%.0f MiB (load %.0f ms)",
                      chunk_, static_cast<long long>(kv_cap_), total_vram_mb, load_ms);
@@ -2921,6 +3002,12 @@ void Engine::shutdown() {
     // stack. Closing it here is what keeps a shutdown from leaving the slot
     // table pointing at freed sequences.
     batch_close();
+    for (KvBlockTable &t : serial_page_k_) t.reset();
+    for (KvBlockTable &t : serial_page_v_) t.reset();
+    serial_page_k_.clear();
+    serial_page_v_.clear();
+    kv_page_k_.clear();
+    kv_page_v_.clear();
     // The dump's end marker, before anything else: a run that ends by crashing
     // in a later teardown still leaves the line that says it produced N rows.
     dump_close();
@@ -4570,6 +4657,7 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         for (i32 i = 0; i < n; i++) ple_seq_[pos0 + i] = toks[i];
     }
 
+    std::vector<void *> row_k_pages, row_v_pages;
     for (i32 l = 0; l < mc.n_layer; l++) {
         // Refill the streaming ring for this layer when it is not resident.
         // A resident layer is a no-op, and the copy is ordered on the default
@@ -4909,14 +4997,27 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         if (mc.diffusion) {
             kbase = ws_k_;
             vbase = ws_v_;
+        } else if (kv_paged_) {
+            if (!prepare_page_rows(l, n, pos0, &row_k_pages, &row_v_pages))
+                return false;
+            kbase = nullptr;
+            vbase = nullptr;
+            d.row_k_pages = row_k_pages.data();
+            d.row_v_pages = row_v_pages.data();
+            d.page_rows = kv_page_rows_;
+            d.page_table_stride = kv_page_table_stride_;
         } else {
             kbase = kvt_k_.base(kv_src);
             vbase = kvt_v_.base(kv_src);
+            d.row_k_pages = nullptr;
+            d.row_v_pages = nullptr;
+            d.page_rows = 0;
+            d.page_table_stride = 0;
         }
         // A model may have no KV on this layer; only a missing pointer for a
         // KV-carrying layer is a resource refusal. Do not turn a valid null pair
         // on recurrent/pure-FFN blocks into a request failure.
-        if (model_.layer_has_kv(l) && (!kbase || !vbase)) {
+        if (!kv_paged_ && model_.layer_has_kv(l) && (!kbase || !vbase)) {
             KRK_ERROR("kv: no resident slot for layer %lld (host reserve %lld MiB "
                       "refused %lld KV promotion(s)); refusing the forward rather "
                       "than replacing retained cache history with zeros",
@@ -4951,7 +5052,7 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // has to run before the cache and the fused chain carries neither, so
         // those shapes take the separate chain. It is the same arithmetic with
         // one extra launch per such layer.
-        if (!(!fwd_row_slot_ && n == 1 && !packed_gate && d.window == 0 &&
+        if (kv_paged_ || !(!fwd_row_slot_ && n == 1 && !packed_gate && d.window == 0 &&
               !mc.attn_gate &&
               !qsa_sel && kv_src == l && !mc.v_norm_weightless &&
               (fused_neox || !(mc.rope_neox && mc.qk_norm)) &&
@@ -5043,7 +5144,7 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
         // A batched row's cache offset is its own, not pos0's, so these two
         // dumps are skipped there rather than reading whichever row the scalar
         // origin happens to name.
-        if (!fwd_row_slot_) {
+        if (!fwd_row_slot_ && !kv_paged_) {
             dump_row("attn.kc", l,
                      static_cast<const u8 *>(kbase) +
                          pos0 * d.pos_stride * be_->act_size(),
@@ -6785,6 +6886,10 @@ bool Engine::diffuse_forward(const i32 *toks, i32 n, i32 pos0, f32 *logits) {
 }
 
 bool Engine::forward(const i32 *toks, i32 n, i32 pos0, bool want_logits) {
+    if (kv_paged_ && !batch_run_ && pos0 == 0) {
+        for (KvBlockTable &t : serial_page_k_) t.reset();
+        for (KvBlockTable &t : serial_page_v_) t.reset();
+    }
     KRK_TRACE_COMP(n > 1 ? "prefill-forward" : "decode-forward");
     if (!forward_core(toks, n, pos0, want_logits ? LogitsLast : LogitsNone))
         return false;
@@ -6883,6 +6988,13 @@ bool Engine::kv_rollback(i64 pos) {
 }
 
 bool Engine::kv_rollback_zero(i64 pos) {
+    if (kv_paged_) {
+        for (KvBlockTable &t : serial_page_k_)
+            if (t.pool() && !t.truncate(static_cast<size_t>(pos))) return false;
+        for (KvBlockTable &t : serial_page_v_)
+            if (t.pool() && !t.truncate(static_cast<size_t>(pos))) return false;
+        return true;
+    }
     // Resolve every layer in both planes before mutating any retained bytes.
     // Otherwise K can be zeroed successfully and V can then refuse promotion,
     // leaving the cache half-rolled-back while kv_pos_ still advertises the
@@ -15807,6 +15919,7 @@ struct Engine::BatchRun {
         std::unique_ptr<TokenEmitter> emit;
         i64 pos = 0;               // next position to append
         i32 slot = -1;
+        std::vector<KvBlockTable> page_k, page_v;
         i32 pending = -1;          // token to feed on the next step
         bool active = false;
         // The prompt is still being prefilled: the sequence holds a slot and an
@@ -15843,6 +15956,7 @@ struct Engine::BatchRun {
     // sampler. The pointer also makes "the address never changes" explicit.
     std::vector<std::unique_ptr<Seq>> seqs;
     std::vector<bool> slot_used;
+    std::vector<i32> slot_seq; // current Seq index for each occupied KV slot
     // The row tables one forward pass reads. Kept here, not on the caller's
     // stack, because a step is now a call of its own.
     std::vector<i32> row_slot;
@@ -15850,6 +15964,79 @@ struct Engine::BatchRun {
     std::vector<i32> tokens;
     std::vector<i32> samples;
 };
+
+bool Engine::prepare_page_rows(i32 layer, i32 n, i32 pos0,
+                               std::vector<void *> *kpages,
+                               std::vector<void *> *vpages) {
+    if (!kv_paged_ || !kpages || !vpages || layer < 0 ||
+        static_cast<size_t>(layer) >= kv_page_k_.size() ||
+        !kv_page_k_[static_cast<size_t>(layer)] ||
+        !kv_page_v_[static_cast<size_t>(layer)]) {
+        forward_error_ = "paged KV has no physical pool for this attention layer";
+        return false;
+    }
+    const size_t stride = static_cast<size_t>(kv_page_table_stride_);
+    try {
+        kpages->assign(static_cast<size_t>(n) * stride, nullptr);
+        vpages->assign(static_cast<size_t>(n) * stride, nullptr);
+    } catch (const std::bad_alloc &) {
+        forward_error_ = "paged KV row-table allocation failed";
+        return false;
+    } catch (const std::length_error &) {
+        forward_error_ = "paged KV row-table size is not representable";
+        return false;
+    }
+    for (i32 t = 0; t < n; ++t) {
+        KvBlockTable *kt = nullptr;
+        KvBlockTable *vt = nullptr;
+        if (fwd_row_slot_) {
+            if (!batch_run_ || fwd_row_slot_[t] < 0 ||
+                static_cast<size_t>(fwd_row_slot_[t]) >= batch_run_->slot_seq.size()) {
+                forward_error_ = "paged KV row refers to an invalid batch slot";
+                return false;
+            }
+            const i32 si = batch_run_->slot_seq[static_cast<size_t>(fwd_row_slot_[t])];
+            if (si < 0 || static_cast<size_t>(si) >= batch_run_->seqs.size()) {
+                forward_error_ = "paged KV batch slot has no live sequence";
+                return false;
+            }
+            BatchRun::Seq &s = *batch_run_->seqs[static_cast<size_t>(si)];
+            if (static_cast<size_t>(layer) >= s.page_k.size() ||
+                static_cast<size_t>(layer) >= s.page_v.size()) {
+                forward_error_ = "paged KV sequence tables do not cover this layer";
+                return false;
+            }
+            kt = &s.page_k[static_cast<size_t>(layer)];
+            vt = &s.page_v[static_cast<size_t>(layer)];
+        } else {
+            if (static_cast<size_t>(layer) >= serial_page_k_.size() ||
+                static_cast<size_t>(layer) >= serial_page_v_.size()) {
+                forward_error_ = "paged KV serial tables do not cover this layer";
+                return false;
+            }
+            kt = &serial_page_k_[static_cast<size_t>(layer)];
+            vt = &serial_page_v_[static_cast<size_t>(layer)];
+        }
+        const i64 pos = fwd_row_pos_ ? fwd_row_pos_[t] :
+                                      static_cast<i64>(pos0) + t;
+        if (pos < 0 || pos >= kv_cap_ ||
+            !kt->writable_page(static_cast<size_t>(pos)) ||
+            !vt->writable_page(static_cast<size_t>(pos))) {
+            forward_error_ = "paged KV page allocation failed or position is out of range";
+            return false;
+        }
+        for (size_t b = 0; b < stride; ++b) {
+            const auto kid = kt->block(b);
+            const auto vid = vt->block(b);
+            (*kpages)[static_cast<size_t>(t) * stride + b] =
+                const_cast<u8 *>(kv_page_k_[static_cast<size_t>(layer)]->data(kid));
+            (*vpages)[static_cast<size_t>(t) * stride + b] =
+                const_cast<u8 *>(kv_page_v_[static_cast<size_t>(layer)]->data(vid));
+        }
+    }
+    return true;
+}
+
 
 bool Engine::batch_open(std::string *err) {
     if (batch_run_) batch_close();
@@ -15868,6 +16055,10 @@ bool Engine::batch_open(std::string *err) {
     }
     // A session starts a new set of sequences: the same reset every
     // single-sequence run does, because the rows below are about to be rewritten.
+    if (kv_paged_) {
+        for (KvBlockTable &t : serial_page_k_) t.reset();
+        for (KvBlockTable &t : serial_page_v_) t.reset();
+    }
     kv_pos_ = 0;
     mtp_fed_ = 0;
     if (trace_hash_on_) trace_stage_.clear();
@@ -15876,6 +16067,7 @@ bool Engine::batch_open(std::string *err) {
     moe_predict_ids_.clear();
     batch_run_ = new BatchRun();
     batch_run_->slot_used.assign(static_cast<size_t>(n_slots_), false);
+    batch_run_->slot_seq.assign(static_cast<size_t>(n_slots_), -1);
     return true;
 }
 
@@ -15906,6 +16098,28 @@ bool Engine::batch_join(const GenerateParams &p, GenerateResult *res,
     s.p = &p;
     s.res = res;
     s.slot = slot;
+    if (kv_paged_) {
+        try {
+            s.page_k.resize(static_cast<size_t>(model_.cfg().n_layer));
+            s.page_v.resize(static_cast<size_t>(model_.cfg().n_layer));
+        } catch (const std::bad_alloc &) {
+            if (err) *err = "sequence paged-KV table allocation failed";
+            return false;
+        } catch (const std::length_error &) {
+            if (err) *err = "sequence paged-KV table size is not representable";
+            return false;
+        }
+        for (i32 l = 0; l < model_.cfg().n_layer; ++l) {
+            if (!model_.layer_writes_kv(l)) continue;
+            if (!s.page_k[static_cast<size_t>(l)].bind(
+                    kv_page_k_[static_cast<size_t>(l)].get(), kv_page_rows_) ||
+                !s.page_v[static_cast<size_t>(l)].bind(
+                    kv_page_v_[static_cast<size_t>(l)].get(), kv_page_rows_)) {
+                if (err) *err = "could not bind sequence paged-KV tables";
+                return false;
+            }
+        }
+    }
     compressed_reset_slot(slot);
     recurrent_reset_slot(slot);
     if (tokenize_prompt(p.prompt, s.ids) < 0) {
@@ -15944,6 +16158,8 @@ bool Engine::batch_join(const GenerateParams &p, GenerateResult *res,
     s.decode_t0 = std::chrono::steady_clock::now();
     batch_run_->slot_used[static_cast<size_t>(slot)] = true;
     batch_run_->seqs.push_back(std::move(owned));
+    batch_run_->slot_seq[static_cast<size_t>(slot)] =
+        static_cast<i32>(batch_run_->seqs.size() - 1);
     return true;
 }
 
@@ -16227,9 +16443,36 @@ bool Engine::batch_fork(i32 index, const std::vector<GenerateParams> &branches,
         if (!batch_run_->slot_used[static_cast<size_t>(i)]) fork_slots.push_back(i);
     if (static_cast<i32>(fork_slots.size()) != need)
         return fail_all("the free KV slot count changed while preparing the fork");
+    std::vector<std::vector<KvBlockTable>> fork_page_k, fork_page_v;
+    if (kv_paged_) {
+        try {
+            fork_page_k.resize(branches.size());
+            fork_page_v.resize(branches.size());
+            for (size_t b = 0; b < branches.size(); ++b) {
+                fork_page_k[b].resize(static_cast<size_t>(model_.cfg().n_layer));
+                fork_page_v[b].resize(static_cast<size_t>(model_.cfg().n_layer));
+                for (i32 l = 0; l < model_.cfg().n_layer; ++l) {
+                    if (!model_.layer_writes_kv(l)) continue;
+                    KvBlockTable &dk = fork_page_k[b][static_cast<size_t>(l)];
+                    KvBlockTable &dv = fork_page_v[b][static_cast<size_t>(l)];
+                    const KvBlockTable &sk = parent.page_k[static_cast<size_t>(l)];
+                    const KvBlockTable &sv = parent.page_v[static_cast<size_t>(l)];
+                    if (!dk.bind(kv_page_k_[static_cast<size_t>(l)].get(), kv_page_rows_) ||
+                        !dv.bind(kv_page_v_[static_cast<size_t>(l)].get(), kv_page_rows_) ||
+                        !dk.clone_prefix_from(sk, static_cast<size_t>(base)) ||
+                        !dv.clone_prefix_from(sv, static_cast<size_t>(base)))
+                        return fail_all("the paged-KV trunk could not be cloned for every branch");
+                }
+            }
+        } catch (const std::bad_alloc &) {
+            return fail_all("paged-KV fork table allocation failed");
+        } catch (const std::length_error &) {
+            return fail_all("paged-KV fork table size is not representable");
+        }
+    }
     if (reuse_trunk) {
         for (i32 slot : fork_slots) {
-            if (!batch_copy_slot_rows(parent.slot, slot, base))
+            if (!kv_paged_ && !batch_copy_slot_rows(parent.slot, slot, base))
                 return fail_all("the trunk's KV rows could not be copied into every branch slot");
         }
     }
@@ -16243,6 +16486,10 @@ bool Engine::batch_fork(i32 index, const std::vector<GenerateParams> &branches,
         s.p = &p;
         s.res = &res;
         s.slot = slot;
+        if (kv_paged_) {
+            s.page_k = std::move(fork_page_k[b]);
+            s.page_v = std::move(fork_page_v[b]);
+        }
         // The history is the trunk the branch inherited plus its own prompt, so
         // the sampler's repetition window sees exactly what the model read --
         // the same thing an isolated run of the concatenation would see.
@@ -16317,6 +16564,8 @@ bool Engine::batch_fork(i32 index, const std::vector<GenerateParams> &branches,
         s.decode_t0 = std::chrono::steady_clock::now();
         batch_run_->slot_used[static_cast<size_t>(slot)] = true;
         batch_run_->seqs.push_back(std::move(owned));
+        batch_run_->slot_seq[static_cast<size_t>(slot)] =
+            static_cast<i32>(batch_run_->seqs.size() - 1);
     }
     if (model_.is_recurrent() && needs_prompt_state) be_->sync();
     KRK_DEBUG("fork of sequence %d: %zu branch(es) from %lld trunk row(s)",
@@ -16346,7 +16595,13 @@ void Engine::batch_finalize(i32 index) {
         KRK_DEBUG("slot %d: %d prompt + %d generated token(s), %lld batched step(s)",
                   static_cast<int>(s.slot), s.res->prompt_tokens, s.res->generated,
                   static_cast<long long>(s.steps));
+    if (kv_paged_) {
+        for (KvBlockTable &t : s.page_k) t.reset();
+        for (KvBlockTable &t : s.page_v) t.reset();
+    }
     batch_run_->slot_used[static_cast<size_t>(s.slot)] = false;
+    if (static_cast<size_t>(s.slot) < batch_run_->slot_seq.size())
+        batch_run_->slot_seq[static_cast<size_t>(s.slot)] = -1;
     s.done = true;
     s.active = false;
 }

@@ -16,7 +16,7 @@ bool KvPagePool::init(size_t page_bytes, size_t page_capacity) {
         (page_capacity && page_bytes > std::numeric_limits<size_t>::max() / page_capacity))
         return false;
     try {
-        std::vector<std::vector<u8>> pages(page_capacity);
+        std::vector<std::unique_ptr<u8[]>> pages(page_capacity);
         std::vector<u32> refs(page_capacity, 0);
         std::vector<PageId> free;
         free.reserve(page_capacity);
@@ -52,18 +52,14 @@ bool KvPagePool::valid(PageId id) const {
 bool KvPagePool::allocate(PageId *out) {
     if (!out || free_.empty() || page_bytes_ == 0) return false;
     const PageId id = free_.back();
-    std::vector<u8> &page = pages_[id];
-    if (page.empty()) {
-        try {
-            page.resize(page_bytes_, 0);
-        } catch (const std::bad_alloc &) {
-            return false;
-        } catch (const std::length_error &) {
-            return false;
-        }
+    if (!pages_[id]) {
+        std::unique_ptr<u8[]> page(new (std::nothrow) u8[page_bytes_]);
+        if (!page) return false;
+        std::memset(page.get(), 0, page_bytes_);
+        pages_[id] = std::move(page);
         resident_bytes_ += page_bytes_;
     } else {
-        std::memset(page.data(), 0, page_bytes_);
+        std::memset(pages_[id].get(), 0, page_bytes_);
     }
     free_.pop_back();
     refs_[id] = 1;
@@ -81,7 +77,7 @@ bool KvPagePool::retain(PageId id) {
 bool KvPagePool::release(PageId id) {
     if (!valid(id)) return false;
     if (--refs_[id] == 0) {
-        std::memset(pages_[id].data(), 0, page_bytes_);
+        std::memset(pages_[id].get(), 0, page_bytes_);
         free_.push_back(id);
         --live_pages_;
     }
@@ -104,11 +100,11 @@ bool KvPagePool::make_writable(PageId *id) {
 }
 
 u8 *KvPagePool::mutable_data(PageId id) {
-    return valid(id) && !pages_[id].empty() ? pages_[id].data() : nullptr;
+    return valid(id) && pages_[id] ? pages_[id].get() : nullptr;
 }
 
 const u8 *KvPagePool::data(PageId id) const {
-    return valid(id) && !pages_[id].empty() ? pages_[id].data() : nullptr;
+    return valid(id) && pages_[id] ? pages_[id].get() : nullptr;
 }
 
 u32 KvPagePool::ref_count(PageId id) const {

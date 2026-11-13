@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <map>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -16,6 +17,7 @@
 #include "krk/ple.hpp"
 #include "krk/expert_cpu.hpp"
 #include "krk/kv_tier.hpp"
+#include "krk/kv_pages.hpp"
 #include "krk/dsv4_route.hpp"
 #include "krk/draft_block.hpp"
 #include "krk/draft_head.hpp"
@@ -38,12 +40,12 @@ struct EngineConfig {
     i32 n_ctx = 4096;        // KV capacity (tokens), PER SLOT
     // How many sequences the KV cache holds at once. 1 (the default) is the
     // single-sequence engine every other path assumes, and costs nothing: the
-    // planes are sized for one context exactly as before. N > 1 sizes every
-    // layer's plane for N slots -- KV grows N-fold, because each sequence needs
-    // its own context -- and enables Engine::generate_batch(), which decodes N
-    // sequences in ONE forward pass. Requires a KV cache that fits: a tiered,
-    // paged cache is refused, because page residency is decided per layer over
-    // one sequence's positions.
+    // planes are sized for one context exactly as before. Without kv_paged, N >
+    // 1 sizes every layer's plane for N slots -- KV grows N-fold, because each
+    // sequence needs its own context -- and enables Engine::generate_batch(),
+    // which decodes N sequences in ONE forward pass. A tiered contiguous cache
+    // is refused for multi-slot runs; the experimental kv_paged path uses
+    // per-sequence block tables and shared-prefix COW forks on supported CPUs.
     i32 n_slots = 1;
     // Prompt tokens per batched forward. 512 because the routed expert set is
     // re-read once per chunk: 35B-A3B at a 4096-token prompt measured 397.1
@@ -74,6 +76,10 @@ struct EngineConfig {
     i32 kv_hot_mb = 0;
     i32 kv_warm_mb = 0;
     std::string kv_cold_dir;
+    // Experimental CPU paged KV with lazy page payloads and COW sequence forks.
+    // Requires a backend advertising AttnDesc page-table support and an ordinary
+    // causal-attention model; unsupported model/backend combinations are refused.
+    bool kv_paged = false;
     // K/V cache element format. 0 = f16/f32 (the default, and the only arm any
     // model ran before this existed: its arithmetic is unchanged). 1 = int8
     // with one f32 scale per 32 values, see KvQuant in backend.hpp. The CPU
@@ -1444,6 +1450,17 @@ private:
     KvTierCache kvt_k_;
     KvTierCache kvt_v_;
     bool kv_tiered_ = false;
+    bool kv_paged_ = false;
+    i64 kv_page_rows_ = 16;
+    i64 kv_page_table_stride_ = 0;
+    // Pools are per layer and K/V plane; page payloads are allocated only as
+    // positions are written. Keep pools before sequence tables in declaration
+    // order so the tables release their references first during destruction.
+    std::vector<std::unique_ptr<KvPagePool>> kv_page_k_, kv_page_v_;
+    std::vector<KvBlockTable> serial_page_k_, serial_page_v_;
+    bool prepare_page_rows(i32 layer, i32 n, i32 pos0,
+                           std::vector<void *> *kpages,
+                           std::vector<void *> *vpages);
     // Gated delta net: f32, one block per recurrent layer, persistent across
     // forwards. conv_state_ is the short conv's last (ksize-1) steps; rec_state_
     // is the delta rule's [n_v_head, d_state, hd] matrix. This is the model's
