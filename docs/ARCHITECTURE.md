@@ -119,10 +119,13 @@ not exist, it returns 0 and the HIP value is kept.
       └───────────────────────┘        └───────────────────────────┘
 ```
 
-`Backend` is the only abstraction in the engine. It has twelve methods, all of
-them bulk operations. `Engine` contains no device code, no `#ifdef`, and no
-notion of a GPU; it allocates workspaces in whatever element type the backend
-advertises (`F16` on the GPU, `F32` on the CPU) and calls ops.
+`Backend` is the device abstraction in the engine. Its interface now covers bulk
+math, attention and recurrent state, quantized KV, expert routing, sampling,
+multi-sequence addressing, and explicit capability queries. Many optional
+operations have defaults that report no support or select a safe fallback.
+`Engine` contains the architecture policy and calls those operations without
+owning device kernels. It allocates workspaces in the backend activation type,
+normally `F16` on HIP and `F32` on CPU.
 
 That is why the CPU build is not a toy: it runs the *same* engine code and is
 what the test suite exercises, so a change to the forward pass is caught without
@@ -237,85 +240,86 @@ and every kernel masks on both axes.
 4. Extend `tests/test_kraken.cpp` with a host-side check of the invariant, and
    compare `--cpu` against the GPU output on a real model.
 
-## Roadmap — what is NOT here yet
+## Current boundaries and remaining work
 
-The features below do not exist in the engine; nothing in the tree implements
-them. They are listed honestly, in the order they would matter to the fleet
-(CPU oracle → `gfx1031` → `gfx1201`).
+The engine now includes features that older revisions of this document listed as
+absent. Their exact contracts matter.
 
-**KV cache — none of it is there yet:**
+### KV state and prefix reuse
 
-* **No prefix/prompt caching.** Two generations with a shared system prompt
-  re-prefill the shared part every time. The engine is single-sequence: one
-  KV cache, one decode position, `Finish` has no cancellation concept.
-  (The `kv_rollback` primitive added for speculative decoding is the first
-  piece a future prompt-cache would reuse.)
-* **No radix/prefix tree.** Not a gap to close incrementally — the single
-  sequence design would need to become sequence-tree first. Worth doing when
-  the engine grows multi-request serving; pure CLI decode never benefits.
-* **No paged KV.** Pages matter when sequences come and go at different
-  lengths (fragmentation). A contiguous cache is the right v0.1 trade-off and
-  is not the bottleneck on one sequence.
-* **No KV quantization.** Cache rows are the activation dtype (fp16 on GPU,
-  fp32 on CPU); `kcache_`/`vcache_` are never compressed.
+- KV formats are `f16`, `int8`, `turbo3`, and experimental `rot4`.
+- HOT, WARM, and COLD residency tiers can move KV state between device memory,
+  host memory, and storage.
+- The server can retain and reuse a matching prompt prefix. Rollback discards
+  invalid or cancelled state.
+- Prefix reuse is one held prompt record, not a general radix tree shared by
+  many independent requests.
+- Tiered KV currently pages whole layers for one sequence and is excluded from
+  the general batch path.
 
-**Speculative decoding — greedy draft model, done:** `--draft model.gguf`
-loads a second internal Engine sharing the backend (own weights, own KV), and
-greedy requests take the verify-and-accept path: the draft proposes up to
-`--draft-tokens N` continuations, the target verifies the block in one batched
-forward with per-row head computes, and the longest greedy-matching prefix is
-kept (with a bonus token on full match). Because only argmax branches are
-pursued, accepted tokens are **bit-identical to plain greedy decoding** — the
-test suite proves this for a weak draft at window sizes 1/2/4/6 and for the
-target-as-its-own-draft (full-accept path). Sampling requests bypass the draft
-with a warning; `--bench` reports proposals, accepts and the acceptance rate.
-`kv_rollback(pos)` is the primitive this builds on: a logical shrink of the
-contiguous cache (no zeroing — rows are overwritten before they are ever read
-again).
+### Speculation
 
-**Speculative decoding — still open:** no tree attention (only a single linear
-chain is verified per step), no `n-gram`/lookup speculation without a draft
-model, and no MTP: `qwen3moe` GGUFs carrying `mtp.*` tensors load but those
-tensors are never referenced. MTP would slot in as a special draft that reads
-the target's own hidden state; the verify/accept machinery does not change.
+`--draft model.gguf` loads a second engine with its own weights and KV state.
+For greedy requests, the target verifies a linear chain of draft proposals and
+keeps the longest matching prefix. The accepted tokens are bit-identical to
+plain greedy decoding for the tested paths. Sampling requests do not use this
+greedy verifier.
 
-**Serving/interaction:** `kraken-server` speaks the OpenAI API (see README), but
-it is a thin shell over the single-sequence engine: generation is serialized
-behind one mutex, every request re-prefills from position 0 (no prefix cache),
-and there is no cancellation. No streaming continuation across calls, no beam
-search, no concurrent batching.
+Embedded and sidecar MTP heads are implemented for supported schemas. DFlash
+and DSpark draft paths also exist. These paths have different levels of fixture
+coverage and must not be described as real-model verified without a matching
+checkpoint and reference run.
 
-**Quantization:** every dequantizer this engine lists in `docs/USER-GUIDE.md` —
-the IQ family (`IQ2_XXS`/`IQ2_XS`/`IQ2_S`, `IQ3_XXS`/`IQ3_S`, `IQ1_S`/`IQ1_M`),
-`IQ4_NL`/`IQ4_XS`, `MXFP4`/`NVFP4`, the ROCmFPX ids 100/101, BitNet's
-`Q1_0`/`Q2_0`/`Q2_0_64` and `TQ1_0`/`TQ2_0` — runs on both the host reference
-path and the GPU kernels, as are PrismML's ternary pair **142** (`PQ2_0`) and
-**143** (`PTQ1_0`) with the block-1024 Hadamard activation transform (permutation,
-sign vectors, FWHT butterfly; applied per weight site, host reference and HIP
-kernels alike) that files describe in `prism.hadamard` metadata. Still refused
-at load: the ROCmFPX ids **102**, **104** and **107**, which no header on this
-machine defines. One id needs care because two producers spell it: id 42 is the
-llama-dx fork's 128-value / 34-byte `Q2_0`, not upstream's 64-value block,
-which is id 48 here. YaRN's NTK-aware frequency warp remains
-approximated; see the model notes.
+Tree attention, n-gram lookup speculation without a draft artifact, recurrent
+rollback for speculation, and sampled verification remain open. Real acceptance
+rates and end-to-end speedups must be measured per target and draft pair.
 
-Performance gaps on the device are in `docs/HARDWARE.md` (split-K attention,
-device-side sampling, prefill tile size). MoE-specific candidates (device-side
-routing, skipping the gather) are below.
+### Serving and batching
 
-On the MoE path specifically, the remaining candidates for optimisation are:
+The HTTP server provides completions, chat completions, SSE streaming,
+client-disconnect cancellation, model listing, health reporting, and prefix
+reuse. Generation is serialized at the service level.
 
-* routing logits are downloaded to the host every layer (a sync per layer).
-  A device-side top-k with a small readback would remove it.
-* the gather/scatter pair materializes the permuted activation block once per
-  expert per matrix. A persistent expert-slot layout (tokens written straight
-  into their expert's rows by the router) would skip the copy.
-* the residency policy is LFU with aging: hits earn counters, counters pin hot
-  experts against eviction, and decay (halving every 64 acquires) lets pins
-  lapse when traffic moves on. `--bench` reports loads, evictions, hit rate and
-  the pinned count. Tuning `kPinThreshold`/`kPinDecay` per model family, or a
-  persistent “hot set” sized from a calibration pass, are the next steps.
-* expert loads are synchronous: a miss blocks the layer while the slice is
-  uploaded. Prefetching the next token's top-k+1 from the router distribution
-  while the current step's GEMMs run is the next win, and it is orthogonal to
-  the tier above — a promotion can be prefetched just as a load can.
+`Engine::generate_batch` provides constrained multi-sequence generation when
+the backend supports per-row attention. `Engine::batch_refusal()` names the
+unsupported per-sequence state. Current exclusions include recurrent and
+diffusion models, unsupported per-row MLA, QSA or MSA, hyper-connections, PLE,
+route prediction, speculation, learned positions, ALiBi, and tiered KV.
+
+The remaining serving work is iteration-level admission, per-slot chunked
+prefill, cancellation at every stage, radix prefix reuse, and KV tiering with
+per-sequence page ownership. This is not yet an unrestricted continuous-batching
+server.
+
+### Quantization
+
+The host reference decoder accepts the formats listed in
+[Model support](MODEL-SUPPORT-MATRIX.md). HIP and optimized CPU kernels cover
+subsets selected by dtype, shape, ISA, and numerical controls. Generic reference
+decoding remains distinct from a dedicated fused kernel.
+
+The ROCmFPX IDs 102, 104, and 107 remain refused. ID 42 is the llama-dx
+128-value Q2_0 layout here, while ID 48 is the 64-value `Q2_0_64` layout.
+PrismML `PQ2_0` and `PTQ1_0` can use the block-1024 Hadamard activation transform
+described by file metadata.
+
+### Performance work
+
+Historical performance notes do not establish current native-device throughput.
+Measure each candidate on the target hardware with matched controls.
+
+Current MoE candidates include:
+
+- Reduce host synchronization in routing while preserving expert identity and
+  exact selection.
+- Reduce gather and scatter materialization and per-expert launch overhead.
+- Overlap expert transfer with independent computation without introducing
+  lifetime races.
+- Tune residency and pinning from measured workload locality rather than a
+  universal hot set.
+- Evaluate graph replay only with stable slots and dynamic-route safety tests.
+
+For KV and attention, measure transfer overlap, long-context attention cost,
+decode occupancy, and prefill tiling. Kernel throughput is not model-wide
+throughput. Pending items and blocked hardware checks live in
+[TO-DO.md](../TO-DO.md).

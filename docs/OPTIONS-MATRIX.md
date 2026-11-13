@@ -34,7 +34,7 @@ unless the row says otherwise.
 |---|---|---|
 | `KRK_CPU_DOT_AVX2=1` | AVX2 block-format dot, bit-identical to `KRK_CPU_DOT_FAST` | prefill **10342.9 → 2940.9 ms (3.5×)**, decode **134.2 → 42.0 ms (3.2×)**. On the general `--cpu` q8_0 path (121-token prompt): 8702.8 → 3947.6 ms, **2.20×** |
 | `--npu-cpu` + `KRK_NPU_W8A8=1` + `KRK_NPU_ATTN=1` | whole graph on VNPU, int8 weights, device attention | decode **32.8 ms/step (30.5 tok/s)** — the fastest decode measured here; prefill 3557.5 ms, slower than AVX2 CPU |
-| `KRK_NPU_W8A8=1` | int8 weights on the device | resident: decode 113.6 → 34.8 ms (**3.3×**). **Streaming: 149.0 → 718.7 ms (4.8× WORSE)** — see [ARCHITECTURE-TIERED.md](ARCHITECTURE-TIERED.md) §5 |
+| `KRK_NPU_W8A8=1` | int8 weights on the device | resident: decode 113.6 → 34.8 ms (**3.3×**). **Streaming: 149.0 → 718.7 ms (4.8× WORSE)**. See [tiered execution](ARCHITECTURE-TIERED.md) |
 | `KRK_NPU_ATTN=1` | attention on the device | 34.8 → 32.8 ms decode, 3597.9 → 3557.5 ms prefill (small, additive to w8a8) |
 | `--expert-cache-mb N` | device expert budget | the decode lever: 41.1 ms (resident) → 73.6 ms (64 MiB) → 74.6 ms (16 MiB). Prefill unmoved (3.82–3.94 s) |
 | `--expert-warm-mb N` | host-RAM WARM tier for evicted experts | read **2519 → 246 MiB (0.10×)** at a 64 MiB device budget; decode 73.6 → 70.5 ms |
@@ -45,7 +45,7 @@ unless the row says otherwise.
 | `--router-resident P` | let a near-tied pick land on an already-resident expert | **no effect at 64 MiB** (0.0% HOT): there is no resident tier to prefer. It reorders picks among resident experts |
 | `--vram-tier`, `--ram-tier`, `--host-ram-mb`, `--vram-cap-mb` | plan for a smaller machine than the installed one | planning only, clamped to what is installed; no throughput claim here (GPU arms unmeasured) |
 | `--cpu` | scalar reference | 3.5× slower than AVX2 on prefill, by design. It is the accuracy witness, not the fast path |
-| *(no flag)* the batched prefill GEMM | decodes each weight block once per 8 rows instead of once per row | **2.28–3.35×** on the q8_0 MoE, **3.83–4.29×** on f16 dense. Always on; bit-identical to the old path ([ARCHITECTURE-TIERED.md §7](ARCHITECTURE-TIERED.md)) |
+| *(no flag)* the batched prefill GEMM | decodes each weight block once per 8 rows instead of once per row | **2.28–3.35×** on the q8_0 MoE, **3.83–4.29×** on f16 dense. Always on; bit-identical to the old path ([tiered execution](ARCHITECTURE-TIERED.md)) |
 
 ## 2. Correctness and determinism opt-ins
 

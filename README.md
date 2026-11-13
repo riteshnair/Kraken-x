@@ -23,7 +23,12 @@ require hipBLAS, MIOpen, or rocBLAS. CPU execution does not require ROCm.
   cache formats.
 - Command-line generation, interactive chat, an OpenAI-compatible HTTP server,
   model inspection, correctness tests, and benchmarks.
-- Greedy speculative decoding with a draft model or a supported MTP head.
+- Greedy speculative decoding with a draft model, DFlash or DSpark head, or a
+  supported MTP head.
+- Cacheless bidirectional execution and block denoising for supported `diffuse`
+  models.
+- Constrained multi-sequence generation with explicit refusals for incompatible
+  per-sequence state.
 
 Support depends on the model architecture, tensor schema, quantization format,
 and selected backend. A GGUF extension alone does not prove that a file is
@@ -230,10 +235,17 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 ```
 
 The server can reuse a matching KV prefix between requests. Its reported cached
-token count describes cache reuse, not a model-quality measurement.
+token count describes cache reuse, not a model-quality measurement. Prefix reuse
+is a single held prompt record, not a general radix cache.
 
-See [docs/USER-GUIDE.md](docs/USER-GUIDE.md) for server options and additional
-examples.
+Set `"stream": true` for SSE output. A failed streaming write cancels generation
+at the next token. Non-streaming disconnects are observed only when the final
+response is written, so they cannot provide the same early cancellation signal.
+Generation is serialized by the service, and the engine's separate constrained
+batch path is not unrestricted continuous batching.
+
+See [docs/USER-GUIDE.md](docs/USER-GUIDE.md) for streaming, diffusion,
+speculation, server options, and additional examples.
 
 ## Correctness and numerical modes
 
@@ -322,7 +334,10 @@ otherwise make a failed build appear successful.
 - [Tiered architecture](docs/ARCHITECTURE-TIERED.md): residency and storage.
 - [CPU low-bit VNNI](docs/CPU-LOWBIT-VNNI.md): optimized kernels, controls,
   validation, and isolated measurements.
-- [Model support](docs/MODEL-SUPPORT-MATRIX.md): architecture and schema support.
+- [Model support](docs/MODEL-SUPPORT-MATRIX.md): architecture, quantization, and
+  evidence levels.
+- [Model status](docs/MODEL-STATUS.md): historical checkpoint runs and their
+  limits, kept separate from current support.
 - [Technical reference](docs/TECHNICAL-README.md): implementation details.
 - [Pending work](TO-DO.md): the single current list of gaps and blocked validation.
 

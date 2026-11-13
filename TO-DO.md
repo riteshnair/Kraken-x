@@ -1,6 +1,6 @@
 # Kraken pending work
 
-Status: 2026-11-12, after the consolidation into `main`.
+Status: 2026-11-12, after the documentation support-state correction.
 
 This is the only pending-work list. Historical plans, audits, campaign logs, and
 transcripts were removed because their claims and line references had become
@@ -71,9 +71,6 @@ Status labels:
 - [ ] **HIP attention-logit softcap** (CODE). Implement the device operation,
   update the capability response, and add CPU/device parity on the Gemma2
   fixture.
-- [ ] **MoVA value-expert attention** (CODE). Implement routing, value gather,
-  and selection bias for `k2-horizon`. Use the existing fixture and a plain-V
-  negative control.
 - [ ] **Recurrent speculation and Tail-Replay** (CODE). Implement invertible
   checkpoint/rollback for recurrent and convolution state, including partial
   acceptance and cancellation.
@@ -85,9 +82,10 @@ Status labels:
 - [ ] **Qwen2VL and Qwen3VL vision towers** (CODE and FILE). Text-only execution
   is not vision support. Implement towers and projector only with real artifacts
   and reference outputs.
-- [ ] **LLaDA diffusion generation** (MEASURE then CODE). Audit current schema
-  and generation state, then implement the diffusion loop with an independent
-  reference.
+- [ ] **LLaDA real-model verification** (FILE). Compare the implemented
+  bidirectional forward and block diffusion sampler with an independent
+  reference on a named checkpoint. Existing synthetic execution tests do not
+  close this item.
 - [ ] **Generic YaRN coverage** (MEASURE). Identify unsupported scale and
   pattern combinations. Laguna support alone does not close this item.
 
@@ -140,19 +138,19 @@ Status labels:
 - [ ] **Remaining HIP graph audit** (CODE and HARDWARE). Compare implemented
   operations with capability responses and model requirements.
 
-## P3: documentation and support-state assessment
+## P3: documentation and support-state maintenance
 
-- [ ] Build a claim-by-claim matrix from README, user guide, architecture,
-  schema, and model-support documents to code and tests.
-- [ ] Reconcile `ArchSupport`, loader refusal, backend capability, and documented
-  support for every architecture.
-- [ ] Separate implemented, fixture-tested, real-model verified, experimental,
-  deliberately refused, missing, and blocked states.
-- [ ] Recheck every example command against current CLI and server options.
-- [ ] Refresh the model inventory only from available artifacts and recorded
-  runs.
-- [ ] Keep historical rejected ideas out of the active plan unless new evidence
-  justifies reopening them.
+- [ ] **Automated consistency checks** (CODE). Check documented dtype and
+  architecture inventories against source, validate local links, and compare
+  documented options with the CLI and server parsers.
+- [ ] **Example smoke tests** (CODE and HARDWARE). Execute README and user-guide
+  commands on CPU and available HIP configurations. Parser inspection alone does
+  not prove that an example runs.
+- [ ] **Current real-model inventory** (FILE). Record available checkpoints and
+  new reference runs without reviving deleted filename-based support claims.
+- [ ] **Historical measurement provenance** (MEASURE). Replace tables that lack
+  raw evidence with new controlled runs when the required model and hardware are
+  available. Keep the old values explicitly historical.
 
 ## Blocked verification matrix
 

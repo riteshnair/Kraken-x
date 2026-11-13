@@ -17,8 +17,7 @@ What is relevant here:
 - **Prerouter**: "a trained head predicts expert routing one step ahead, so
   expert loads overlap the forward pass instead of stalling it — up to +59%
   decode throughput; the gain grows with storage latency, model size, and routed
-  width K." This is the same wall `docs/PERF-ANALYSIS.md` section 10 measures
-  from the other side: after the arena and the promotion-ordering fixes, a
+  width K." This is the same wall measured in the earlier performance analysis: after the arena and the promotion-ordering fixes, a
   laguna-xs2 token is ~35 ms of compulsory file read against ~25 ms of
   everything else, and the compute it could hide behind is only 8.5 ms. An
   untrained version of the idea — use the *previous* token's routing for a layer
@@ -112,82 +111,30 @@ inspects as six blocks with the target's own embedding and head geometry
 needs is the one this engine already implements for Laguna -- but that is an
 inference from the tensors, not from running it.
 
-## Qwen3.8-Flash-Next: what it changes, and what kraken has
+## Current support corrections for earlier research
 
-Qwen3.8-Flash-Next is 125B of MoE plus a **51B-parameter n-gram embedding
-table** (20M entries, indexed by bigrams and trigrams) with 6B active, on a
-hybrid stack of **36 Gated DeltaNet layers and 12 Qwen Sparse Attention layers in
-a 3:1 schedule**, with **Gated Residual** (an element-wise data-dependent read
-gate and a per-branch scalar write gate on the residual stream) and a training
-recipe that splits Muon and AdamW across weight categories.
+Earlier revisions of this research note described QSA, hyper-connections, MoVA,
+Mamba-2, DFlash loading, and several quantization decoders as missing. Those
+implementation gaps have since closed or narrowed. Current support belongs to
+[Model support](MODEL-SUPPORT-MATRIX.md), not to the historical observations in
+this file.
 
-None of that file is on this machine. What is here, under the filename
-`qwen3.8-flash-next-Q4.gguf`, is **Qwen3.8-27B** -- `general.name = "Qwen3.8-27B"`,
-65 blocks, 15.92 GiB, and it is **runnable in kraken today**: `qwen35` arch,
-Gated DeltaNet weights (`ssm_a`, `ssm_alpha`, `ssm_beta`, `ssm_conv1d`,
-`ssm_dt`, `ssm_norm`, `ssm_out`), gated attention (`attn_gate` on the 3:1
-schedule's attention layers), and one MTP block at `blk.64`.
+The following distinctions remain important:
 
-So the three Flash-Next-specific features are all **absent from kraken**:
+- A filename containing `flash-next` does not identify its GGUF architecture.
+  Read `general.architecture`, `general.name`, and the actual tensors.
+- Qwen3.8 family exports can map to different implemented graphs, including
+  `qwen35` and `qwen4exp`, depending on their schema.
+- DFlash is a draft head set, not a standalone target model. Current code has a
+  dedicated loader and drafting path.
+- K2-Horizon text MoVA and Nemotron Mamba-2 paths are implemented and
+  fixture-tested. Their real-checkpoint evidence remains separate.
+- MXFP4 and the supported ROCmFPX decoders exist. Format acceptance still does
+  not guarantee a dedicated optimized kernel for every backend and shape.
 
-| feature | what it would take |
-|---|---|
-| **QSA** | a lightweight indexer that compresses the sequence into micro-blocks and selects at *micro-block* granularity, before the attention itself. Kraken's attention is full plus sliding-window; there is no indexer, and this is a long-context feature, not a decode one |
-| **Gated Residual** | an element-wise read gate plus a per-branch scalar write gate on the residual stream. Distinct from the `attn_gate` and the packed output gate the engine already has: those gate an attention *output*, this gates the residual *stream* |
-| **N-gram Embedding** | 20M-entry lookup table indexed by bigram/trigram. Not a matmul, so it wants exactly the tiering this engine already has for experts -- WARM, read-through, promotion -- with a different key. The one to build first of the three: it is the feature most aligned with what this engine already does well, and 51B of parameters that are looked up rather than multiplied is the cheapest kind of parameter scaling to serve from host RAM |
-
-The naming is worth a warning: a file called `qwen3.8-flash-next` that is
-actually Qwen3.8-27B will be counted as "Flash-Next supported" by anyone
-reading a filename list. Kraken prints `general.name`, which is how this was
-caught.
-
-## The DFlash head Poolside ships for Laguna
-
-Not a separate project, but the other half of this one, and worth recording
-next to the two above. `kraken-inspect` on
-`G:/More-models/laguna-s-2.1-DFlash-Q4_K_M.gguf` (full output in
-`docs/traces/dflash-head-inspect.txt`):
-
-| field | value | why it matters |
-|---|---|---|
-| `dflash.decoder_arch` | `laguna` | same decoder as the target; the head is not a different model |
-| `dflash.block_count` | 6 | six dense blocks, ~330 MiB of weights, all resident |
-| `dflash.block_size` | 16 | up to 16 candidate tokens per pass |
-| `dflash.target_layers` | 6 indices | only six layers have to be recomputed for verification |
-| embedding / heads / head_dim | 3072 / 72 (8 KV) / 128 | identical to Laguna S 2.1's own config |
-| tensors | 76, `blk.N.attn_{q,k,v,output,gate}`, `ffn_{gate,up,down}`, `*_norm` | a plain dense transformer block with an attention output gate -- **no experts** |
-
-Two things follow. The head is cheap: six dense blocks against a 68 GiB MoE
-target, with none of the streaming that costs a laguna token 60 ms. And the
-speculation loop is cheap to verify here, because only six layers of the target
-have to be re-run per candidate token.
-
-The loader currently refuses architecture `dflash` as "draft file (not a model)",
-which is right for `--draft` and wrong as a refusal: the head wants a code path
-of its own, not to masquerade as a model of the family.
-
-## What the models on this machine are refused for, and what is cheapest to fix
-
-After the router-bias fix (see below), `kraken-inspect` on every large model
-here says one of these. Raw output in
-`docs/traces/model-refusals-after-router-bias.txt`.
-
-| model | arch | blocked by | size of the job |
-|---|---|---|---|
-| `Qwen3.8-27B-*` | `qwen35` | runs | -- |
-| `Qwen3.5-9B-...-MTP` | `qwen35` | runs (MTP block skipped) | -- |
-| `qwable-v1-mxfp4_moe` | `qwen35moe` | **quant type #39 only** (MXFP4) | one dequant path |
-| `Ornith-1.0-9b-ROCmFPX` | `qwen35` | **quant types #100 and #101 only** (ROCm FPX) | two dequant paths |
-| `K2-Horizon-MoVA-36B-A4B` | `k2-horizon` | routed experts on the attention *values* (`attn_v_exps`/`attn_v_gate`) | a new expert family, on top of a gate we already have |
-| `NVIDIA-Nemotron-3.5-Lightning` | `nemotron_h_moe` | Mamba-2 blocks instead of the gated delta net | a new recurrence, not a delta rule |
-| `DeepSeek-V4-Flash` | `deepseek4` | MLA, attention sinks, quant #26 | three real gaps |
-
-The cheapest unblocks on this machine are therefore **three quantization types,
-not three architectures**: `qwable-v1-mxfp4_moe` and `Ornith-1.0-9b` are both
-`qwen35` models whose *architecture this engine already runs*, blocked by
-dequantization alone. That is a much better first move than a new architecture,
-and it is the one a user with a folder of models actually feels.
-
+The original inspector and refusal outputs referenced by older revisions were
+removed during consolidation. They are not available as retained evidence. New
+support claims need a fresh run on the exact checkpoint.
 ## Two refusal reasons that were wrong
 
 Both were found while checking the models above, and both are fixed in this

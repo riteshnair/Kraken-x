@@ -48,7 +48,7 @@ row anywhere.
 
 If you port from an RDNA4 example you will get wrong numbers, because RDNA3
 mirrors fragments across the two lane groups instead of splitting K. See
-`docs/RESEARCH.md` §1.
+`src/hip/kernels/gemm.hpp` for the implementation guards.
 
 ## RDNA4 (`gfx1200`/`gfx1201`) — WMMA with the K-split layout
 
@@ -82,12 +82,15 @@ mismatch is a build problem, not a runtime one.
 
 ## Known limits worth knowing before benchmarking
 
-* **Decode on a 32-head model launches 32 attention blocks**, one per head. On a
-  40- or 64-CU card that is poor occupancy. A split-K attention (several blocks
-  cooperating per head, combining partial online-softmaxes) is the standard fix
-  and is not implemented in v0.1.
-* **Sampling happens on the host.** Logits for a 150k vocab are 300 KiB of fp16
-  per token across PCIe. A device-side top-k/top-p sampler removes that; the
-  kernel structure is trivial but it is not written yet.
-* **Prefill block tile is 32x64.** For a batch of 32 tokens that is one M-tile;
-  a larger BM would help long prompts on the 9070 XT's wider array.
+* **Attention occupancy remains workload-dependent.** The HIP backend has a
+  split decode-attention path selected by `attention_decode_splits`. Measure its
+  threshold and reduction cost on each card instead of assuming one block per
+  head is always optimal.
+* **Device candidate selection exists.** `Backend::logits_topk` can rank logits
+  on the device and return candidates with probability-mass information. Host
+  fallback remains necessary for unsupported configurations and exact sampler
+  behavior. Compare both output equivalence and end-to-end latency.
+* **Prefill block tile is 32x64 in the documented kernel configuration.** For a
+  batch of 32 tokens that is one M-tile. Larger tiles and staging changes need
+  native gfx1031 and gfx1201 measurements; source inspection alone does not
+  establish a speedup.

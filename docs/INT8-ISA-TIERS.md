@@ -118,17 +118,15 @@ targets rather than a compile-time assumption.
 
 ## 4. What is missing, stated as work rather than as a wish
 
-* **T3 (`VPDPBUSD`, VEX) is not a separate kernel.** Today an Alder Lake host
-  falls from T5 straight to T2, giving up roughly half the int8 rate even though
-  it has a VNNI instruction. The dispatcher would need a third `target`
-  attribute (`avxvnni`) and a fourth probe. This is the single largest missing
-  tier for a laptop fleet.
+* **T3 (`VPDPBUSD`, VEX) now has runtime-dispatched kernels.** The Q2_K and
+  Q3_K paths include AVX-VNNI and AVX512VL plus AVX512VNNI variants, with
+  scalar and SSSE3 fallbacks. Native Core Ultra 135H throughput remains
+  unmeasured. See [CPU low-bit VNNI](CPU-LOWBIT-VNNI.md) for controls and scope.
 * **T7 (AMX) does not exist.** It would be a separate kernel, not a widening:
   AMX is tile-based, needs `_tile_loadd` / `_tile_dpbssd` / `_tile_stored` and a
   1 KiB tile configuration, and it would also **remove the bias trick entirely**
   (`TDPBSSD` is signed x signed). It is worth doing only where the machine has
-  it, and it must be gated on a verified known-answer test, not on CPUID — the
-  rule in `docs/VIRTUAL-DEVICE-PLAYBOOK.md` §4.
+  it, and it must pass a known-answer test in addition to CPUID dispatch.
 * **Tuning knobs from the same guide** — performance governor, C-state depth,
   NUMA placement — are the playbook's C4 scheduling contract, and this sandbox
   exposes none of them (`cpufreq` sysfs is absent). They belong in the capability
