@@ -16,13 +16,13 @@ bool KvPagePool::init(size_t page_bytes, size_t page_capacity) {
         (page_capacity && page_bytes > std::numeric_limits<size_t>::max() / page_capacity))
         return false;
     try {
-        std::vector<u8> bytes(page_bytes * page_capacity, 0);
+        std::vector<std::vector<u8>> pages(page_capacity);
         std::vector<u32> refs(page_capacity, 0);
         std::vector<PageId> free;
         free.reserve(page_capacity);
         for (size_t i = page_capacity; i > 0; --i)
             free.push_back(static_cast<PageId>(i - 1));
-        bytes_.swap(bytes);
+        pages_.swap(pages);
         refs_.swap(refs);
         free_.swap(free);
         page_bytes_ = page_bytes;
@@ -37,11 +37,12 @@ bool KvPagePool::init(size_t page_bytes, size_t page_capacity) {
 }
 
 void KvPagePool::reset() {
-    bytes_.clear();
+    pages_.clear();
     refs_.clear();
     free_.clear();
     page_bytes_ = 0;
     live_pages_ = 0;
+    resident_bytes_ = 0;
 }
 
 bool KvPagePool::valid(PageId id) const {
@@ -51,9 +52,21 @@ bool KvPagePool::valid(PageId id) const {
 bool KvPagePool::allocate(PageId *out) {
     if (!out || free_.empty() || page_bytes_ == 0) return false;
     const PageId id = free_.back();
+    std::vector<u8> &page = pages_[id];
+    if (page.empty()) {
+        try {
+            page.resize(page_bytes_, 0);
+        } catch (const std::bad_alloc &) {
+            return false;
+        } catch (const std::length_error &) {
+            return false;
+        }
+        resident_bytes_ += page_bytes_;
+    } else {
+        std::memset(page.data(), 0, page_bytes_);
+    }
     free_.pop_back();
     refs_[id] = 1;
-    std::memset(bytes_.data() + static_cast<size_t>(id) * page_bytes_, 0, page_bytes_);
     ++live_pages_;
     *out = id;
     return true;
@@ -68,7 +81,7 @@ bool KvPagePool::retain(PageId id) {
 bool KvPagePool::release(PageId id) {
     if (!valid(id)) return false;
     if (--refs_[id] == 0) {
-        std::memset(bytes_.data() + static_cast<size_t>(id) * page_bytes_, 0, page_bytes_);
+        std::memset(pages_[id].data(), 0, page_bytes_);
         free_.push_back(id);
         --live_pages_;
     }
@@ -91,11 +104,11 @@ bool KvPagePool::make_writable(PageId *id) {
 }
 
 u8 *KvPagePool::mutable_data(PageId id) {
-    return valid(id) ? bytes_.data() + static_cast<size_t>(id) * page_bytes_ : nullptr;
+    return valid(id) && !pages_[id].empty() ? pages_[id].data() : nullptr;
 }
 
 const u8 *KvPagePool::data(PageId id) const {
-    return valid(id) ? bytes_.data() + static_cast<size_t>(id) * page_bytes_ : nullptr;
+    return valid(id) && !pages_[id].empty() ? pages_[id].data() : nullptr;
 }
 
 u32 KvPagePool::ref_count(PageId id) const {
@@ -130,19 +143,33 @@ bool KvBlockTable::bind(KvPagePool *pool, size_t rows_per_page) {
 }
 
 bool KvBlockTable::clone_from(const KvBlockTable &source) {
-    if (this == &source) return true;
+    if (!source.pool_ || source.rows_per_page_ == 0 ||
+        source.blocks_.size() > std::numeric_limits<size_t>::max() /
+                                    source.rows_per_page_)
+        return false;
+    return clone_prefix_from(source, source.blocks_.size() * source.rows_per_page_);
+}
+
+bool KvBlockTable::clone_prefix_from(const KvBlockTable &source,
+                                     size_t logical_rows) {
+    if (this == &source) return logical_rows <= blocks_.size() * rows_per_page_;
     if (!source.pool_ || source.rows_per_page_ == 0) return false;
     if (pool_ && (pool_ != source.pool_ || rows_per_page_ != source.rows_per_page_))
         return false;
+    const size_t count = logical_rows == 0
+                             ? 0
+                             : 1 + (logical_rows - 1) / source.rows_per_page_;
+    if (count > source.blocks_.size()) return false;
     std::vector<KvPagePool::PageId> copy;
     try {
-        copy.reserve(source.blocks_.size());
+        copy.reserve(count);
     } catch (const std::bad_alloc &) {
         return false;
     } catch (const std::length_error &) {
         return false;
     }
-    for (KvPagePool::PageId id : source.blocks_) {
+    for (size_t i = 0; i < count; ++i) {
+        const KvPagePool::PageId id = source.blocks_[i];
         if (!source.pool_->retain(id)) {
             for (KvPagePool::PageId held : copy) source.pool_->release(held);
             return false;

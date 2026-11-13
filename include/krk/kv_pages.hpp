@@ -32,6 +32,7 @@ public:
     size_t page_bytes() const { return page_bytes_; }
     size_t capacity() const { return refs_.size(); }
     size_t live_pages() const { return live_pages_; }
+    size_t resident_bytes() const { return resident_bytes_; }
 
     bool allocate(PageId *out);
     bool retain(PageId id);
@@ -50,7 +51,8 @@ private:
 
     size_t page_bytes_ = 0;
     size_t live_pages_ = 0;
-    std::vector<u8> bytes_;
+    size_t resident_bytes_ = 0;
+    std::vector<std::vector<u8>> pages_; // payload allocated on first use
     std::vector<u32> refs_;
     std::vector<PageId> free_;
 };
@@ -70,6 +72,9 @@ public:
 
     bool bind(KvPagePool *pool, size_t rows_per_page);
     bool clone_from(const KvBlockTable &source);
+    // Fork only the pages intersecting the visible prefix. A partially shared
+    // final page is detached on the branch's first write past the fork point.
+    bool clone_prefix_from(const KvBlockTable &source, size_t logical_rows);
     // Returns the full mutable page containing logical_position, detaching it
     // first when shared. The caller owns the logical-row-to-byte offset math.
     u8 *writable_page(size_t logical_position);
