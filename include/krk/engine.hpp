@@ -467,15 +467,16 @@ public:
     // suffix is prefetched. Tokens the parent generated itself are not inherited,
     // so a parent can keep decoding while its branches run.
     //
-    // Ordinary f16-KV attention copies only the shared trunk rows and prefills
-    // the suffix. Lossy KV is refused: even a complete-prompt replay into a
-    // nonzero slot has not matched the single-slot output on the CPU fixture, so
-    // its row-addressing/quantized-kernel parity must be fixed first. Compressed
-    // attention and recurrent models are supported through a correctness-first
-    // fallback that resets that branch slot and prefills the complete prompt;
-    // this does NOT reuse their trunk state yet. Recurrent batch steps serialize
-    // one row per sequence against private per-slot state. Tests compare these
-    // fallbacks with standalone complete-prompt runs; they do not imply a speedup.
+    // Ordinary f16-KV attention copies the shared trunk rows and prefills only
+    // the suffix. Compressed-attention and recurrent forks also reuse those KV
+    // rows, restoring a prompt-boundary snapshot of compressor/recurrent state
+    // before prefill of the suffix. Recurrent batch steps serialize one row per
+    // sequence against private per-slot state. These snapshots avoid recomputing
+    // the trunk but are still copy-backed: no shared KV pages or branch-visibility
+    // mask exists, and no performance gain is claimed. Forks refuse all lossy
+    // KV. Int8 multi-slot sessions are also refused at batch_open because even
+    // a complete-prompt replay into a nonzero slot diverged from the single-slot
+    // CPU fixture. Other lossy formats remain unvalidated for forks.
     // The caller must keep each branch's GenerateParams and GenerateResult alive
     // through the session, just as for batch_join.
     //

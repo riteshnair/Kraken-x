@@ -125,16 +125,16 @@ analogue of.
    mix of requests.
 
 **Kraken today.** The row-table mechanism carries `(slot, position)` for
-attention rows. `Engine::batch_fork` now has correctness-first fallbacks where
-trunk state cannot yet be shared: compressed-attention and recurrent branches
-clear their destination slot and replay the complete branch prompt. Recurrent
-convolution/scan state is allocated per slot, and recurrent decode forwards are
-serialized one sequence at a time; `test_batch_fork` compares two sibling branch
-runs with isolated complete-prompt oracles. Ordinary f16 attention still reuses
-its trunk KV rows through copying. Lossy KV remains gated because a nonzero-slot
-full-prompt replay has not matched the single-slot oracle. These paths establish
-fixture parity only; compressed/recurrent trunk reuse, quantized parity, CoW
-pages, and a shared sibling-node visibility mask remain unimplemented.
+attention rows. Ordinary f16 attention forks copy trunk KV rows into independent
+slots and prefill only suffixes. Compressed-attention and recurrent branches now
+also reuse the copied KV prefix, restoring snapshots captured at the prompt
+boundary so the parent's generated continuation is excluded. Recurrent state is
+per slot and recurrent decode forwards are serialized one sequence at a time;
+`test_batch_fork` compares sibling recurrent branches with isolated full-prompt
+oracles. Lossy-KV multi-slot sessions are refused at `batch_open`: a direct
+nonzero-slot full-prompt probe still diverged from the slot-zero oracle. These
+changes establish fixture-level output parity, not speedup. Quantized parity,
+copy-on-write KV pages, and a shared sibling-node visibility mask remain open.
 
 **What we would build.** Generalise the row metadata from `(slot, position)` to
 `(trunk, branch, position)` and derive the attention mask from it, then add the
