@@ -23,6 +23,76 @@ The model mapping, dense weights, activation workspaces, host warm tiers, and
 allocator overhead are outside a single expert or KV budget. Total process RSS
 must be measured independently.
 
+## Adopted tiering lessons and limits
+
+The Betelgeuse and Kanjoos references are useful as policy and measurement
+examples, not as portable settings. Their hardware, model formats, and cache
+sizes do not define Kraken's budgets.
+
+### What Kraken already does
+
+- Expert residency is distinct from the mapped GGUF source, host WARM copies,
+  and device HOT slots. A disk-backed mapping is not counted as a second
+  application-owned expert cache; WARM copies are separately budgeted.
+- Device and host policies have explicit byte/slot limits. Host WARM admission
+  rechecks live available RAM through `SharedHostRamBudget`; it is not only a
+  one-time startup estimate. The engine reports the planned tiers, while the
+  bounded-MoE benchmark records actual process peak RSS separately.
+- Expert misses preserve the routed expert computation. Do not convert an I/O
+  failure into zero weights or a different expert choice. A failed demand read
+  must fail the operation rather than silently alter model output.
+- Prefetch/prediction is staging only: the native router still chooses the
+  experts that execute. Treat speculative staging as expendable, bounded work;
+  it must never raise the resident-slot cap or evict in-use data.
+
+These are distinct guarantees: an expert-slot or WARM-byte limit is not a hard
+limit on process RSS, page cache, or total machine memory. For a deployment that
+must not exceed a system ceiling, run under an OS-enforced limit (and record
+swap/OOM counters) in addition to measuring RSS. A simulated `--ram-tier` is
+planner input, not enforcement.
+
+### Safe ideas to carry forward
+
+- Keep a budget ledger per tier: configured cap, allocated/occupied bytes or
+  slots, current use, and any clamp/refusal reason. Do not merge VRAM, pinned
+  host memory, pageable WARM, mapped-file page cache, KV, and scratch into one
+  misleading “cache size.” Improve diagnostics only where a value is missing;
+  avoid a second policy that can disagree with the engine's enforced budget.
+- Preserve a hard ownership order during eviction: active leases and
+  event-referenced/in-flight transfers cannot be evicted; speculative prefetch
+  is lower priority than demand data. Any change to recency/frequency scoring
+  must be evaluated under the same hard limits, with forced-eviction and
+  concurrent-use tests.
+- Consider coalescing storage reads for adjacent expert payloads only as an
+  I/O-only experiment. Keep per-expert admission and execution identity
+  unchanged; cap bytes and requests in flight, cancel stale speculation, and
+  prove exact output parity. GGUF payload layout must be inspected rather than
+  assuming adjacent experts are physically contiguous.
+- Make cold-start, first-request, and repeated warm-request measurements
+  separate. Report peak RSS, VRAM peak, swap/OOM, resident slots/bytes, cold
+  bytes/read time, hit/eviction counts, prefill, decode, and output parity on
+  the same named model and workload. Never transplant another project's token
+  rates or cache sizes.
+
+### Ideas not adopted as defaults
+
+- Do not copy Betelgeuse's 8 GiB host victim cache or thousands of device slots.
+  Kraken's one-slot run remains the minimum-residency stress profile; larger
+  pools require an explicit comparison and measured reason.
+- Do not import Kanjoos's fixed VRAM/RAM split, eviction score, prefetch horizon,
+  or ReBAR requirement. Each is model/backend/device-dependent and needs a
+  Kraken measurement and correctness gate. The Kanjoos 16 GiB row also appears
+  inconsistent with its stated formula (`min(0.65 * RAM, RAM - 8 GiB)` gives
+  8 GiB, while its table lists 10.4 GiB); none of its numeric tier values are
+  treated as Kraken guidance.
+- Do not adopt its lower-precision expert-pack recommendations as a memory
+  shortcut. Any lossy format remains subject to Kraken's existing opt-in,
+  parity, and quality gates.
+- Explicit per-session resident/spilled/suspended KV admission classes could be
+  considered only after per-sequence KV ownership and accounting exist. The
+  current whole-layer tiering and batch refusals remain authoritative; do not
+  imply a session can spill safely merely by assigning it a label.
+
 ## Expert ownership
 
 `ExpertCache` owns resident expert slots and their eviction policy. Residency is
