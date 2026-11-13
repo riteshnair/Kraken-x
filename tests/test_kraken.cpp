@@ -2839,6 +2839,11 @@ struct MoeSpec {
     int n_expert_used = 2;
     bool shared = true;   // Qwen2-MoE style always-on shared expert
     bool varied = true;   // false => every expert identical to the dense FFN
+    // Attention geometry overrides for KV-format fixtures. Defaults preserve
+    // the tiny 32-wide model used by the existing architecture tests.
+    int n_head = 4;
+    int n_kv = 2;
+    int head_dim = 8;
     // Jinja program to write as `tokenizer.chat_template`, exactly as a real
     // file would carry it. Empty means the fixture declares no template, which
     // is the builtin-fallback case.
@@ -2858,7 +2863,7 @@ struct MoeSpec {
 };
 
 static bool build_tiny_moe_model(const std::string &path, const MoeSpec &s) {
-    const int n_embd = 32, n_head = 4, n_kv = 2, hd = 8;
+    const int n_embd = 32, n_head = s.n_head, n_kv = s.n_kv, hd = s.head_dim;
     const int n_ff = 64, n_ff_exp = 64, n_ff_sh = 32, vocab = 260, ctx = 64;
     const int q_dim = n_head * hd, kv_dim = n_kv * hd;
     // Both arms must be the SAME attention body or the twin comparison measures
@@ -33048,13 +33053,15 @@ static void test_batch_decode() {
         cfg.n_slots = slots;
         return engine->init(cpu, cfg, err);
     };
-    auto open_int8 = [&](Engine *engine, i32 slots, std::string *err) {
+    auto open_quant = [&](Engine *engine, const std::string &model_path,
+                          i32 slots, i32 quant, std::string *err) {
         EngineConfig cfg;
-        cfg.model_path = path;
+        cfg.model_path = model_path;
         cfg.n_ctx = 32;
         cfg.prefill_chunk = 8;
         cfg.n_slots = slots;
-        cfg.kv_quant = 1;
+        cfg.kv_quant = quant;
+        cfg.kv_quant_explicit = true;
         return engine->init(cpu, cfg, err);
     };
     auto params = [](const char *prompt, i32 max_tokens) {
@@ -33397,48 +33404,69 @@ static void test_batch_decode() {
                       " kept its solo tokens with chunk 1 and three slots");
     }
 
-    // Int8 multi-slot parity regression: every slot uses a distinct prompt so
-    // stale or cross-slot KV reads cannot hide behind identical outputs.
+    // Quantized multi-slot parity: distinct prompts of different lengths make
+    // stale or cross-slot KV reads observable. Rot4 needs a full 32-value block
+    // per KV head, so its fixture uses a compatible head width.
     {
-        std::vector<std::vector<i32>> int8_solo(4);
-        const char *int8_prompts[4] = {"the", "a the", "the a the", "a a the a"};
-        Engine oracle;
-        std::string err;
-        if (!open_int8(&oracle, 1, &err)) {
-            CHECK(false, std::string("int8 solo oracle initializes: ") + err);
-        } else {
+        const char *quant_prompts[4] = {"the", "a the", "the a the", "a a the a"};
+        const std::string rot4_path = "kraken-batch-rot4-parity.gguf";
+        MoeSpec rot4_spec;
+        rot4_spec.n_head = 1;
+        rot4_spec.n_kv = 1;
+        rot4_spec.head_dim = 32;
+        CHECK(build_tiny_moe_model(rot4_path, rot4_spec),
+              "wrote a 32-wide head fixture for Rot4 parity");
+        auto parity = [&](const char *name, i32 quant,
+                          const std::string &model_path) {
+            std::vector<std::vector<i32>> solo_tokens(4);
+            std::string err;
+            Engine oracle;
+            if (!open_quant(&oracle, model_path, 1, quant, &err)) {
+                CHECK(false, std::string(name) + " solo oracle initializes: " + err);
+                return;
+            }
             for (int i = 0; i < 4; ++i) {
                 GenerateResult r;
-                CHECK(oracle.generate(params(int8_prompts[i], 5), &r),
-                      "int8 solo oracle request completes");
-                int8_solo[static_cast<size_t>(i)] = r.tokens;
+                CHECK(oracle.generate(params(quant_prompts[i], 5), &r),
+                      std::string(name) + " solo oracle request completes");
+                solo_tokens[static_cast<size_t>(i)] = r.tokens;
             }
-        }
-        Engine batched;
-        if (!open_int8(&batched, 4, &err)) {
-            CHECK(false, std::string("int8 four-slot engine initializes: ") + err);
-        } else {
+            Engine batched;
+            if (!open_quant(&batched, model_path, 4, quant, &err)) {
+                CHECK(false, std::string(name) + " four-slot engine initializes: " + err);
+                return;
+            }
             CHECK(batched.batch_refusal().empty(),
-                  std::string("CPU int8 multi-slot batch is admitted: ") +
+                  std::string("CPU ") + name + " multi-slot batch is admitted: " +
                       batched.batch_refusal());
             std::vector<GenerateParams> reqs;
             for (int i = 0; i < 4; ++i)
-                reqs.push_back(params(int8_prompts[i], 5));
+                reqs.push_back(params(quant_prompts[i], 5));
             std::vector<GenerateResult> outs;
-            CHECK(batched.generate_batch(reqs, &outs), "int8 four-slot batch runs");
-            CHECK(outs.size() == 4, "int8 batch returns all four slot outputs");
+            CHECK(batched.generate_batch(reqs, &outs),
+                  std::string(name) + " four-slot batch runs");
+            CHECK(outs.size() == 4,
+                  std::string(name) + " batch returns all four slot outputs");
             for (int i = 0; i < 4 && i < static_cast<int>(outs.size()); ++i) {
-                if (outs[static_cast<size_t>(i)].tokens != int8_solo[static_cast<size_t>(i)]) {
-                    std::string a, b;
-                    for (i32 tok : int8_solo[static_cast<size_t>(i)]) a += std::to_string(tok) + " ";
-                    for (i32 tok : outs[static_cast<size_t>(i)].tokens) b += std::to_string(tok) + " ";
-                    std::fprintf(stderr, "  [int8 dbg] slot %d solo=[%s] batch=[%s]\n",
-                                 i, a.c_str(), b.c_str());
+                if (outs[static_cast<size_t>(i)].tokens != solo_tokens[static_cast<size_t>(i)]) {
+                    std::string solo_text, batch_text;
+                    for (i32 tok : solo_tokens[static_cast<size_t>(i)])
+                        solo_text += std::to_string(tok) + " ";
+                    for (i32 tok : outs[static_cast<size_t>(i)].tokens)
+                        batch_text += std::to_string(tok) + " ";
+                    std::fprintf(stderr,
+                                 "  [%s parity] slot %d solo=[%s] batch=[%s]\n",
+                                 name, i, solo_text.c_str(), batch_text.c_str());
                 }
-                CHECK(outs[static_cast<size_t>(i)].tokens == int8_solo[static_cast<size_t>(i)],
-                      "int8 slot " + std::to_string(i) + " matches its solo oracle");
+                CHECK(outs[static_cast<size_t>(i)].tokens == solo_tokens[static_cast<size_t>(i)],
+                      std::string(name) + " slot " + std::to_string(i) +
+                          " matches its solo oracle");
             }
-        }
+        };
+        parity("int8", 1, path);
+        parity("Turbo3", 2, path);
+        parity("Rot4", 3, rot4_path);
+        std::remove(rot4_path.c_str());
     }
 
     std::remove(path.c_str());

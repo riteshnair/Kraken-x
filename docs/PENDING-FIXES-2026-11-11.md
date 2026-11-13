@@ -63,13 +63,13 @@ reading cached keys, but omitted it when reading cached values. Nonzero slots
 therefore attended to their own keys and slot zero's values. The CPU value read
 now adds the row's `kvb`, matching the key read and the append address.
 
-**Evidence:** `test_batch_decode` now compares greedy outputs from four standalone
+**Evidence:** `test_batch_decode` compares greedy outputs from four standalone
 CPU int8 runs with a four-slot batch, using distinct prompts of different
-lengths. All slots, including slots 1–3, match exactly (105/105 checks). The
-int8-specific global batch refusal was removed; the backend's existing
-`attn_multiseq_supported()` check still refuses backends without per-row cache
-addressing. The lossy-format fork refusal remains unchanged. This validates CPU
-batch decode, not native-device parity or quantized forks.
+lengths. All slots, including slots 1–3, match exactly. The int8-specific global
+batch refusal was removed; the backend's existing `attn_multiseq_supported()`
+check still refuses backends without per-row cache addressing. The lossy-format
+fork refusal remains unchanged. CPU batch decode is covered; native-device
+parity and quantized forks are not.
 
 **Remaining coverage:** add native-device parity before enabling int8 batches on
 any device backend that advertises per-row attention. The separate per-format
@@ -77,16 +77,18 @@ batch/fork matrix below remains open; batch parity does not authorize forks.
 
 ### 2. Establish per-format quantized batch and fork parity
 
-The KV formats are f16, int8, Turbo3, and Rot4. Only int8 multi-slot sessions
-currently have the explicit `batch_refusal()` gate; this does not prove other
-formats correct. Forks remain disabled for every non-f16 format. Existing Turbo3
-HTTP fixture coverage is not the full slot/backend/fork matrix.
+The KV formats are f16, int8, Turbo3, and Rot4. CPU `test_batch_decode` now
+compares four standalone generations with a four-slot batch for int8 and Turbo3
+on the tiny fixture, and Rot4 on a matching 32-wide-head fixture. Each format
+uses distinct prompts of different lengths; outputs match exactly. This is
+fixture-level decode evidence, not full backend/API coverage. Forks remain
+disabled for every non-f16 format.
 
-**Work / acceptance:** parameterize solo-versus-multi-slot tests across int8,
-Turbo3, and Rot4 using the same model and KV format for oracle and batch runs.
-Cover `batch_open`/`batch_join`, HTTP admission, slot isolation, and forks as
-separate paths. Gate each unsupported format/backend combination with a tested
-refusal. Passing batch decode alone does not authorize forks.
+**Remaining work / acceptance:** cover `batch_open`/`batch_join` and HTTP
+admission for each supported format; keep unsupported backend/shape combinations
+behind tested refusals. Add native-device parity where a backend advertises
+per-row attention. Test lossy forks separately; passing batch decode does not
+authorize them.
 
 ### 3. Run the actual bounded-memory MoE experiment
 
