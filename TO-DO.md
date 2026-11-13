@@ -12,12 +12,12 @@ runs.
 
 ## Evidence rules
 
-- The release CPU suite passes 8185/8185 checks; the ASan build passes 8184/8184
-  across all 187 groups (`build-cpu`, and `build-asan` with
-  `detect_leaks=1:halt_on_error=1`). The one-check difference is deliberate: the
-  wall-clock ratio gate in `test_batch_decode` is skipped under instrumentation,
-  because ASan re-times two code paths unevenly and the number would be about the
-  sanitizer. ASan runs every group, so a leak in one is not hidden by another.
+- The current CPU Release suite passes 8231/8231 checks across all 187 groups
+  (`build-cpu`). The last recorded ASan run passed 8184/8184 checks before the
+  latest quantized-batch regression additions; rerun it before treating that
+  count as validation of the current tree. The Release/ASan one-check difference
+  was deliberate: the wall-clock ratio gate in `test_batch_decode` is skipped
+  under instrumentation because ASan re-times the code paths unevenly.
 - ASan validation uses `detect_leaks=1:halt_on_error=1`, without suppressions.
 - A synthetic fixture proves only the behavior it constructs. It does not prove
   real-model coherence, output quality, acceptance rate, or throughput.
@@ -90,13 +90,14 @@ Status labels:
   and reuse the copied trunk rows; recurrent decode remains serialized per
   sequence. `test_batch_fork` checks these paths against standalone runs,
   including nested and sibling recurrent forks, while preserving the parent's
-  continuation. This is fixture correctness, not a speedup claim. CPU int8
-  multi-slot decode now matches standalone outputs for four distinct prompts of
-  different lengths. The bug was a missing per-slot base on the CPU int8
-  attention value read; the corresponding key read already used that base.
-  Backends without per-row attention remain refused, and forks remain gated for
-  all lossy formats. Other quantized batch-session modes still need per-format
-  solo-output tests before drawing a parity conclusion. Remaining for
+  continuation. This is fixture correctness, not a speedup claim. CPU int8,
+  Turbo3, and Rot4 multi-slot decode now match four standalone outputs for
+  distinct prompts of different lengths (Rot4 uses a 32-wide-head fixture).
+  The int8 bug was a missing per-slot base on the CPU attention value read; the
+  corresponding key read already used that base. Backends without per-row
+  attention remain refused, and forks remain gated for all lossy formats.
+  Native-device, per-format session/HTTP admission, and lossy-fork coverage
+  remain open. Remaining for
   Flide: KV pages/refcounts/CoW and `(trunk, branch, position)`
   visibility masks. The current API still duplicates KV rows, and state snapshots
   copy data; there is no shared branch stream or measured throughput result. See
