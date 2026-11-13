@@ -245,9 +245,10 @@ void OpenAiService::start_scheduler() {
         KRK_INFO("slot serving off: %s", why.c_str());
         return;
     }
+    sched_running_.store(true, std::memory_order_relaxed);
     sched_ = std::thread(&OpenAiService::scheduler_loop, this);
     KRK_INFO("slot serving on: %d sequence(s) decode in one pass; a request "
-             "arriving during a pass waits for the next one",
+             "arriving mid-pass joins at the next step",
              static_cast<int>(engine_->n_slots()));
 }
 
@@ -260,34 +261,149 @@ OpenAiService::~OpenAiService() {
     if (sched_.joinable()) sched_.join();
 }
 
-// One wave at a time. Taking up to `n_slots` queued requests and decoding them
-// together is the whole of the policy: there is no eviction, no priority and no
-// partial wave, because a partial wave is what the next iteration will take.
+// Iteration-level admission.
+//
+// This used to be one wave at a time: take up to n_slots queued requests, run
+// them to completion, then take the next set. A request that arrived one step
+// after a wave started waited for the whole wave -- up to every sequence's
+// `max_tokens` -- before its own prefill began, so the queue's latency was the
+// other requests' generation time rather than the work the new request needs.
+//
+// Now the session stays open and requests join between steps. The scheduler
+// holds no policy of its own: admission order is arrival order, a request is
+// admitted whenever a slot is free, and the engine owns every arithmetic
+// decision. What the loop guarantees is that a step never runs with a slot
+// marked in use by a sequence the engine has already finished, and that a
+// request cancelled while it is still queued never reaches the engine at all.
 void OpenAiService::scheduler_loop() {
     std::unique_lock<std::mutex> lk(q_mu_);
-    while (true) {
-        q_cv_.wait(lk, [&] { return sched_stop_ || !q_.empty(); });
-        if (sched_stop_) break;
-        std::vector<Job *> wave;
-        const size_t cap = static_cast<size_t>(engine_->n_slots());
-        while (!q_.empty() && wave.size() < cap) {
-            wave.push_back(q_.front());
+    std::string open_err;
+    if (!engine_->batch_open(&open_err)) {
+        // The engine accepted the configuration at startup and refuses it now:
+        // report it, and answer whatever is already queued rather than leave
+        // those connections waiting on a thread that will not run steps.
+        KRK_ERROR("slot serving could not open a batch session: %s",
+                  open_err.c_str());
+        while (!q_.empty()) {
+            Job *j = q_.front();
             q_.pop_front();
-        }
-        lk.unlock();
-        std::vector<GenerateParams> params;
-        params.reserve(wave.size());
-        for (Job *j : wave) params.push_back(*j->p);
-        std::vector<GenerateResult> results;
-        const bool ok = engine_->generate_batch(params, &results);
-        lk.lock();
-        for (size_t i = 0; i < wave.size(); i++) {
-            if (i < results.size()) *wave[i]->r = results[i];
-            wave[i]->ok = ok;
-            wave[i]->done = true;
+            j->r->finish = FinishError;
+            j->r->error = open_err;
+            j->ok = false;
+            j->done = true;
         }
         done_cv_.notify_all();
+        sched_running_.store(false, std::memory_order_relaxed);
+        return;
     }
+
+    // Join index -> the job the engine is decoding for it. The engine reports
+    // completions by that index, so this is the only mapping admission needs.
+    std::vector<Job *> joined;
+    i32 join_base = 0; // engine join index of joined[0]
+    bool session_ok = true;
+    while (true) {
+        if (sched_stop_ && engine_->batch_active() == 0 && q_.empty()) break;
+
+        // 1. admit everything that fits, in arrival order. A cancelled request
+        //    is answered here and never costs a slot or a prefill.
+        while (session_ok && !q_.empty() && engine_->batch_free_slots() > 0) {
+            Job *j = q_.front();
+            q_.pop_front();
+            if (j->p->cancel && j->p->cancel->load(std::memory_order_relaxed)) {
+                j->r->finish = FinishStop;
+                j->r->cancelled = true;
+                j->ok = true;
+                j->done = true;
+                done_cv_.notify_all();
+                continue;
+            }
+            // The prefill runs outside the queue lock: it is the longest thing
+            // this thread does, and holding the lock through it would stop a new
+            // connection from even ENQUEUEING while it runs.
+            lk.unlock();
+            std::string why;
+            const bool joined_ok = engine_->batch_join(*j->p, j->r, &why);
+            lk.lock();
+            if (!joined_ok) {
+                if (j->r->error.empty()) j->r->error = why;
+                j->ok = false;
+                j->done = true;
+                done_cv_.notify_all();
+                continue;
+            }
+            joined.push_back(j);
+        }
+
+        // 2. nothing running and nothing waiting: block until an arrival or a
+        //    shutdown, so an idle server costs no CPU.
+        if (engine_->batch_active() == 0 && q_.empty()) {
+            q_cv_.wait(lk, [&] { return sched_stop_ || !q_.empty(); });
+            continue;
+        }
+
+        // 3. one iteration, outside the queue lock: a connection may arrive
+        //    while it runs, and it will be admitted at the next boundary.
+        lk.unlock();
+        std::vector<i32> finished;
+        const bool stepped = engine_->batch_step(&finished);
+        lk.lock();
+        for (i32 index : finished) {
+            if (index < join_base) continue;
+            const size_t at = static_cast<size_t>(index - join_base);
+            if (at >= joined.size()) continue;
+            Job *j = joined[at];
+            if (!j || j->done) continue;
+            j->ok = j->r->finish != FinishError;
+            j->done = true;
+            joined[at] = nullptr;
+        }
+        done_cv_.notify_all();
+        // The engine's join indices only grow, so the table is compacted from
+        // the front and a base index is carried with it. Without this a
+        // long-lived server would keep one pointer per request it ever served.
+        while (!joined.empty() && joined.front() == nullptr) {
+            joined.erase(joined.begin());
+            join_base++;
+        }
+
+        if (!stepped) {
+            // The forward pass failed: the engine has already finished every
+            // attached sequence with that error and reported them above. Close
+            // and reopen so the next request starts from a known state.
+            for (Job *j : joined) {
+                if (!j || j->done) continue;
+                j->ok = false;
+                j->done = true;
+            }
+            done_cv_.notify_all();
+            engine_->batch_close();
+            std::string reopen;
+            session_ok = engine_->batch_open(&reopen);
+            if (!session_ok)
+                KRK_ERROR("slot serving could not reopen the batch session: %s",
+                          reopen.c_str());
+            joined.clear();
+            join_base = 0;
+            if (!session_ok) {
+                // No session: answer the queue directly so nothing hangs, and
+                // leave the loop; run_generation falls back to the serial path
+                // once this thread is gone.
+                while (!q_.empty()) {
+                    Job *j = q_.front();
+                    q_.pop_front();
+                    j->r->finish = FinishError;
+                    j->r->error = reopen;
+                    j->ok = false;
+                    j->done = true;
+                }
+                done_cv_.notify_all();
+                break;
+            }
+        }
+    }
+    engine_->batch_close();
+    sched_running_.store(false, std::memory_order_relaxed);
 }
 
 OpenAiService::RunResult OpenAiService::run_generation(GenerateParams *p,

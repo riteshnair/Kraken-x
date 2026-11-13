@@ -312,10 +312,14 @@ Cached token usage is an execution metric, not evidence of response correctness.
 The held prefix is not a general radix tree.
 
 Available endpoints are `/`, `/health`, `/v1/models`, `/v1/tools/rv32`,
-`/v1/completions`, and `/v1/chat/completions`. The service loads one model and
-serializes generation. The engine also has a constrained multi-sequence API, but
-it excludes incompatible per-sequence state and is not exposed as unrestricted
-continuous batching by this server.
+`/v1/completions`, and `/v1/chat/completions`. The service loads one model.
+
+With more than one KV slot it decodes several requests in one pass and admits a
+new request between steps, so a request arriving mid-generation waits for one
+step rather than for the running set to drain. The batch is constrained: the
+engine refuses models and features whose state is per sequence rather than per
+row, and prefix reuse applies only to the serial path. This is iteration-level
+admission over that constrained batch, not unrestricted continuous batching.
 
 ## 7. Testing
 

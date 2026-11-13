@@ -19150,6 +19150,121 @@ static void test_http_server() {
 }
 
 // ---------------------------------------------------------------------------
+// B2.3c -- admission through the HTTP service
+// ---------------------------------------------------------------------------
+//
+// The engine session is unit-tested; this is the piece above it, the service
+// loop that owns the queue. It is a separate group because it needs a TWO-slot
+// engine, and the multi-slot configuration is exactly what turns the serial
+// request path off: prefix reuse disappears, `cached_tokens` becomes 0, and two
+// requests share one pass. Two connections asking for the same prompt must each
+// come back with the bytes a solo run produces, which is the property that
+// would break if admission mixed two sequences' rows.
+static void test_http_admission() {
+    const std::string path = "kraken-http-admission.gguf";
+    if (!build_tiny_model(path, false)) {
+        CHECK(false, "http admission: build_tiny_model failed");
+        return;
+    }
+
+    Backend *cpu = make_cpu_backend();
+    Engine engine;
+    EngineConfig cfg;
+    cfg.model_path = path;
+    cfg.n_ctx = 64;
+    cfg.prefill_chunk = 8;
+    cfg.kv_quant = 2;
+    cfg.n_slots = 2;
+    std::string err;
+    if (!engine.init(cpu, cfg, &err)) {
+        CHECK(false, std::string("http admission: the engine initialises (") + err + ")");
+        delete cpu;
+        std::remove(path.c_str());
+        return;
+    }
+    const std::string why = engine.batch_refusal();
+    CHECK(why.empty(), "http admission: the fixture is batchable: " + why);
+    CHECK(engine.n_slots() == 2, "http admission: two slots");
+    if (!why.empty()) {
+        engine.shutdown();
+        delete cpu;
+        std::remove(path.c_str());
+        return;
+    }
+
+    // What one request for this prompt produces alone: the service must not
+    // change it by decoding the same prompt twice in one pass.
+    GenerateParams ref_p;
+    ref_p.prompt = "the";
+    ref_p.max_tokens = 6;
+    ref_p.sampler.greedy = true;
+    ref_p.sampler.temp = 0.0f;
+    ref_p.sampler.repeat_penalty = 1.0f;
+    ref_p.sample_host = true;
+    GenerateResult ref;
+    CHECK(engine.generate(ref_p, &ref), "http admission: reference generation runs");
+    CHECK(!ref.tokens.empty(), "http admission: the reference produced tokens");
+
+    std::mutex gen_mu;
+    OpenAiService svc(&engine, 0.8f, &gen_mu);
+    HttpServer server;
+    CHECK(server.listen("127.0.0.1", 0, &err),
+          std::string("http admission: listener on an ephemeral port: ") + err);
+    const int port = server.port();
+    std::thread accept_thread([&server, &svc]() {
+        server.run([&svc](const HttpRequest &req, HttpResponse &res, HttpConn &conn) {
+            return svc.handle(req, res, conn);
+        });
+    });
+
+    const std::string req = "{\"prompt\":\"the\",\"max_tokens\":6,"
+                            "\"temperature\":0,\"repeat_penalty\":1.0}";
+    // Two connections in flight together. Both are admitted by the service
+    // loop: the first opens the pass, the second joins between steps.
+    std::string bodies[2];
+    int statuses[2] = {0, 0};
+    bool transport[2] = {false, false};
+    std::thread clients[2];
+    for (int i = 0; i < 2; i++) {
+        clients[i] = std::thread([&, i]() {
+            transport[i] = http_request(port, "POST", "/v1/completions", req,
+                                        &statuses[i], &bodies[i]);
+        });
+    }
+    for (auto &t : clients) t.join();
+
+    for (int i = 0; i < 2; i++) {
+        CHECK(transport[i], "http admission: request " + std::to_string(i) + " was answered");
+        CHECK(statuses[i] == 200,
+              "http admission: request " + std::to_string(i) + " returned 200, not " +
+                  std::to_string(statuses[i]));
+        JsonValue j;
+        std::string e;
+        const std::string payload = bodies[i].substr(bodies[i].find("\r\n\r\n") + 4);
+        CHECK(json_parse(payload, &j, &e), "http admission: body " + std::to_string(i) + " is JSON");
+        const JsonValue *usage = j.find("usage");
+        CHECK(usage && usage->get_int("cached_tokens") == 0,
+              "http admission: the batch answers cached_tokens=0");
+        const JsonValue *choices = j.find("choices");
+        if (choices && !choices->items().empty()) {
+            std::string text;
+            choices->items()[0].get_string("text", &text);
+            CHECK(text == ref.text,
+                  "http admission: request " + std::to_string(i) +
+                      " matches the solo text");
+        } else {
+            CHECK(false, "http admission: request " + std::to_string(i) + " has a choice");
+        }
+    }
+
+    server.stop();
+    accept_thread.join();
+    engine.shutdown();
+    delete cpu;
+    std::remove(path.c_str());
+}
+
+// ---------------------------------------------------------------------------
 // The pool's completion accounting IS the correctness argument: a worker that
 // mistimes its completion marker either strands the caller in run() forever or
 // replays a block, and the difference is a hang or two threads writing the same
@@ -31565,6 +31680,235 @@ static void test_cli_arg_refusal() {
 #define TEST_GROUP_SERIAL(fn, why) {#fn, fn, why},
 
 // ---------------------------------------------------------------------------
+// B2.3b -- iteration-level admission
+// ---------------------------------------------------------------------------
+//
+// The batched entry point used to be one call per wave: it returned when the
+// LAST sequence of the wave finished, so a request arriving one step in waited
+// for the whole wave before its prefill began. A session keeps the slots and
+// admits between steps instead.
+//
+// What this group pins is the contract that makes that safe rather than fast:
+// a sequence admitted mid-session produces exactly the tokens it produces
+// alone, its step count is its own (not the session's), and a cancelled
+// request leaves without disturbing anyone. The latency claim itself is not
+// measurable here -- a one-layer fixture has no queue to speak of -- so what is
+// asserted is the mechanism: a slot freed by a finished sequence is reused
+// while the others are still decoding.
+static void test_batch_admission() {
+    Backend *cpu = make_cpu_backend();
+    const std::string path = "kraken-batch-admission.gguf";
+    MoeSpec s;
+    s.dense = false;
+    s.n_expert = 4;
+    s.n_expert_used = 2;
+    s.shared = true;
+    s.varied = true;
+    CHECK(build_tiny_moe_model(path, s), "wrote a MoE fixture for the admission test");
+
+    auto open = [&](Engine *engine, i32 slots, std::string *err) {
+        EngineConfig cfg;
+        cfg.model_path = path;
+        cfg.n_ctx = 32;
+        cfg.prefill_chunk = 8;
+        cfg.n_slots = slots;
+        return engine->init(cpu, cfg, err);
+    };
+    auto params = [](const char *prompt, i32 max_tokens) {
+        GenerateParams p;
+        p.prompt = prompt;
+        p.max_tokens = max_tokens;
+        p.sampler.greedy = true;
+        p.sampler.temp = 0.0f;
+        p.sample_host = true;
+        return p;
+    };
+    const char *prompts[4] = {"the", "a the", "the a", "a a the a"};
+    const i32 limits[4] = {6, 3, 6, 4};
+    // The short arm admits its first request with a lower limit than the oracle
+    // uses, so it finishes while the second is still decoding. Its own oracle is
+    // a solo run at that limit, not at limits[0].
+    const i32 short_limit = 3;
+    std::vector<i32> solo_short;
+
+    // The oracle: every prompt alone, through the serial path.
+    std::vector<std::vector<i32>> solo(4);
+    std::vector<int> solo_finish(4);
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 2, &err)) {
+            CHECK(false, "the admission oracle engine initialises");
+            delete cpu;
+            return;
+        }
+        for (int i = 0; i < 4; i++) {
+            GenerateParams p = params(prompts[i], limits[i]);
+            GenerateResult r;
+            CHECK(engine.generate(p, &r), "solo run " + std::to_string(i) + " completes");
+            solo[i] = r.tokens;
+            solo_finish[i] = r.finish;
+        }
+        GenerateParams p = params(prompts[0], short_limit);
+        GenerateResult r;
+        CHECK(engine.generate(p, &r), "the short solo run completes");
+        solo_short = r.tokens;
+    }
+
+    // --- a late arrival joins and still matches its solo run -----------------
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 2, &err)) {
+            CHECK(false, "the admission engine initialises");
+            delete cpu;
+            return;
+        }
+        std::string why;
+        CHECK(engine.batch_open(&why), std::string("a session opens: ") + why);
+        CHECK(engine.batch_free_slots() == 2, "both slots are free at the start");
+
+        // A short request, so it finishes while B is still decoding.
+        GenerateParams pa = params(prompts[0], short_limit);
+        GenerateResult ra;
+        CHECK(engine.batch_join(pa, &ra, &why), std::string("A joins: ") + why);
+        CHECK(engine.batch_free_slots() == 1, "A took one slot");
+
+        std::vector<i32> finished;
+        bool a_done = false;
+        auto step = [&]() {
+            finished.clear();
+            const bool ok = engine.batch_step(&finished);
+            for (i32 index : finished)
+                if (index == 0) a_done = true;
+            return ok;
+        };
+        CHECK(step(), "the first step runs");
+        CHECK(!a_done, "A has not finished after one step");
+
+        // B arrives while A is decoding -- the case the wave design made wait.
+        GenerateParams pb = params(prompts[1], limits[1]);
+        GenerateResult rb;
+        CHECK(engine.batch_join(pb, &rb, &why), std::string("B joins mid-session: ") + why);
+        CHECK(engine.batch_free_slots() == 0, "the session is now full");
+
+        // C cannot join yet: the session refuses rather than queueing.
+        GenerateParams pc = params(prompts[2], limits[2]);
+        GenerateResult rc;
+        CHECK(!engine.batch_join(pc, &rc, &why), "a full session refuses a join");
+        CHECK(why.find("slot") != std::string::npos,
+              std::string("and says why: ") + why);
+
+        // Admission latency, in the only unit that is not machine-dependent:
+        // ONE step. B's first token appears in the first iteration after it
+        // joined, not after the sequence it joined has drained.
+        CHECK(step(), "a step runs after the mid-session join");
+        CHECK(rb.generated >= 1,
+              "a request admitted mid-session emits a token on its first step");
+        CHECK(engine.batch_active() >= 1, "the sequence it joined is still running");
+
+        // Run until A finishes; its slot must come back with B still decoding.
+        for (int k = 0; k < 8 && !a_done; k++)
+            CHECK(step(), "a step runs while both are attached");
+        CHECK(a_done, "the short request finished without the long one draining");
+        CHECK(engine.batch_active() == 1, "B is still decoding when A is gone");
+        CHECK(engine.batch_free_slots() == 1, "A's slot came back");
+        CHECK(ra.tokens == solo_short,
+              "A's tokens are the tokens the same request produces alone");
+        CHECK(ra.finish == FinishLength, "A stopped at its own limit");
+
+        // C joins into the slot A released, while B keeps decoding.
+        CHECK(engine.batch_join(pc, &rc, &why),
+              std::string("C joins into the freed slot: ") + why);
+        CHECK(engine.batch_active() == 2, "B and C decode together");
+        int guard = 0;
+        while (engine.batch_active() > 0 && guard++ < 64) {
+            finished.clear();
+            CHECK(engine.batch_step(&finished), "the session keeps stepping");
+        }
+        CHECK(engine.batch_active() == 0, "the session drains");
+        CHECK(rb.tokens == solo[1],
+              "the mid-session arrival produced its solo tokens (" +
+                  std::to_string(rb.tokens.size()) + " vs " +
+                  std::to_string(solo[1].size()) + ")");
+        CHECK(rb.finish == solo_finish[1], "the mid-session arrival kept its finish reason");
+        CHECK(rc.tokens == solo[2], "the reused-slot arrival produced its solo tokens");
+        // Per-sequence accounting: B and C each report their own steps, not the
+        // session's. A session is not a wave, so neither inherits the other's
+        // step count.
+        CHECK(rb.decode_steps > 0 && rc.decode_steps > 0,
+              "both sequences count their own decode steps");
+        // The first token comes out of the prefill pass's last row, so a
+        // length-limited sequence runs exactly generated-1 steps of its own --
+        // and NOT the session's total, which is what a wave used to report.
+        CHECK(rb.decode_steps == rb.generated - 1,
+              "B's step count is its own, not the session's");
+        CHECK(rc.decode_steps == rc.generated - 1,
+              "C's step count is its own, not the session's");
+        CHECK(rb.decode_steps < rc.decode_steps,
+              "the request that generated more took more of its own steps");
+        engine.batch_close();
+    }
+
+    // --- cancellation inside a session --------------------------------------
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 2, &err)) {
+            CHECK(false, "the cancellation engine initialises");
+            delete cpu;
+            return;
+        }
+        std::string why;
+        CHECK(engine.batch_open(&why), std::string("a session opens: ") + why);
+        std::atomic<bool> stop{false};
+        GenerateParams pa = params(prompts[0], limits[0]);
+        pa.cancel = &stop;
+        GenerateParams pb = params(prompts[1], limits[1]);
+        GenerateResult ra, rb;
+        CHECK(engine.batch_join(pa, &ra, &why), "the cancellable request joins");
+        CHECK(engine.batch_join(pb, &rb, &why), "its neighbour joins");
+        std::vector<i32> finished;
+        CHECK(engine.batch_step(&finished), "one step runs");
+        stop.store(true, std::memory_order_relaxed);
+        int guard = 0;
+        while (engine.batch_active() > 0 && guard++ < 64) {
+            finished.clear();
+            CHECK(engine.batch_step(&finished), "steps continue after a cancellation");
+        }
+        CHECK(ra.cancelled, "the cancelled sequence reports the cancellation");
+        CHECK(ra.finish == FinishStop, "and finishes as a stop");
+        CHECK(!rb.cancelled, "the neighbour was not cancelled with it");
+        CHECK(rb.tokens == solo[1],
+              "the neighbour's tokens are unchanged by the cancellation");
+        CHECK(rb.finish == solo_finish[1], "and so is its finish reason");
+        engine.batch_close();
+    }
+
+    // --- a closed session leaves nothing attached ---------------------------
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 2, &err)) {
+            CHECK(false, "the teardown engine initialises");
+            delete cpu;
+            return;
+        }
+        std::string why;
+        CHECK(engine.batch_open(&why), "a session opens for the teardown arm");
+        GenerateParams pa = params(prompts[0], limits[0]);
+        GenerateResult ra;
+        CHECK(engine.batch_join(pa, &ra, &why), "a request joins the teardown session");
+        engine.batch_close();
+        CHECK(!engine.batch_running(), "the session is closed");
+        engine.batch_close(); // a second close is a no-op, not a use-after-free
+        CHECK(!engine.batch_running(), "and still closed");
+    }
+
+    delete cpu;
+}
+
+// ---------------------------------------------------------------------------
 // B2.3 -- batched decode. One forward pass serves several sequences, each with
 // its own KV region and its own position. The contract is exactness: a slot's
 // tokens are the tokens that sequence produces alone, because the only thing
@@ -32470,6 +32814,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_dflash_laguna_spelling)
     TEST_GROUP(test_json)
     TEST_GROUP(test_http_server)
+    TEST_GROUP(test_http_admission)
     TEST_GROUP(test_http_listener_lifetime)
     TEST_GROUP(test_par_pool_covers_every_block)
     TEST_GROUP(test_kv_quant_int8)
@@ -32480,6 +32825,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_kv_tier_per_plane_cold_files)
     TEST_GROUP(test_moe_batch_ops)
     TEST_GROUP(test_batch_decode)
+    TEST_GROUP(test_batch_admission)
     TEST_GROUP_SERIAL(test_batch_throughput,
                       "times the machine: four sequences batched vs serial")
     TEST_GROUP(test_cli_arg_refusal)
