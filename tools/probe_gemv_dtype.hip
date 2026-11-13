@@ -54,6 +54,7 @@ struct Fmt {
 };
 
 const Fmt kFmts[] = {
+    {DType::IQ2_XS, "IQ2_XS", 256, 74, 0},
     {DType::Q4_K, "Q4_K", 256, 144, 0},
     {DType::Q5_K, "Q5_K", 256, 176, 0},
     {DType::Q6_K, "Q6_K", 256, 210, 208},
@@ -125,6 +126,34 @@ __global__ void l2_flush_kernel(const u32 *__restrict__ p, size_t n32,
     if (acc == 0xFFFFFFFFu) sink[0] = acc; // never taken on a zero fill
 }
 
+// Compare the new fused IQ2_XS pair-dot with the exact generic path it
+// replaces: dequantize the 32-value chunk to f16, then accumulate even and odd
+// products in separate f32 chains. Outputs carry (difference, gross magnitude)
+// so the caller can report a conditioning-independent error bound.
+__global__ void check_iq2xs_dot_kernel(const u8 *__restrict__ blocks,
+                                       const _Float16 *__restrict__ x,
+                                       f32 *__restrict__ result,
+                                       int nblocks) {
+    const int block = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (block >= nblocks) return;
+    const u8 *b = blocks + static_cast<size_t>(block) * 74;
+    f32 fast = dot_chunks_t<DType::IQ2_XS>(b, x, 0, 8);
+    f32 even = 0.0f, odd = 0.0f, gross = 0.0f;
+    _Float16 tmp[32];
+    for (int c = 0; c < 8; ++c) {
+        dequant_chunk<DType::IQ2_XS>(b, c, tmp);
+        for (int j = 0; j < 32; ++j) {
+            const f32 term = static_cast<f32>(tmp[j]) *
+                             static_cast<f32>(x[c * 32 + j]);
+            if (j & 1) odd += term;
+            else even += term;
+            gross += fabsf(term);
+        }
+    }
+    result[block * 2] = fast - (even + odd);
+    result[block * 2 + 1] = gross;
+}
+
 // One weight matrix as the walk sees it.
 struct Mat {
     u8 *w;
@@ -147,6 +176,52 @@ int main() {
     std::printf("device: %s  CUs=%d  bus=%d bit (measured HBM band: see the "
                 ">=600 MiB rows)\n\n",
                 prop.gcnArchName, cu, prop.memoryBusWidth);
+
+    // First prove the IQ2_XS fast path against the generic decoder/dot order on
+    // random valid blocks. This probe deliberately compares full block output,
+    // not a hand-picked codebook entry, before reporting throughput.
+    constexpr int kCheckBlocks = 2048;
+    Fmt iq2xs{DType::IQ2_XS, "IQ2_XS", 256, 74, 0};
+    std::vector<u8> check_host((size_t)kCheckBlocks * 74);
+    fill(check_host, iq2xs);
+    std::vector<_Float16> check_x(256);
+    u32 xs = 0xA511E9B3u;
+    for (_Float16 &v : check_x) {
+        xs ^= xs << 13; xs ^= xs >> 17; xs ^= xs << 5;
+        v = static_cast<_Float16>(
+            (static_cast<int>((xs >> 16) & 2047u) - 1024) / 512.0f);
+    }
+    u8 *check_blocks = nullptr;
+    _Float16 *check_device_x = nullptr;
+    f32 *check_result = nullptr;
+    if (hipMalloc(&check_blocks, check_host.size()) != hipSuccess ||
+        hipMalloc(&check_device_x, check_x.size() * sizeof(_Float16)) != hipSuccess ||
+        hipMalloc(&check_result, (size_t)kCheckBlocks * 2 * sizeof(f32)) != hipSuccess)
+        return 1;
+    hipMemcpy(check_blocks, check_host.data(), check_host.size(), hipMemcpyHostToDevice);
+    hipMemcpy(check_device_x, check_x.data(), check_x.size() * sizeof(_Float16),
+              hipMemcpyHostToDevice);
+    check_iq2xs_dot_kernel<<<(kCheckBlocks + 255) / 256, 256>>>(
+        check_blocks, check_device_x, check_result, kCheckBlocks);
+    if (hipDeviceSynchronize() != hipSuccess) return 1;
+    std::vector<f32> check_out((size_t)kCheckBlocks * 2);
+    hipMemcpy(check_out.data(), check_result, check_out.size() * sizeof(f32),
+              hipMemcpyDeviceToHost);
+    f32 worst_iq2xs_rel = 0.0f;
+    for (int i = 0; i < kCheckBlocks; ++i) {
+        const f32 rel = fabsf(check_out[(size_t)i * 2]) /
+                        fmaxf(check_out[(size_t)i * 2 + 1], 1.0e-30f);
+        worst_iq2xs_rel = fmaxf(worst_iq2xs_rel, rel);
+    }
+    std::printf("IQ2_XS fused-dot check: %d random blocks, worst error/gross %.3e\n\n",
+                kCheckBlocks, worst_iq2xs_rel);
+    hipFree(check_result);
+    hipFree(check_device_x);
+    hipFree(check_blocks);
+    if (worst_iq2xs_rel > 2.0e-5f) {
+        std::fprintf(stderr, "IQ2_XS fused dot exceeded 2e-5 error/gross gate\n");
+        return 2;
+    }
 
     _Float16 *x = nullptr, *o = nullptr;
     const int xcap = 65536;

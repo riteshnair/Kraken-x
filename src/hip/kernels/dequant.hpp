@@ -983,6 +983,50 @@ __device__ __forceinline__ f32 dot_chunk_q5k(const u8 *b, int cc,
     return dl * acc - (1024.0f * dl + mn) * sum;
 }
 
+// IQ2_XS is four 8-value codebook groups per 32-value chunk. Decode each
+// signed pair directly into packed f16 registers and feed it to dot2, rather
+// than materializing a 32-half temporary and then doing 32 scalar products.
+// Keep the scale multiply and f16 conversion in the same order as
+// dequant_chunk_iq2_xs so this remains numerically comparable to the generic
+// decode-then-dot path. The 4 groups share two scales (groups 0/1 and 2/3).
+__device__ __forceinline__ u32 iq2xs_weight_pair(const u64 grid, u8 signs,
+                                                  int j, f32 db) {
+    const f32 g0 = static_cast<f32>(static_cast<int>((grid >> (8 * j)) & 0xFFu));
+    const f32 g1 = static_cast<f32>(static_cast<int>((grid >> (8 * (j + 1))) & 0xFFu));
+    const f32 v0 = db * g0 * ((signs & kDevMaskIq2xs[j]) ? -1.0f : 1.0f);
+    const f32 v1 = db * g1 * ((signs & kDevMaskIq2xs[j + 1]) ? -1.0f : 1.0f);
+    const _Float16 pair[2] = {static_cast<_Float16>(v0),
+                              static_cast<_Float16>(v1)};
+    u32 bits;
+    __builtin_memcpy(&bits, pair, sizeof(bits));
+    return bits;
+}
+
+__device__ __forceinline__ f32 dot_chunk_iq2_xs(const u8 *b, int chunk,
+                                                 const _Float16 *x) {
+    const f32 d = d_h2f(static_cast<u16>(b[0] | (b[1] << 8)));
+    const u8 scale = b[66 + chunk];
+    const f32 db[2] = {
+        d * (0.5f + static_cast<f32>(scale & 0x0F)) * 0.25f,
+        d * (0.5f + static_cast<f32>(scale >> 4)) * 0.25f,
+    };
+    f32 acc = 0.0f;
+#pragma unroll
+    for (int l = 0; l < 4; l++) {
+        const int idx = 4 * chunk + l;
+        const u16 q = static_cast<u16>(b[2 + 2 * idx] | (b[3 + 2 * idx] << 8));
+        const u64 grid = kDevIq2xsGrid[q & 511u];
+        const u8 signs = kDevSignsIq2xs[(q >> 9) & 127u];
+        const f32 group_scale = db[l >> 1];
+#pragma unroll
+        for (int j = 0; j < 8; j += 2) {
+            const u32 weights = iq2xs_weight_pair(grid, signs, j, group_scale);
+            acc = d_dot2_pk(weights, dot_pair_act(x + 8 * l + j), acc);
+        }
+    }
+    return acc;
+}
+
 #endif // KRK_HAS_DOT2
 
 // dot over chunks [c0, c1) of a weight row against fp16 activations.
@@ -1028,6 +1072,17 @@ __device__ __forceinline__ f32 dot_chunks_t<DType::Q5_K>(const u8 *wrow,
     for (int c = c0; c < c1; c++)
         acc += dot_chunk_q5k(wrow + (c >> 3) * 176, c & 7,
                              x + static_cast<i64>(c) * 32);
+    return acc;
+}
+
+template <>
+__device__ __forceinline__ f32 dot_chunks_t<DType::IQ2_XS>(const u8 *wrow,
+                                                           const _Float16 *x,
+                                                           int c0, int c1) {
+    f32 acc = 0.0f;
+    for (int c = c0; c < c1; c++)
+        acc += dot_chunk_iq2_xs(wrow + (c >> 3) * 74, c & 7,
+                                x + static_cast<i64>(c) * 32);
     return acc;
 }
 #endif
