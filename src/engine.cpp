@@ -15736,9 +15736,6 @@ std::string Engine::batch_refusal() const {
     if (!be_) return "no backend is attached to this engine";
     if (!be_->attn_multiseq_supported())
         return "this backend does not address the KV cache per row";
-    if (n_slots_ > 1 && kv_quant_of(cfg_) == KvQuant::Int8)
-        return "multi-slot sessions are disabled for int8 KV until row-addressing "
-               "passes solo-output parity";
     const ModelConfig &mc = model_.cfg();
     // Every refusal below is a per-SEQUENCE thing that a row cannot carry.
     // They are named rather than probed because the failure they prevent is

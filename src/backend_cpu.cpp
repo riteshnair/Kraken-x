@@ -2529,7 +2529,7 @@ public:
                             for (i64 i = 0; i < d.hd; i++) oh[i] = 0.0f;
                             for (i64 j = 0; j < n_vis; j++) {
                                 const f32 p = scores[static_cast<size_t>(j)] * inv;
-                                const u8 *row = vc + (j_lo + j) * d.pos_stride;
+                                const u8 *row = vc + kvb + (j_lo + j) * d.pos_stride;
                                 const f32 *sc =
                                     reinterpret_cast<const f32 *>(row + kv_dim);
                                 for (i64 i = 0; i < d.hd; i++) {

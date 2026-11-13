@@ -32446,9 +32446,8 @@ static void test_batch_fork() {
         CHECK(!engine.batch_fork(0, ok, &outs, &why), "a fork with no session is refused");
     }
 
-    // Multi-slot quantized sessions are disabled until the quantized row-base
-    // path passes isolated-output parity. Exercise the refusal at session open,
-    // since allowing batch_join without a safe row path would silently diverge.
+    // Int8 multi-slot decode is parity-tested in test_batch_decode, but lossy
+    // KV forks remain gated independently until their own fork parity passes.
     {
         EngineConfig cfg;
         cfg.model_path = path;
@@ -32463,11 +32462,21 @@ static void test_batch_fork() {
             delete cpu;
             return;
         }
-        CHECK(!engine.batch_open(&why),
-              "int8 multi-slot sessions stay refused until solo-output parity is established");
-        CHECK(why.find("int8 KV") != std::string::npos &&
-                  why.find("solo-output parity") != std::string::npos,
-              std::string("and states the multi-slot safety gate: ") + why);
+        CHECK(engine.batch_open(&why),
+              std::string("int8 multi-slot decode session opens: ") + why);
+        GenerateParams parent_params = params("the a", 5);
+        GenerateResult parent;
+        CHECK(engine.batch_join(parent_params, &parent, &why),
+              std::string("the int8 parent joins: ") + why);
+        std::vector<i32> finished;
+        CHECK(engine.batch_step(&finished), "the int8 parent prefills");
+        std::vector<GenerateParams> branches{params("the a branch", 2)};
+        std::vector<GenerateResult> branch_out;
+        CHECK(!engine.batch_fork(0, branches, &branch_out, &why),
+              "int8 KV forks remain refused pending fork-specific parity");
+        CHECK(why.find("quantized KV forks") != std::string::npos,
+              std::string("and states the independent fork gate: ") + why);
+        engine.batch_close();
     }
 
     // Compressed attention carries pooled-key and compressor state in addition
@@ -33039,6 +33048,15 @@ static void test_batch_decode() {
         cfg.n_slots = slots;
         return engine->init(cpu, cfg, err);
     };
+    auto open_int8 = [&](Engine *engine, i32 slots, std::string *err) {
+        EngineConfig cfg;
+        cfg.model_path = path;
+        cfg.n_ctx = 32;
+        cfg.prefill_chunk = 8;
+        cfg.n_slots = slots;
+        cfg.kv_quant = 1;
+        return engine->init(cpu, cfg, err);
+    };
     auto params = [](const char *prompt, i32 max_tokens) {
         GenerateParams p;
         p.prompt = prompt;
@@ -33377,6 +33395,50 @@ static void test_batch_decode() {
             CHECK(outs[static_cast<size_t>(i)].tokens == solo[static_cast<size_t>(i)],
                   "sequence " + std::to_string(i) +
                       " kept its solo tokens with chunk 1 and three slots");
+    }
+
+    // Int8 multi-slot parity regression: every slot uses a distinct prompt so
+    // stale or cross-slot KV reads cannot hide behind identical outputs.
+    {
+        std::vector<std::vector<i32>> int8_solo(4);
+        const char *int8_prompts[4] = {"the", "a the", "the a the", "a a the a"};
+        Engine oracle;
+        std::string err;
+        if (!open_int8(&oracle, 1, &err)) {
+            CHECK(false, std::string("int8 solo oracle initializes: ") + err);
+        } else {
+            for (int i = 0; i < 4; ++i) {
+                GenerateResult r;
+                CHECK(oracle.generate(params(int8_prompts[i], 5), &r),
+                      "int8 solo oracle request completes");
+                int8_solo[static_cast<size_t>(i)] = r.tokens;
+            }
+        }
+        Engine batched;
+        if (!open_int8(&batched, 4, &err)) {
+            CHECK(false, std::string("int8 four-slot engine initializes: ") + err);
+        } else {
+            CHECK(batched.batch_refusal().empty(),
+                  std::string("CPU int8 multi-slot batch is admitted: ") +
+                      batched.batch_refusal());
+            std::vector<GenerateParams> reqs;
+            for (int i = 0; i < 4; ++i)
+                reqs.push_back(params(int8_prompts[i], 5));
+            std::vector<GenerateResult> outs;
+            CHECK(batched.generate_batch(reqs, &outs), "int8 four-slot batch runs");
+            CHECK(outs.size() == 4, "int8 batch returns all four slot outputs");
+            for (int i = 0; i < 4 && i < static_cast<int>(outs.size()); ++i) {
+                if (outs[static_cast<size_t>(i)].tokens != int8_solo[static_cast<size_t>(i)]) {
+                    std::string a, b;
+                    for (i32 tok : int8_solo[static_cast<size_t>(i)]) a += std::to_string(tok) + " ";
+                    for (i32 tok : outs[static_cast<size_t>(i)].tokens) b += std::to_string(tok) + " ";
+                    std::fprintf(stderr, "  [int8 dbg] slot %d solo=[%s] batch=[%s]\n",
+                                 i, a.c_str(), b.c_str());
+                }
+                CHECK(outs[static_cast<size_t>(i)].tokens == int8_solo[static_cast<size_t>(i)],
+                      "int8 slot " + std::to_string(i) + " matches its solo oracle");
+            }
+        }
     }
 
     std::remove(path.c_str());

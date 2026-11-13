@@ -56,26 +56,24 @@ work. It is not a claim that the papers' reported performance has been reproduce
 
 ## Ordered pending work
 
-### 1. Fix int8 KV multi-slot slot-zero/nonzero parity — known correctness bug
+### 1. Int8 KV multi-slot slot-zero/nonzero parity — CPU fix validated
 
-**Observed:** a CPU tiny-model probe generated `5 5 5 5` in slot zero and
-`5 5 3 1` in a nonzero slot with int8 KV. Serializing batch processing did not
-fix it. The old divergent probe was replaced by a safety-refusal assertion, so it
-must be restored as a failing regression before the implementation is changed.
+**Root cause and fix:** CPU int8 attention included the per-slot base when
+reading cached keys, but omitted it when reading cached values. Nonzero slots
+therefore attended to their own keys and slot zero's values. The CPU value read
+now adds the row's `kvb`, matching the key read and the append address.
 
-**Current guard:** `Engine::batch_refusal()` refuses multi-slot int8 sessions;
-`Engine::batch_fork()` refuses forks for every lossy KV format. Keep both rules.
+**Evidence:** `test_batch_decode` now compares greedy outputs from four standalone
+CPU int8 runs with a four-slot batch, using distinct prompts of different
+lengths. All slots, including slots 1–3, match exactly (105/105 checks). The
+int8-specific global batch refusal was removed; the backend's existing
+`attn_multiseq_supported()` check still refuses backends without per-row cache
+addressing. The lossy-format fork refusal remains unchanged. This validates CPU
+batch decode, not native-device parity or quantized forks.
 
-**Work:** instrument the earliest divergent position and compare K/V data,
-quantization scales, row bases, and strides from slot zero, nonzero slots, and a
-single-slot oracle. Investigate prefill and decode separately. Do not assume a
-scheduler race: serialization was already tried without success.
-
-**Acceptance:** a persistent test compares logits at each step plus greedy
-outputs for slots 0, 1, and a later slot; include unequal prompts, chunk
-boundaries, and slot isolation. Require exact CPU equality if the kernels match;
-document any backend-specific numeric tolerance. Add native device coverage before
-lifting the int8 gate there.
+**Remaining coverage:** add native-device parity before enabling int8 batches on
+any device backend that advertises per-row attention. The separate per-format
+batch/fork matrix below remains open; batch parity does not authorize forks.
 
 ### 2. Establish per-format quantized batch and fork parity
 
