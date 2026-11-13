@@ -32434,10 +32434,9 @@ static void test_batch_fork() {
         CHECK(!engine.batch_fork(0, ok, &outs, &why), "a fork with no session is refused");
     }
 
-    // Quantized KV fork support remains gated: even a complete-prompt replay
-    // in a nonzero slot differs from the single-slot oracle on this fixture.
-    // Do not return plausible but divergent tokens while the row-base parity
-    // issue is unresolved.
+    // Multi-slot quantized sessions are disabled until the quantized row-base
+    // path passes isolated-output parity. Exercise the refusal at session open,
+    // since allowing batch_join without a safe row path would silently diverge.
     {
         EngineConfig cfg;
         cfg.model_path = path;
@@ -32445,32 +32444,23 @@ static void test_batch_fork() {
         cfg.prefill_chunk = 8;
         cfg.n_slots = 3;
         cfg.kv_quant = 1;
-        std::string err;
+        std::string err, why;
         Engine engine;
         if (!engine.init(cpu, cfg, &err)) {
             CHECK(false, std::string("the int8 fork engine initializes: ") + err);
             delete cpu;
             return;
         }
-        std::string why;
-        CHECK(engine.batch_open(&why), "the int8 batch session opens");
-        GenerateParams pp = params(trunk, 3);
-        GenerateResult pr;
-        CHECK(engine.batch_join(pp, &pr, &why), "the int8 trunk joins");
-        std::vector<i32> finished;
-        CHECK(engine.batch_step(&finished), "the int8 trunk prefills");
-        std::vector<GenerateParams> qbranch{params(branch_prompt[0], 2)};
-        std::vector<GenerateResult> qout;
-        CHECK(!engine.batch_fork(0, qbranch, &qout, &why),
-              "int8 fork stays refused until multi-slot parity is established");
-        CHECK(why.find("multi-slot solo-output parity") != std::string::npos,
-              std::string("and states the exact gate: ") + why);
-        engine.batch_close();
+        CHECK(!engine.batch_open(&why),
+              "int8 multi-slot sessions stay refused until solo-output parity is established");
+        CHECK(why.find("int8 KV") != std::string::npos &&
+                  why.find("solo-output parity") != std::string::npos,
+              std::string("and states the multi-slot safety gate: ") + why);
     }
 
     // Compressed attention carries pooled-key and compressor state in addition
-    // to ordinary KV. Until that state can be snapshotted at the prompt boundary,
-    // compressed forks also replay the complete prompt into a cleared slot.
+    // to ordinary KV. The fork restores its prompt-boundary snapshot and only
+    // prefills the branch suffix; the standalone oracle checks the result.
     {
         const std::string cpath = "kraken-batch-fork-compressed.gguf";
         MlaFix mf;
@@ -32521,7 +32511,7 @@ static void test_batch_fork() {
         std::vector<GenerateParams> branch{full};
         std::vector<GenerateResult> out;
         CHECK(engine.batch_fork(0, branch, &out, &why),
-              std::string("the compressed fork replays its complete prompt: ") + why);
+              std::string("the compressed fork restores its trunk snapshot: ") + why);
         int guard = 0;
         while (engine.batch_active() > 0 && guard++ < 64) {
             finished.clear();
@@ -32533,10 +32523,9 @@ static void test_batch_fork() {
         std::remove(cpath.c_str());
     }
 
-    // Recurrent/short-convolution models now keep state per batch slot. Forks
-    // replay the complete prompt into a cleared state slot until a prompt-boundary
-    // state snapshot is implemented; this still gives exact semantics and lets
-    // sibling branches advance independently.
+    // Recurrent/short-convolution models keep state per batch slot. The fork
+    // restores the prompt-boundary state snapshot into a sibling slot so its
+    // suffix continues from the shared trunk, not the parent's generated token.
     {
         const std::string rpath = "kraken-batch-fork-recurrent.gguf";
         CHECK(build_lfm2_dense_model(rpath), "wrote recurrent shortconv fork fixture");
@@ -32584,7 +32573,7 @@ static void test_batch_fork() {
         std::vector<GenerateParams> branches{full, full2};
         std::vector<GenerateResult> out;
         CHECK(engine.batch_fork(0, branches, &out, &why),
-              std::string("the recurrent branch replays its full prompt: ") + why);
+              std::string("the recurrent branch restores the trunk state snapshot: ") + why);
         int guard = 0;
         while (engine.batch_active() > 0 && guard++ < 64) {
             finished.clear();

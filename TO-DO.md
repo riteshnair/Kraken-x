@@ -12,7 +12,7 @@ runs.
 
 ## Evidence rules
 
-- The release CPU suite passes 8188/8188 checks; the ASan build passes 8187/8187
+- The release CPU suite passes 8185/8185 checks; the ASan build passes 8184/8184
   across all 187 groups (`build-cpu`, and `build-asan` with
   `detect_leaks=1:halt_on_error=1`). The one-check difference is deliberate: the
   wall-clock ratio gate in `test_batch_decode` is skipped under instrumentation,
@@ -84,20 +84,20 @@ Status labels:
   single-sequence path, where one page lookup per block is the cost.
   See `docs/PAPER-EVALUATION-2026-11.md` section 1 (PagedAttention).
 - [ ] **Exact branch forking** (CODE). `Engine::batch_fork` accepts complete
-  branch prompts and checks the parent's token-prefix. On ordinary f16-KV
-  attention it copies trunk rows into independent slots and prefills only the
-  suffix; `test_batch_fork` covers solo parity, nested forks, slot/refusal cases,
-  and parent-continuation isolation. Compressed-attention and recurrent forks
-  now work through a correctness-first complete-prompt replay into a cleared
-  slot; the recurrent batch scheduler carries separate per-slot state and steps
-  one sequence at a time. The fixture asserts output parity, not a speedup.
-  Lossy KV remains refused: even full-prompt replay in a nonzero slot has not
-  matched the single-slot oracle, so the multi-slot quantized attention path must
-  be debugged before enabling it. Remaining for Flide: KV pages/refcounts/CoW,
-  `(trunk, branch, position)` visibility masks, snapshots that let compressed and
-  recurrent forks reuse the trunk (including the two-call recurrent continuation
-  by index), and quantized multi-slot parity. The copy-backed API still duplicates
-  KV storage; no shared branch stream or throughput result is claimed. See
+  branch prompts and checks the parent's token-prefix. Ordinary f16-KV forks
+  copy trunk rows into independent slots and prefill only the suffix. Compressed-
+  attention and recurrent forks now also restore prompt-boundary state snapshots
+  and reuse the copied trunk rows; recurrent decode remains serialized per
+  sequence. `test_batch_fork` checks these paths against standalone runs,
+  including nested and sibling recurrent forks, while preserving the parent's
+  continuation. This is fixture correctness, not a speedup claim. Int8
+  multi-slot sessions are refused at `batch_open`: a direct full-prompt
+  nonzero-slot probe diverged from slot zero (`5 5 5 5` vs `5 5 3 1`). Forks
+  remain gated for all lossy formats; other quantized batch-session modes need
+  per-format solo-output tests before drawing a parity conclusion. Remaining for
+  Flide: KV pages/refcounts/CoW and `(trunk, branch, position)`
+  visibility masks. The current API still duplicates KV rows, and state snapshots
+  copy data; there is no shared branch stream or measured throughput result. See
   `docs/PAPER-EVALUATION-2026-11.md` section 2 (Flide).
 - [ ] **Per-option scoring surface** (CODE). A request that returns the output
   head normalised over a caller-supplied option set (Flide's Eq. 1), on both the

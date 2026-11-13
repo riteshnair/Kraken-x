@@ -15736,6 +15736,9 @@ std::string Engine::batch_refusal() const {
     if (!be_) return "no backend is attached to this engine";
     if (!be_->attn_multiseq_supported())
         return "this backend does not address the KV cache per row";
+    if (n_slots_ > 1 && kv_quant_of(cfg_) == KvQuant::Int8)
+        return "multi-slot sessions are disabled for int8 KV until row-addressing "
+               "passes solo-output parity";
     const ModelConfig &mc = model_.cfg();
     // Every refusal below is a per-SEQUENCE thing that a row cannot carry.
     // They are named rather than probed because the failure they prevent is
@@ -15825,6 +15828,16 @@ struct Engine::BatchRun {
         i64 steps = 0;
         f64 prefill_ms = 0.0;
         std::chrono::steady_clock::time_point decode_t0{};
+        // Prompt-boundary state, captured before the parent begins generating.
+        // Forks use this snapshot rather than replaying the shared trunk for
+        // recurrent/compressed families, whose continuation state is not
+        // reconstructible from ordinary KV rows alone.
+        bool prompt_state_saved = false;
+        std::vector<u8> prompt_sc_state, prompt_conv_state, prompt_rec_state;
+        std::vector<std::vector<f32>> prompt_comp_kv, prompt_comp_sc, prompt_pooled;
+        std::vector<std::vector<f32>> prompt_idx_kv, prompt_idx_sc, prompt_idx_key;
+        std::vector<std::vector<i64>> prompt_comp_kpos;
+        std::vector<i64> prompt_comp_nblocks;
     };
 
     // unique_ptr, not Seq by value: TokenEmitter keeps a reference to its
@@ -15999,6 +16012,74 @@ bool Engine::batch_prefill_slice(i32 index) {
         // serial path does.
         be_->sync();
         be_->download_f32(s.logits.data(), ws_logits_, n_vocab_);
+        // Save the exact state at the prompt boundary. The parent's live state
+        // will move as it generates, while a branch must begin from the prompt
+        // only. These snapshots let stateful forks reuse trunk KV without
+        // inheriting the parent's continuation.
+        if (model_.is_recurrent() || !comp_nblocks_.empty()) {
+            const size_t slot = static_cast<size_t>(s.slot);
+            if (model_.is_recurrent()) {
+                if (sc_state_) {
+                    const size_t bytes = static_cast<size_t>(model_.cfg().n_layer) *
+                                         static_cast<size_t>(sc_state_span_) *
+                                         be_->act_size();
+                    s.prompt_sc_state.resize(bytes);
+                    be_->download(s.prompt_sc_state.data(),
+                                  static_cast<const char *>(sc_state_) + slot * bytes,
+                                  bytes);
+                }
+                if (conv_state_) {
+                    const size_t bytes = static_cast<size_t>(rec_layers_) *
+                                         static_cast<size_t>(conv_state_span_) * sizeof(f32);
+                    s.prompt_conv_state.resize(bytes);
+                    be_->download(s.prompt_conv_state.data(),
+                                  static_cast<const char *>(conv_state_) + slot * bytes,
+                                  bytes);
+                }
+                if (rec_state_) {
+                    const i64 rs = mamba2_state_span_ > 0
+                                       ? mamba2_state_span_ : rec_state_span_;
+                    const size_t bytes = static_cast<size_t>(rec_layers_) *
+                                         static_cast<size_t>(rs) * sizeof(f32);
+                    s.prompt_rec_state.resize(bytes);
+                    be_->download(s.prompt_rec_state.data(),
+                                  static_cast<const char *>(rec_state_) + slot * bytes,
+                                  bytes);
+                }
+            }
+            auto capture_f32 = [&](const std::vector<std::vector<f32>> &src,
+                                   std::vector<std::vector<f32>> &dst) {
+                dst.resize(src.size());
+                for (size_t l = 0; l < src.size(); l++) {
+                    const size_t span = src[l].size() / static_cast<size_t>(n_slots_);
+                    const size_t off = slot * span;
+                    dst[l].assign(src[l].begin() + static_cast<ptrdiff_t>(off),
+                                  src[l].begin() + static_cast<ptrdiff_t>(off + span));
+                }
+            };
+            auto capture_i64 = [&](const std::vector<std::vector<i64>> &src,
+                                   std::vector<std::vector<i64>> &dst) {
+                dst.resize(src.size());
+                for (size_t l = 0; l < src.size(); l++) {
+                    const size_t span = src[l].size() / static_cast<size_t>(n_slots_);
+                    const size_t off = slot * span;
+                    dst[l].assign(src[l].begin() + static_cast<ptrdiff_t>(off),
+                                  src[l].begin() + static_cast<ptrdiff_t>(off + span));
+                }
+            };
+            capture_f32(comp_state_kv_, s.prompt_comp_kv);
+            capture_f32(comp_state_sc_, s.prompt_comp_sc);
+            capture_f32(comp_pooled_, s.prompt_pooled);
+            capture_f32(idx_state_kv_, s.prompt_idx_kv);
+            capture_f32(idx_state_sc_, s.prompt_idx_sc);
+            capture_f32(idx_key_, s.prompt_idx_key);
+            capture_i64(comp_kpos_, s.prompt_comp_kpos);
+            s.prompt_comp_nblocks.resize(comp_nblocks_.size() /
+                                         static_cast<size_t>(n_slots_));
+            for (size_t l = 0; l < s.prompt_comp_nblocks.size(); l++)
+                s.prompt_comp_nblocks[l] = comp_nblocks_[l * static_cast<size_t>(n_slots_) + slot];
+            s.prompt_state_saved = true;
+        }
         s.prefill = false;
         s.steps = 0;
         s.decode_t0 = std::chrono::steady_clock::now();
@@ -16072,12 +16153,16 @@ bool Engine::batch_fork(i32 index, const std::vector<GenerateParams> &branches,
         return fail_all("the sequence to fork is still prefilling its prompt");
     // Quantized multi-slot attention has not yet passed solo-output parity:
     // even a full-prompt replay in a nonzero slot differs from the single-slot
-    // oracle on the CPU fixture. Keep it refused until row-base/quant-kernel
-    // parity is fixed. Compressed attention has a safe, slower full-prompt
-    // replay fallback below; ordinary f16 keeps the prefix-copy fast path.
+    // oracle on the CPU fixture. Int8 multi-slot sessions are also rejected at
+    // batch_open; forks for every lossy KV format stay disabled until their
+    // parity is established. Fix row-base/quant-kernel parity before enabling
+    // quantized forks.
     if (kv_quant_of(cfg_) != KvQuant::F16)
         return fail_all("quantized KV forks are gated on multi-slot solo-output parity");
-    const bool reuse_trunk = comp_nblocks_.empty() && !model_.is_recurrent();
+    const bool reuse_trunk = true;
+    const bool needs_prompt_state = model_.is_recurrent() || !comp_nblocks_.empty();
+    if (needs_prompt_state && !parent.prompt_state_saved)
+        return fail_all("the prompt-boundary recurrent/compressed snapshot is unavailable");
     // The fork point, and the rows that exist behind it.
     const i64 base = std::min<i64>(parent.prompt_rows, parent.pos);
     if (base <= 0) return fail_all("the sequence to fork has no prompt rows to inherit");
@@ -16164,22 +16249,69 @@ bool Engine::batch_fork(i32 index, const std::vector<GenerateParams> &branches,
         // The history is the trunk the branch inherited plus its own prompt, so
         // the sampler's repetition window sees exactly what the model read --
         // the same thing an isolated run of the concatenation would see.
-        if (reuse_trunk) {
-            s.ids.assign(parent.ids.begin(), parent.ids.begin() + static_cast<size_t>(base));
-            s.ids.insert(s.ids.end(), bids[b].begin(), bids[b].end());
-            s.prefill_ids = bids[b];
-        } else {
-            s.ids = bids[b];
-            s.prefill_ids = bids[b];
-            compressed_reset_slot(slot);
-            recurrent_reset_slot(slot);
+        s.ids.assign(parent.ids.begin(), parent.ids.begin() + static_cast<size_t>(base));
+        s.ids.insert(s.ids.end(), bids[b].begin(), bids[b].end());
+        s.prefill_ids = bids[b];
+        compressed_reset_slot(slot);
+        recurrent_reset_slot(slot);
+        if (needs_prompt_state) {
+            const size_t si = static_cast<size_t>(slot);
+            if (model_.is_recurrent()) {
+                if (!parent.prompt_sc_state.empty()) {
+                    const size_t bytes = parent.prompt_sc_state.size();
+                    be_->upload(static_cast<char *>(sc_state_) + si * bytes,
+                                parent.prompt_sc_state.data(), bytes);
+                }
+                if (!parent.prompt_conv_state.empty()) {
+                    const size_t bytes = parent.prompt_conv_state.size();
+                    be_->upload(static_cast<char *>(conv_state_) + si * bytes,
+                                parent.prompt_conv_state.data(), bytes);
+                }
+                if (!parent.prompt_rec_state.empty()) {
+                    const size_t bytes = parent.prompt_rec_state.size();
+                    be_->upload(static_cast<char *>(rec_state_) + si * bytes,
+                                parent.prompt_rec_state.data(), bytes);
+                }
+            }
+            auto restore_f32 = [&](const std::vector<std::vector<f32>> &snap,
+                                   std::vector<std::vector<f32>> &dst) {
+                for (size_t l = 0; l < dst.size(); l++) {
+                    const size_t span = dst[l].size() / static_cast<size_t>(n_slots_);
+                    if (l < snap.size() && snap[l].size() == span) {
+                        const size_t off = si * span;
+                        std::copy(snap[l].begin(), snap[l].end(),
+                                  dst[l].begin() + static_cast<ptrdiff_t>(off));
+                    }
+                }
+            };
+            auto restore_i64 = [&](const std::vector<std::vector<i64>> &snap,
+                                   std::vector<std::vector<i64>> &dst) {
+                for (size_t l = 0; l < dst.size(); l++) {
+                    const size_t span = dst[l].size() / static_cast<size_t>(n_slots_);
+                    if (l < snap.size() && snap[l].size() == span) {
+                        const size_t off = si * span;
+                        std::copy(snap[l].begin(), snap[l].end(),
+                                  dst[l].begin() + static_cast<ptrdiff_t>(off));
+                    }
+                }
+            };
+            restore_f32(parent.prompt_comp_kv, comp_state_kv_);
+            restore_f32(parent.prompt_comp_sc, comp_state_sc_);
+            restore_f32(parent.prompt_pooled, comp_pooled_);
+            restore_f32(parent.prompt_idx_kv, idx_state_kv_);
+            restore_f32(parent.prompt_idx_sc, idx_state_sc_);
+            restore_f32(parent.prompt_idx_key, idx_key_);
+            restore_i64(parent.prompt_comp_kpos, comp_kpos_);
+            for (size_t l = 0; l < parent.prompt_comp_nblocks.size(); l++)
+                comp_nblocks_[l * static_cast<size_t>(n_slots_) + si] =
+                    parent.prompt_comp_nblocks[l];
         }
         res.prompt_tokens = static_cast<i32>(s.ids.size());
         s.sampler.reset(p.sampler);
         s.sampler.accept(s.ids.data(), static_cast<int>(s.ids.size()));
         s.emit.reset(new TokenEmitter(p, tok_, s.sampler, &res, s.ids));
         s.logits.assign(static_cast<size_t>(n_vocab_), 0.0f);
-        s.pf_base = reuse_trunk ? base : 0;
+        s.pf_base = base;
         s.pos = s.pf_base + static_cast<i64>(s.prefill_ids.size());
         s.active = true;
         s.prefill = true;
@@ -16189,6 +16321,7 @@ bool Engine::batch_fork(i32 index, const std::vector<GenerateParams> &branches,
         batch_run_->slot_used[static_cast<size_t>(slot)] = true;
         batch_run_->seqs.push_back(std::move(owned));
     }
+    if (model_.is_recurrent() && needs_prompt_state) be_->sync();
     KRK_DEBUG("fork of sequence %d: %zu branch(es) from %lld trunk row(s)",
               static_cast<int>(index), branches.size(), static_cast<long long>(base));
     return true;
