@@ -12484,18 +12484,17 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                 // expert that is never promoted never becomes resident, so the
                 // cache stayed at 55/104 of a budget that could have held all of
                 // it and decode fell from 99.3 to 6.4 tok/s.
-                bool cpu = !ec.in_vram(layer, e) && ec.full_for(L.experts);
-                // A deterministic share of the resident set can be forced to
-                // the host as well, which is how the two arms are swept against
-                // each other at a fixed cache size (--hybrid-frac). The hash is
-                // over (layer, expert) and not a counter, so the same experts
-                // move together layer after layer.
-                if (!cpu && hybrid_frac_permille_ < 1000) {
-                    const u32 hsh = static_cast<u32>(layer) * 2654435761u +
-                                    static_cast<u32>(e) * 40503u;
-                    if (static_cast<int>(hsh % 1000u) < hybrid_frac_permille_)
-                        cpu = true;
-                }
+                //
+                // --hybrid-frac divides that overflow: 1000 (the default) gives
+                // all of it to the host, 0 promotes all of it, and a value in
+                // between splits it per (layer, expert) so two arms at one cache
+                // size differ in placement rather than in budget. The share used
+                // to be applied the other way round -- forcing a fraction of the
+                // RESIDENT set onto the host -- which spent VRAM on an expert and
+                // then refused to use it, and which no argument documented.
+                const bool overflow = !ec.in_vram(layer, e) && ec.full_for(L.experts);
+                const bool cpu = overflow &&
+                                 expert_split_share(layer, e, hybrid_frac_permille_);
                 if (cpu) {
                     hy_take_[static_cast<size_t>(e)] = 1;
                     n_cpu_experts++;

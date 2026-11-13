@@ -149,7 +149,10 @@ Prefetch and prediction, all opt-in and all measured before being believed:
   **9% slower** on REAP-320, which is why nothing here is on by default.
 - `--hybrid-experts` / `--hybrid-frac` move the overflow of the device tier to
   host compute at a fixed cache size, which is how the two arms are swept
-  against each other. With no device present there is nothing to overflow.
+  against each other. The share is a share of the OVERFLOW, per (layer, expert):
+  `1.0` (the default) gives all of it to the host, `0` promotes all of it, and a
+  value in between splits it. Resident experts are never moved: their bytes are
+  already on the card. With no device present there is nothing to overflow.
 
 ## 4. Model families
 
