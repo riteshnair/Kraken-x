@@ -4391,7 +4391,7 @@ const i64 *Engine::row_kv_bases(i32 n, i64 pos_stride) {
 }
 
 bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
-    KRK_TRACE_COMP("forward-core");
+    ::krk::TraceSpan krk_trace_forward_core("component", "forward-core");
     forward_error_.clear();
     // The hash route needs the vocab id of each row (see fwd_toks_ in the
     // header); a row index only equals it on a single-token decode.

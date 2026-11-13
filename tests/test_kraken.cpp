@@ -18631,11 +18631,15 @@ static void test_http_server() {
     }
 
     // chat completion renders the ChatML template and answers
-    req = "{\"messages\":[{\"role\":\"system\",\"content\":\"You are terse.\"},"
-          "{\"role\":\"user\",\"content\":\"hello\"}],\"max_tokens\":3,"
-          "\"temperature\":0}";
+    // Keep this tiny: the fixture's context is 64 tokens and its tokenizer
+    // has a deliberately small vocabulary, so a longer prompt can be truncated
+    // before the optional assistant prefix becomes observable in usage.
+    const std::string chat_messages =
+        "\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]";
+    req = "{" + chat_messages + ",\"max_tokens\":3,\"temperature\":0}";
     CHECK(http_request(port, "POST", "/v1/chat/completions", req, &status, &body) &&
               status == 200, "http: /v1/chat/completions returns 200");
+    i64 prompt_tokens_with_assistant_header = -1;
     {
         JsonValue j;
         std::string e;
@@ -18655,6 +18659,29 @@ static void test_http_server() {
         } else {
             CHECK(false, "http: chat response has choices");
         }
+        const JsonValue *usage = j.find("usage");
+        prompt_tokens_with_assistant_header =
+            usage ? usage->get_int("prompt_tokens", -1) : -1;
+    }
+
+    // The optional boolean is read as a value, not mistaken for an output
+    // pointer. Omitting the assistant prefix must produce a shorter prompt.
+    req = "{" + chat_messages +
+          ",\"max_tokens\":3,\"temperature\":0,"
+          "\"add_generation_prompt\":false}";
+    CHECK(http_request(port, "POST", "/v1/chat/completions", req, &status, &body) &&
+              status == 200, "http: add_generation_prompt=false is accepted");
+    {
+        JsonValue j;
+        std::string e;
+        const std::string payload = body.substr(body.find("\r\n\r\n") + 4);
+        CHECK(json_parse(payload, &j, &e),
+              "http: chat response without generation prefix is valid JSON");
+        const JsonValue *usage = j.find("usage");
+        const i64 no_header_tokens = usage ? usage->get_int("prompt_tokens", -1) : -1;
+        CHECK(prompt_tokens_with_assistant_header > no_header_tokens &&
+                  no_header_tokens >= 0,
+              "http: add_generation_prompt=false omits assistant-prefix tokens");
     }
 
     // chat request is rejected when messages is missing
