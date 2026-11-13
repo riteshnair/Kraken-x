@@ -12,7 +12,8 @@
 #
 # Optional environment:
 #   KRK_BENCH_TIERS="16 24 32"   planned RAM classes in GiB
-#   KRK_BENCH_TOKENS=128          greedy decode tokens per run
+#   KRK_BENCH_TOKENS=128          greedy decode tokens per request
+#   KRK_BENCH_REPEATS=3           requests per process (first + same-process repeats)
 #   KRK_BENCH_EXPERT_SLOTS=N      resident (layer,expert) slot cap (default 1);
 #                                 use "auto" for Kraken's normal budget
 #   KRK_BENCH_HASH_MODEL=1        include a full SHA-256 model hash (extra I/O)
@@ -35,6 +36,7 @@ exe=${2:-${KRK_EXE:-./build/kraken}}
 outdir=${3:-${KRK_BENCH_OUT:-./bounded-moe-results}}
 tiers=${KRK_BENCH_TIERS:-"16 24 32"}
 tokens=${KRK_BENCH_TOKENS:-128}
+repeats=${KRK_BENCH_REPEATS:-3}
 slots=${KRK_BENCH_EXPERT_SLOTS:-1}
 python=${KRK_PYTHON:-python3}
 script_dir=$(CDPATH= cd "$(dirname "$0")" && pwd)
@@ -63,6 +65,13 @@ if [ "$tokens" -le 0 ]; then
     echo "bounded-moe: KRK_BENCH_TOKENS must be a positive integer" >&2
     exit 2
 fi
+case "$repeats" in
+    ''|*[!0-9]*) echo "bounded-moe: KRK_BENCH_REPEATS must be an integer in 1..100" >&2; exit 2 ;;
+esac
+if [ "$repeats" -lt 1 ] || [ "$repeats" -gt 100 ]; then
+    echo "bounded-moe: KRK_BENCH_REPEATS must be in 1..100" >&2
+    exit 2
+fi
 if [ "$slots" != auto ]; then
     case "$slots" in
         ''|*[!0-9]*) echo "bounded-moe: KRK_BENCH_EXPERT_SLOTS must be a positive integer or auto" >&2; exit 2 ;;
@@ -85,8 +94,9 @@ model_bytes=$(wc -c <"$model" | tr -d ' ')
     printf 'executable: %s\n' "$exe"
     printf 'planned_ram_tiers_gib: %s\n' "$tiers"
     printf 'expert_slot_cap: %s\n' "$slots"
-    printf 'tokens: %s\n' "$tokens"
-    printf 'measurement_mode: one process startup plus one fixed-prompt --bench request per tier; not a repeated warm-request measurement\n'
+    printf 'tokens_per_request: %s\n' "$tokens"
+    printf 'requests_per_process: %s\n' "$repeats"
+    printf 'measurement_mode: one startup, first fixed-prompt request, then %s same-process repeat request(s); per-request HOT/WARM hits and COLD reads are reported\n' "$((repeats - 1))"
     printf 'host_uname: %s\n' "$(uname -a)"
     if [ -r /proc/meminfo ]; then
         grep -E '^(MemTotal|MemAvailable|SwapTotal|SwapFree):' /proc/meminfo || true
@@ -150,7 +160,7 @@ bench_prompt='The history of computing is a history of abstraction: from relays 
 reference_tokens=
 reference_tier=
 printf 'Bounded-memory MoE benchmark\nmodel: %s\nexe: %s\n' "$model" "$exe"
-printf 'planned tiers (GiB): %s\ntokens: %s\n' "$tiers" "$tokens"
+printf 'planned tiers (GiB): %s\ntokens/request: %s\nrequests/process: %s\n' "$tiers" "$tokens" "$repeats"
 printf 'resident expert slots: %s\n' "${slots:-automatic}"
 echo "NOTE: --ram-tier is a policy simulation, not a hard RSS cap."
 echo "NOTE: cgroup limits are observed, not created; use a dedicated systemd scope for enforcement."
@@ -170,7 +180,7 @@ for tier in $tiers; do
     genlog="$outdir/${model_name}.${tier}GiB.generate.log"
     set -- --cpu -m "$model" --ram-tier "$tier" \
         --expert-warmup 0 --expert-warm-mb 0 --expert-pin-mb 0 \
-        --greedy --max-tokens "$tokens" --bench
+        --greedy --max-tokens "$tokens" --bench --bench-repeats "$repeats"
     if [ "$slots" != auto ]; then
         set -- "$@" --expert-cache-slots "$slots"
     fi
@@ -187,7 +197,7 @@ for tier in $tiers; do
         echo "bounded-moe: run failed (exit $rc), see $log and $timelog" >&2
         exit "$rc"
     }
-    grep -E '^(model|device|prefill|decode|total|experts|expert WARM|\[stats \] expert-pool|\[stats \] experts|\[stats \] cache|\[stats \] warm|\[stats \] transfer)' "$log" || true
+    grep -E '^(model|device|prefill|decode|repeat|first cache|total|experts|expert WARM|\[stats \] expert-pool|\[stats \] experts|\[stats \] cache|\[stats \] warm|\[stats \] transfer)' "$log" || true
     grep -E '^Maximum resident set size:' "$timelog" || true
     echo "full run log: $log"
     echo "peak RSS report: $timelog"

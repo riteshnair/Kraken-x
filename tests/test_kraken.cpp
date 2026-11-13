@@ -31613,6 +31613,10 @@ static void test_cli_arg_refusal() {
         {"--expert-warm-prefetch abc", "--expert-warm-prefetch"},
         {"--expert-warmup abc", "--expert-warmup"},
         {"--expert-warmup-ms abc", "--expert-warmup-ms"},
+        {"--bench-repeats abc", "--bench-repeats"},
+        {"--bench-repeats 0", "--bench-repeats must be in 1..100"},
+        {"--bench-repeats 101", "--bench-repeats must be in 1..100"},
+        {"--bench-repeats 2", "requires --bench"},
         {"--ram-tier abc", "--ram-tier"},
         {"--hybrid-experts abc", "--hybrid-experts"},
         {"--hybrid-threads abc", "--hybrid-threads"},
@@ -31661,6 +31665,14 @@ static void test_cli_arg_refusal() {
                              "refuses the missing file"
                            : "a valid command line did not reach the loader: the "
                              "refusal arms above prove nothing");
+    std::string err_repeat_ok;
+    const int rc_repeat_ok = run(std::string("-m \"") + missing +
+                                 "\" --bench --bench-repeats 2",
+                                 &err_repeat_ok);
+    CHECK(rc_repeat_ok == 1,
+          rc_repeat_ok == 1
+              ? "a valid repeated-benchmark command reaches model loading"
+              : "a valid repeated-benchmark command was not accepted");
 
     // Control 2: --help is not a refusal, so it must NOT come back as 2.
     const int rc_h = run("--help", nullptr);
