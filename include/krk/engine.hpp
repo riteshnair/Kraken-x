@@ -467,21 +467,21 @@ public:
     // suffix is prefetched. Tokens the parent generated itself are not inherited,
     // so a parent can keep decoding while its branches run.
     //
-    // This is the trunk-once case. Prefilling one state and asking N questions
-    // about it costs one trunk pass plus N short suffix prefills; running the same
-    // thing as N requests costs N trunk passes. The copied KV rows are
-    // byte-identical at the same positions. For the f16-KV CPU fixture,
-    // test_batch_fork compares branch tokens against the same complete request
-    // run alone. Forking currently refuses lossy KV modes: a CPU int8 probe
-    // changed greedy branch tokens across the fork's different prefill
-    // partitioning, so quantized-cache parity is not established. The caller
-    // must keep each branch's GenerateParams and GenerateResult alive through
-    // the session, just as for batch_join.
+    // Ordinary f16-KV attention copies only the shared trunk rows and prefills
+    // the suffix. Lossy KV is refused: even a complete-prompt replay into a
+    // nonzero slot has not matched the single-slot output on the CPU fixture, so
+    // its row-addressing/quantized-kernel parity must be fixed first. Compressed
+    // attention and recurrent models are supported through a correctness-first
+    // fallback that resets that branch slot and prefills the complete prompt;
+    // this does NOT reuse their trunk state yet. Recurrent batch steps serialize
+    // one row per sequence against private per-slot state. Tests compare these
+    // fallbacks with standalone complete-prompt runs; they do not imply a speedup.
+    // The caller must keep each branch's GenerateParams and GenerateResult alive
+    // through the session, just as for batch_join.
     //
     // Refused, with `err` set and every result failed: no session, no such
-    // sequence, a sequence still prefilling or already finished, compressed
-    // attention state that is not fork-copyable yet, an empty/non-prefix branch
-    // prompt, or insufficient KV slots.
+    // sequence, a sequence still prefilling or already finished, lossy KV, an
+    // empty/non-prefix branch prompt, or insufficient KV slots.
     bool batch_fork(i32 index, const std::vector<GenerateParams> &branches,
                     std::vector<GenerateResult> *outs, std::string *err);
     i32 batch_active() const;
@@ -1184,12 +1184,14 @@ private:
     // Clears the convolution windows and delta-rule states (f32, one set per
     // recurrent layer). Only correct to call at a sequence boundary.
     void recurrent_reset();
+    void recurrent_reset_slot(i32 slot);
     // Clears the compressed-attention streams (state rings + pooled keys). The
     // pooled keys are a SUMMARY of positions a prefill cannot rewrite in place
     // -- a block's pool is taken once, when its last token arrives -- so a new
     // sequence that kept them would attend the previous run's history through a
     // row the KV cursor cannot invalidate. Same boundary as recurrent_reset().
     void compressed_reset();
+    void compressed_reset_slot(i32 slot);
     // Downloads the last row of logits into logits_host_. With device_only true the
     // row stays in VRAM and is reduced to a single greedy argmax by
     // topk_argmax() instead; see fetch_logits() for when that is legal. The

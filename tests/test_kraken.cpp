@@ -32434,11 +32434,11 @@ static void test_batch_fork() {
         CHECK(!engine.batch_fork(0, ok, &outs, &why), "a fork with no session is refused");
     }
 
-    // Quantized KV produces a different greedy branch under the fork's changed
-    // prefill partition in this CPU fixture. Until that path is characterized,
-    // the exact-fork API refuses it rather than promising solo-run parity.
+    // Quantized KV fork support remains gated: even a complete-prompt replay
+    // in a nonzero slot differs from the single-slot oracle on this fixture.
+    // Do not return plausible but divergent tokens while the row-base parity
+    // issue is unresolved.
     {
-        Engine engine;
         EngineConfig cfg;
         cfg.model_path = path;
         cfg.n_ctx = 64;
@@ -32446,8 +32446,9 @@ static void test_batch_fork() {
         cfg.n_slots = 3;
         cfg.kv_quant = 1;
         std::string err;
+        Engine engine;
         if (!engine.init(cpu, cfg, &err)) {
-            CHECK(false, std::string("the int8 fork refusal engine initializes: ") + err);
+            CHECK(false, std::string("the int8 fork engine initializes: ") + err);
             delete cpu;
             return;
         }
@@ -32461,10 +32462,139 @@ static void test_batch_fork() {
         std::vector<GenerateParams> qbranch{params(branch_prompt[0], 2)};
         std::vector<GenerateResult> qout;
         CHECK(!engine.batch_fork(0, qbranch, &qout, &why),
-              "forking with int8 KV is refused until parity is established");
-        CHECK(why.find("quantized-cache parity") != std::string::npos,
-              std::string("and explains the evidence gap: ") + why);
+              "int8 fork stays refused until multi-slot parity is established");
+        CHECK(why.find("multi-slot solo-output parity") != std::string::npos,
+              std::string("and states the exact gate: ") + why);
         engine.batch_close();
+    }
+
+    // Compressed attention carries pooled-key and compressor state in addition
+    // to ordinary KV. Until that state can be snapshotted at the prompt boundary,
+    // compressed forks also replay the complete prompt into a cleared slot.
+    {
+        const std::string cpath = "kraken-batch-fork-compressed.gguf";
+        MlaFix mf;
+        mf.kind = MlaFixKind::Shared;
+        mf.n_layer = 1;
+        mf.ratios = {4};
+        mf.idx_heads = 1;
+        mf.idx_head = 4;
+        mf.idx_top_k = 1;
+        mf.ctx = 64;
+        mf.live_head = true;
+        CHECK(build_mla_fixture(cpath, mf), "wrote compressed-attention fork fixture");
+        EngineConfig cfg;
+        cfg.model_path = cpath;
+        cfg.n_ctx = 64;
+        cfg.prefill_chunk = 8;
+        cfg.n_slots = 3;
+        cfg.kv_quant = 0;
+        std::string err;
+        Engine oracle;
+        if (!oracle.init(cpu, cfg, &err)) {
+            CHECK(false, std::string("the compressed fork oracle initializes: ") + err);
+            std::remove(cpath.c_str());
+            delete cpu;
+            return;
+        }
+        GenerateParams full = params("the the a", 4);
+        GenerateResult expected;
+        std::vector<GenerateResult> oracle_out;
+        CHECK(oracle.generate_batch(std::vector<GenerateParams>{full}, &oracle_out),
+              "the compressed standalone prompt runs through the batch path");
+        if (!oracle_out.empty()) expected = oracle_out[0];
+        oracle.shutdown();
+        Engine engine;
+        if (!engine.init(cpu, cfg, &err)) {
+            CHECK(false, std::string("the compressed fork engine initializes: ") + err);
+            std::remove(cpath.c_str());
+            delete cpu;
+            return;
+        }
+        std::string why;
+        CHECK(engine.batch_open(&why), std::string("the compressed batch session opens: ") + why);
+        GenerateParams pp = params("the the", 3);
+        GenerateResult pr;
+        CHECK(engine.batch_join(pp, &pr, &why), "the compressed trunk joins");
+        std::vector<i32> finished;
+        CHECK(engine.batch_step(&finished), "the compressed trunk prefill advances");
+        std::vector<GenerateParams> branch{full};
+        std::vector<GenerateResult> out;
+        CHECK(engine.batch_fork(0, branch, &out, &why),
+              std::string("the compressed fork replays its complete prompt: ") + why);
+        int guard = 0;
+        while (engine.batch_active() > 0 && guard++ < 64) {
+            finished.clear();
+            CHECK(engine.batch_step(&finished), "the compressed fork session advances");
+        }
+        CHECK(out.size() == 1 && out[0].tokens == expected.tokens,
+              "compressed fallback matches the standalone full-prompt run");
+        engine.batch_close();
+        std::remove(cpath.c_str());
+    }
+
+    // Recurrent/short-convolution models now keep state per batch slot. Forks
+    // replay the complete prompt into a cleared state slot until a prompt-boundary
+    // state snapshot is implemented; this still gives exact semantics and lets
+    // sibling branches advance independently.
+    {
+        const std::string rpath = "kraken-batch-fork-recurrent.gguf";
+        CHECK(build_lfm2_dense_model(rpath), "wrote recurrent shortconv fork fixture");
+        EngineConfig cfg;
+        cfg.model_path = rpath;
+        cfg.n_ctx = 64;
+        cfg.prefill_chunk = 8;
+        cfg.n_slots = 3;
+        cfg.kv_quant = 0;
+        std::string err;
+        const std::string rtrunk = "the the";
+        const std::string rfull = "the the the";
+        const std::string rfull2 = "the the the the";
+        GenerateParams full = params(rfull, 3);
+        GenerateParams full2 = params(rfull2, 3);
+        Engine oracle;
+        if (!oracle.init(cpu, cfg, &err)) {
+            CHECK(false, std::string("the recurrent fork oracle initializes: ") + err);
+            std::remove(rpath.c_str());
+            delete cpu;
+            return;
+        }
+        GenerateResult expected, expected2;
+        CHECK(oracle.generate(full, &expected), "the recurrent full-prompt oracle runs");
+        CHECK(oracle.generate(full2, &expected2), "the second recurrent oracle resets its state");
+        oracle.shutdown();
+
+        Engine engine;
+        if (!engine.init(cpu, cfg, &err)) {
+            CHECK(false, std::string("the recurrent fork engine initializes: ") + err);
+            std::remove(rpath.c_str());
+            delete cpu;
+            return;
+        }
+        std::string why;
+        CHECK(engine.batch_open(&why), std::string("the recurrent session opens: ") + why);
+        GenerateParams pp = params(rtrunk, 100);
+        pp.sampler.greedy = false;
+        pp.sampler.temp = 1.0f;
+        pp.sampler.seed = 42;
+        GenerateResult parent;
+        CHECK(engine.batch_join(pp, &parent, &why), "the recurrent parent joins");
+        std::vector<i32> finished;
+        CHECK(engine.batch_step(&finished), "the recurrent parent prefills and advances");
+        std::vector<GenerateParams> branches{full, full2};
+        std::vector<GenerateResult> out;
+        CHECK(engine.batch_fork(0, branches, &out, &why),
+              std::string("the recurrent branch replays its full prompt: ") + why);
+        int guard = 0;
+        while (engine.batch_active() > 0 && guard++ < 64) {
+            finished.clear();
+            CHECK(engine.batch_step(&finished), "the recurrent session advances per slot");
+        }
+        CHECK(out.size() == 2 && out[0].tokens == expected.tokens &&
+                  out[1].tokens == expected2.tokens,
+              "recurrent sibling forks match isolated full-prompt runs");
+        engine.batch_close();
+        std::remove(rpath.c_str());
     }
 
     std::remove(path.c_str());
