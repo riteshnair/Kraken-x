@@ -98,6 +98,14 @@ ReplayResult replay_expert_trace(Backend *be, const ExpertSource *const *src_of,
     r.resident_slots = cache.resident_slots();
     r.warm_slots = cache.warm_slots();
     r.pinned_slots = cache.pinned_slots();
+    // Release the cells this replay promoted. `ExpertCache` does not release its
+    // resident slots on destruction (a cache may outlive a `configure()` that
+    // re-tiers it), so a caller that only drops the object hands the backend
+    // nothing back: LeakSanitizer sees the pooled blocks as still live, which is
+    // exactly what they are. Clearing here is also what makes the next replay in
+    // the same process start from the budget it asked for rather than from the
+    // previous trace's residency.
+    cache.clear();
     return r;
 }
 
