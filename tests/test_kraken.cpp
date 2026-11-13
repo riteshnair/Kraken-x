@@ -2077,11 +2077,12 @@ static void test_vec_dot() {
 static const char *kTestModelPath = "kraken-test-model.gguf";
 
 // Builds a 1-layer, 32-wide LLaMA-family model with byte-fallback SPM vocab.
-static bool build_tiny_model(const std::string &path, bool bpe, f32 softcap = 0.0f) {
+static bool build_tiny_model(const std::string &path, bool bpe, f32 softcap = 0.0f,
+                             int ctx_override = 0) {
     const int n_embd = 32, n_layer = 1, n_head = 4, n_kv = 2, hd = 8, n_ff = 64;
     const int q_dim = n_head * hd, kv_dim = n_kv * hd;
     const int vocab = bpe ? 300 : 260;
-    const int ctx = 64;
+    const int ctx = ctx_override > 0 ? ctx_override : 64;
 
     GgufBuilder b;
     b.meta_str("general.architecture", "llama");
@@ -32943,9 +32944,145 @@ static void test_batch_fork() {
         std::remove(rpath.c_str());
     }
 
+
     std::remove(path.c_str());
     delete cpu;
 }
+
+// A focused parity probe for Engine page-table integration. Kept separate from
+// the large fork lifecycle group so addressing regressions are quick to isolate.
+static void test_engine_paged_kv_parity() {
+    Backend *cpu = make_cpu_backend();
+    // Engine-level paged KV acceptance on a dense, ordinary-attention fixture.
+    // The long common prompt crosses a physical page boundary; sibling suffixes
+    // then write through the shared final page and must match standalone runs.
+    {
+        const std::string ppath = "kraken-batch-fork-paged.gguf";
+        CHECK(build_tiny_model(ppath, false, 0.0f, 96),
+              "wrote the dense paged-KV fixture");
+        EngineConfig cfg;
+        cfg.model_path = ppath;
+        cfg.n_ctx = 96;
+        cfg.prefill_chunk = 8;
+        cfg.n_slots = 4;
+        cfg.kv_quant = 0;
+        auto pp = [](const std::string &text, i32 count) {
+            GenerateParams p;
+            p.prompt = text;
+            p.max_tokens = count;
+            p.sampler.greedy = true;
+            p.sampler.temp = 0.0f;
+            p.sample_host = true;
+            return p;
+        };
+        std::string long_trunk;
+        for (int i = 0; i < 24; ++i) {
+            if (i) long_trunk += " ";
+            long_trunk += "the";
+        }
+        const std::string btext[2] = {long_trunk + " the", long_trunk + " a"};
+        const std::string nested_prompt = btext[0] + " the";
+        std::vector<GenerateResult> oracle(3);
+        Engine reference;
+        std::string why;
+        if (!reference.init(cpu, cfg, &why)) {
+            CHECK(false, "the dense standalone oracle initializes: " + why);
+        } else {
+            for (int i = 0; i < 2; ++i)
+                CHECK(reference.generate(pp(btext[i], 4), &oracle[static_cast<size_t>(i)]),
+                      "standalone paged-fork oracle " + std::to_string(i) + " runs");
+            CHECK(reference.generate(pp(nested_prompt, 3), &oracle[2]),
+                  "standalone nested paged-fork oracle runs");
+            reference.shutdown();
+        }
+        EngineConfig paged_cfg = cfg;
+        paged_cfg.kv_paged = true;
+        Engine engine;
+        if (!engine.init(cpu, paged_cfg, &why)) {
+            CHECK(false, "the dense paged engine initializes: " + why);
+        } else {
+            for (int i = 0; i < 2; ++i) {
+                GenerateResult serial_paged;
+                CHECK(engine.generate(pp(btext[i], 4), &serial_paged),
+                      "serial paged baseline " + std::to_string(i) + " runs");
+                CHECK(serial_paged.tokens == oracle[static_cast<size_t>(i)].tokens,
+                      "serial paged output matches standalone contiguous output");
+            }
+            std::string rollback_prompt;
+            for (int i = 0; i < 80; ++i) {
+                if (i) rollback_prompt += " ";
+                rollback_prompt += "the";
+            }
+            GenerateResult rollback_result;
+            CHECK(engine.generate(pp(rollback_prompt, 1), &rollback_result),
+                  "paged KV fills a multi-page rollback fixture");
+            CHECK(engine.kv_pos() > 72,
+                  "the rollback fixture leaves more than 64 suffix rows");
+            CHECK(engine.kv_rollback(8) && engine.kv_pos() == 8,
+                  "paged rollback truncates a long suffix to the retained prefix");
+            std::vector<i32> trunk_ids;
+            CHECK(engine.tokenizer().encode(long_trunk, trunk_ids, true) >= 0 &&
+                      trunk_ids.size() > 16,
+                  "the common Engine trunk crosses the 16-row page boundary");
+            CHECK(engine.batch_open(&why), "the paged Engine session opens: " + why);
+            GenerateParams parent_p = pp(long_trunk, 100);
+            GenerateResult parent_r;
+            CHECK(engine.batch_join(parent_p, &parent_r, &why),
+                  "the paged Engine trunk joins: " + why);
+            std::vector<i32> finished;
+            CHECK(engine.batch_step(&finished), "the paged Engine trunk prefills");
+            std::vector<GenerateParams> branches{pp(btext[0], 4), pp(btext[1], 4)};
+            std::vector<GenerateResult> branch_out;
+            CHECK(engine.batch_fork(0, branches, &branch_out, &why),
+                  "the paged Engine forks sibling branches: " + why);
+            // Advance the child prompt once so branch zero is attached and can
+            // itself become the trunk of a nested fork.
+            CHECK(engine.batch_step(&finished), "paged siblings prefill and advance");
+            std::vector<GenerateParams> nested{pp(nested_prompt, 3)};
+            std::vector<GenerateResult> nested_out;
+            CHECK(engine.batch_fork(1, nested, &nested_out, &why),
+                  "a paged sibling can fork a nested child: " + why);
+            int guard = 0;
+            while (engine.batch_active() > 1 && guard++ < 64) {
+                finished.clear();
+                CHECK(engine.batch_step(&finished), "paged sibling session advances");
+            }
+            CHECK(branch_out.size() == 2, "both paged sibling results are present");
+            CHECK(nested_out.size() == 1, "the nested paged child result is present");
+            if (branch_out.size() == 2) {
+                CHECK(branch_out[0].tokens == oracle[0].tokens,
+                      "paged sibling zero matches its isolated full-prefix run");
+                CHECK(branch_out[1].tokens == oracle[1].tokens,
+                      "paged sibling one matches its isolated full-prefix run");
+            }
+            if (nested_out.size() == 1)
+                CHECK(nested_out[0].tokens == oracle[2].tokens,
+                      "nested paged branch matches its isolated full-prefix run");
+            // The completed branch slots must be reusable with empty tables;
+            // a new request in one of them must not see either old suffix.
+            GenerateResult reused;
+            GenerateParams reuse_p = pp(btext[1], 2);
+            CHECK(engine.batch_join(reuse_p, &reused, &why),
+                  "a finalized paged slot is reusable: " + why);
+            guard = 0;
+            while (engine.batch_active() > 1 && guard++ < 32) {
+                finished.clear();
+                CHECK(engine.batch_step(&finished), "reused paged slot advances");
+            }
+            engine.batch_close();
+            CHECK(reused.finish != FinishError,
+                  "the reused paged slot finishes without stale-page errors");
+            CHECK(reused.tokens.size() == 2 && oracle[1].tokens.size() >= 2 &&
+                      std::equal(reused.tokens.begin(), reused.tokens.end(),
+                                 oracle[1].tokens.begin()),
+                  "the reused paged slot starts from a clean prompt and matches its oracle prefix");
+            engine.shutdown();
+        }
+        std::remove(ppath.c_str());
+    }
+
+}
+
 
 // ---------------------------------------------------------------------------
 // B2.3a -- prefill interleaved with decode
@@ -34389,6 +34526,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_kv_quant_int8)
     TEST_GROUP(test_kv_page_attention)
     TEST_GROUP(test_kv_page_cow)
+    TEST_GROUP(test_engine_paged_kv_parity)
     TEST_GROUP(test_kv_tier_per_layer_widths)
     TEST_GROUP(test_kv_tier_no_kv_layers)
     TEST_GROUP(test_kv_tier_drop_vs_spill)

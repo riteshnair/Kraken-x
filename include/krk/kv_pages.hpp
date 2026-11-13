@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "krk/common.hpp"
@@ -52,7 +53,7 @@ private:
     size_t page_bytes_ = 0;
     size_t live_pages_ = 0;
     size_t resident_bytes_ = 0;
-    std::vector<std::vector<u8>> pages_; // payload allocated on first use
+    std::vector<std::unique_ptr<u8[]>> pages_; // payload allocated on first use
     std::vector<u32> refs_;
     std::vector<PageId> free_;
 };

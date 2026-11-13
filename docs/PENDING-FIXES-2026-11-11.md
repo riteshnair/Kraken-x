@@ -124,43 +124,48 @@ boundaries at chunk edges and near context limits. If a model/backend cannot
 preserve the invariant, refuse the operation; do not silently use an unverified
 fallback.
 
-### 5. Add paged KV storage and copy-on-write
+### 5. Paged KV storage and copy-on-write
 
-The engine's active KV storage is still contiguous per slot and the fork path
-still copies rows. A bounded, lazy-payload page arena and sequence block-table primitive exist
-in `include/krk/kv_pages.hpp` / `src/kv_pages.cpp`; they cover shared references,
-write-time COW, truncation/reset, exhaustion, and reuse. `AttnDesc` now carries
+A bounded, lazy-payload page arena and sequence block-table primitive live in
+`include/krk/kv_pages.hpp` / `src/kv_pages.cpp`; they cover shared references,
+write-time COW, truncation/reset, exhaustion, and reuse. `AttnDesc` carries
 optional per-row physical K/V page tables, and the CPU reference backend honors
-them in KV append and dense/sparse attention (including packed cache row
-addressing); incomplete tables fail closed. HIP and NPU do not advertise the
-capability. Backend tests compare page-mapped append/attention with contiguous
-results across page boundaries, including int8 rows; a CPU sibling-fork fixture
-checks that two branches see the shared trunk plus only their own suffix. The
-Engine still allocates and addresses active KV contiguously, and batch forks
-still copy rows, so the runtime does not yet save memory or fork-copy bandwidth.
-The next work is wiring tables into Engine allocation, per-sequence lifecycle,
-rollback, reset/close and fork paths; the current branch-local ancestry test is
-not Engine fork coverage. This should reduce KV reservation/duplication; it does
-not reduce expert-weight residency directly.
+them in KV append and attention, including packed cache row addressing;
+incomplete tables fail closed. HIP and NPU do not advertise the capability.
+Backend tests compare page-mapped append/attention with contiguous results
+across page boundaries, including int8 rows.
 
-**Acceptance:** existing batch and prefill exactness tests remain green; add
-page-boundary, allocation-failure, reset/close, slot reuse, and refcount-balance
-tests. Measure single-sequence regressions and actual memory saved before claiming
-a benefit.
+The experimental `--kv-paged` Engine path uses lazy page payloads instead of
+initializing contiguous K/V tiers. It passes page tables to append and attention,
+and keeps per-sequence block tables through batch join, prefix fork, rollback,
+finalize/close, and slot reuse. Forks share only their inherited prefix;
+first writes to a shared partial page detach it, while causal positions prevent
+sibling suffix visibility. Unsupported backends and non-ordinary model layouts
+are refused rather than silently falling back. Engine tests cover serial
+contiguous parity and Engine-level page-boundary sibling/nested fork exactness on
+a synthetic CPU fixture.
 
-### 6. Add trunk/branch visibility metadata for shared-tree forks
+This is correctness coverage, not a performance or real-model memory result.
+No latency, peak-RSS, or memory-saved benefit has been measured; do not claim
+one. Remaining work is broader allocation-failure and native-device coverage,
+plus single-sequence regression and real-model memory measurements. Contiguous
+KV remains the default; paged KV does not reduce expert-weight residency.
 
-The CPU backend fixture now checks the core page-table invariant directly: two
-prefix-cloned sibling tables share trunk pages, detach a partial page on write,
-and causal row positions make each answer see only its own suffix. This is not
-yet Engine/session coverage. Wire ancestry/prefix limits into the sequence and
-attention row tables so an Engine fork may see the shared prompt and its own
-ancestors, never a sibling's suffix.
+**Acceptance:** existing batch and prefill exactness tests remain green; Engine
+page-boundary/nested-sibling visibility, reset/close, slot reuse, and prefix
+parity pass. Measure single-sequence regressions and actual memory saved before
+claiming a benefit.
 
-**Acceptance:** compare nested and sibling branch logits/tokens with isolated
-standalone runs through the Engine, including page boundaries and slot/page
-reuse. Land only after paged storage is correct. This is the missing shared-trunk
-part of Flide; the current copy-backed f16 forks are not that implementation.
+### 6. Trunk/branch visibility for shared-tree forks
+
+The CPU backend and Engine/session tests now check the core page-table
+invariant: prefix-cloned siblings share trunk pages, detach a partial page on
+write, and causal row positions make each answer see only its own suffix. The
+Engine test compares nested and sibling branch tokens with isolated standalone
+runs across a page boundary and reuses a completed slot. Broader model and
+backend coverage, including native HIP/device, remains pending. This is the
+shared-trunk implementation path; contiguous copy-backed forks remain the
+default unless `--kv-paged` is explicitly enabled.
 
 ### 7. Add the per-option scoring surface before MMDM
 

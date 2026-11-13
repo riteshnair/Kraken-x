@@ -78,6 +78,7 @@ struct Args {
     int chunk = 512;
     int kv_quant = 2; // 0 = f16, 1 = int8, 2 = turbo3 (default), 3 = rot4 (experimental)
 bool kv_quant_explicit = false; // --kv-quant was given, so a refusal is a refusal
+    bool kv_paged = false;
     int device = 0;
     int threads = 0;
     int expert_cache_mb = 0;    // MoE expert residency budget (MiB), 0 = auto
@@ -306,6 +307,8 @@ void usage() {
         "                        keeps them resident while they fit and streams\n"
         "                        whole layers from the file once they do not,\n"
         "                        which frees VRAM for KV. Negative disables it.\n"
+        "  --kv-paged             experimental CPU-only paged KV with COW forks;\n"
+        "                        refuses unsupported model/backend combinations\n"
         "  --kv-hot-mb N          KV HOT tier in VRAM, in MiB. 0 (default) takes\n"
         "                        whatever VRAM the weights and workspaces leave\n"
         "                        free. The KV is split into layer-granular slots;\n"
@@ -621,6 +624,7 @@ bool parse(int argc, char **argv, Args *a) {
             a->host_ram_mb = next_i("--host-ram-mb");
         else if (f == "--weight-vram-mb")
             a->weight_vram_mb = next_i("--weight-vram-mb");
+        else if (f == "--kv-paged") a->kv_paged = true;
         else if (f == "--kv-hot-mb")
             a->kv_hot_mb = next_i("--kv-hot-mb");
         else if (f == "--kv-warm-mb")
@@ -1883,6 +1887,7 @@ int main(int argc, char **argv) {
     cfg.prefill_chunk = a.chunk;
     cfg.kv_quant = a.kv_quant;
     cfg.kv_quant_explicit = a.kv_quant_explicit;
+    cfg.kv_paged = a.kv_paged;
     cfg.trace_hash = a.prefill_hash;
     cfg.threads = a.threads;
     cfg.seed = a.seed;
