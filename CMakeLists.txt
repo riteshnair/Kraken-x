@@ -128,6 +128,7 @@ set(KRK_CORE_SOURCES
     src/draft_head.cpp
     src/expert_cache.cpp
     src/expert_cpu.cpp
+    src/expert_replay.cpp
     src/kv_tier.cpp
     src/engine.cpp
     src/backend_cpu.cpp
@@ -578,6 +579,12 @@ target_link_libraries(kraken-inspect PRIVATE krk_core)
 # alone, so it can be run without the GPU being busy.
 add_executable(kraken-cpu-expert-ceiling tools/cpu_expert_ceiling.cpp)
 target_link_libraries(kraken-cpu-expert-ceiling PRIVATE krk_core)
+
+# Replays a recorded routing trace through the real ExpertCache, so a cache
+# size, a pin budget or a host share can be compared without loading the model
+# once per arm. The counters it prints are the cache's own.
+add_executable(kraken-expert-replay tools/moe_cache_replay.cpp)
+target_link_libraries(kraken-expert-replay PRIVATE krk_core)
 
 # Checks the attention body against a scalar reference over every shape that
 # has its own code path: decode, prefill, GQA, hd 80/96/128/256, windowed,

@@ -989,6 +989,29 @@ private:
     i32 table_host_cells_ = 0;
 };
 
+// Which experts of the device tier's OVERFLOW the host arm computes, when the
+// hybrid CPU+GPU split is on. `permille` is `--hybrid-frac` in thousandths:
+// 0 leaves every overflow expert to the cache (all promoted, the pre-hybrid
+// behaviour) and 1000 gives all of it to the host (the default).
+//
+// The decision has to be a function of (layer, expert) and not of a counter or
+// of arrival order: the same experts then move together layer after layer, so
+// two arms of a sweep differ in placement rather than in which weight went
+// where. It is also what makes the choice replayable -- see
+// `expert_replay.hpp`, which must reach the same answer as the engine or the
+// tuner would be predicting a different run.
+//
+// Only experts that are NOT resident are candidates. A resident expert stays on
+// the device whatever the share says: its bytes are already there, and moving
+// the arithmetic off the card while keeping the copy spends VRAM to go slower.
+inline bool expert_split_share(i32 layer, i32 expert, int permille) {
+    if (permille <= 0) return false;
+    if (permille >= 1000) return true;
+    const u32 hsh = static_cast<u32>(layer) * 2654435761u +
+                    static_cast<u32>(expert) * 40503u;
+    return static_cast<int>(hsh % 1000u) < permille;
+}
+
 } // namespace krk
 
 #endif // KRK_EXPERT_CACHE_HPP

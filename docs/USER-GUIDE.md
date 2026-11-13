@@ -131,6 +131,42 @@ The following options are different because they deliberately influence routing:
 They can reduce expert transfers while changing outputs. Benchmark them with a
 separate quality evaluation, not only a tokens/s comparison.
 
+### Choosing the expert budgets from a recorded trace
+
+A cache size, a pin budget and a host share can be compared without loading the
+model once per arm. Record one run's routing, then replay it through the same
+`ExpertCache` the run used:
+
+```sh
+# 1. Record the routing of a short generation (one TSV, one line per acquire).
+KRK_TRACE_EXPERTS=1 KRK_TRACE_PATH=expert_trace.tsv \
+  ./build-cpu/kraken -m moe.gguf --intel -p "Write a short sort." -n 128 --greedy
+
+# 2. Compare cache sizes and host shares offline.
+python3 scripts/moe_cache_tune.py --trace expert_trace.tsv \
+  --expert-mib 1.95 --budget-mib 1440,2880,5760 --shares 0,0.5,1 \
+  --base-ms 30
+```
+
+The script prints one row per configuration with the replayed hits, promotions,
+mapping reads and host-computed experts, predicts a per-token time from the read
+and promotion rates you pass (or the recorded defaults), and recommends the
+lowest host share within 5% of the fastest. `--markdown` prints the table for a
+report, and `--out DIR` caches replay results so trying another size is instant.
+
+Two things to keep in mind:
+
+- The prediction is only as good as the three rate constants. `--print-defaults`
+  shows the recorded ones; substitute your own before believing a percentage.
+- `--expert-mib` must match the model, because the replay works in expert slots:
+  the policy divides the budget by the expert footprint, and that ratio is the
+  whole decision. `kraken-inspect file.gguf --info` prints the routed set size to
+  divide by the expert count.
+
+The replay models the byte budget, the per-layer leases and the host arm's share
+of the overflow. It does not model staging, prediction or lookahead, so a run
+that turns those on can still beat the prediction.
+
 ### Long context
 
 ```sh
