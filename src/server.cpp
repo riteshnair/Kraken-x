@@ -107,8 +107,7 @@ bool render_chat(const Engine &engine, const JsonValue &body, std::string *promp
     // `add_generation_prompt` is true unless the client explicitly asked for the
     // transcript alone: an OpenAI chat call is by definition about to be
     // continued by the model.
-    bool add_prompt = true;
-    body.get_bool("add_generation_prompt", &add_prompt);
+    const bool add_prompt = body.get_bool("add_generation_prompt", true);
     std::string err;
     if (render_chat_prompt(model.chat_template_or_builtin(), turns, add_prompt,
                            bos, eos, prompt, &err)) {
