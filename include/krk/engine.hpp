@@ -460,6 +460,30 @@ public:
     // only when the forward pass failed, in which case every attached sequence
     // is finished with that error.
     bool batch_step(std::vector<i32> *finished);
+    // Fork the sequence at `index` into one sequence per branch. Each branch's
+    // GenerateParams::prompt is a COMPLETE prompt whose tokenized prefix must
+    // exactly match the parent's prompt. The fork point is the end of that
+    // prefix: those KV rows are COPIED into the branch slot and only the prompt
+    // suffix is prefetched. Tokens the parent generated itself are not inherited,
+    // so a parent can keep decoding while its branches run.
+    //
+    // This is the trunk-once case. Prefilling one state and asking N questions
+    // about it costs one trunk pass plus N short suffix prefills; running the same
+    // thing as N requests costs N trunk passes. The copied KV rows are
+    // byte-identical at the same positions. For the f16-KV CPU fixture,
+    // test_batch_fork compares branch tokens against the same complete request
+    // run alone. Forking currently refuses lossy KV modes: a CPU int8 probe
+    // changed greedy branch tokens across the fork's different prefill
+    // partitioning, so quantized-cache parity is not established. The caller
+    // must keep each branch's GenerateParams and GenerateResult alive through
+    // the session, just as for batch_join.
+    //
+    // Refused, with `err` set and every result failed: no session, no such
+    // sequence, a sequence still prefilling or already finished, compressed
+    // attention state that is not fork-copyable yet, an empty/non-prefix branch
+    // prompt, or insufficient KV slots.
+    bool batch_fork(i32 index, const std::vector<GenerateParams> &branches,
+                    std::vector<GenerateResult> *outs, std::string *err);
     i32 batch_active() const;
     i32 batch_free_slots() const;
     // Ends the session and releases its slots. Safe to call when none is open,
@@ -846,6 +870,10 @@ private:
     // prompt. Sets the sequence's first-token logits when it consumes the last
     // chunk; returns false when the chunk failed or the request was cancelled.
     bool batch_prefill_slice(i32 index);
+    // Copies `rows` rows of every KV plane from one slot to another. One call
+    // per plane and per layer, because a slot's rows are contiguous within a
+    // plane; shared-KV layers are skipped, since they have no plane of their own.
+    bool batch_copy_slot_rows(i32 from_slot, i32 to_slot, i64 rows);
 
     // Cooperative cancellation (see GenerateParams::cancel). Read once per
     // prefill chunk and once per generated token; the decode loops stop through

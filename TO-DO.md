@@ -1,6 +1,7 @@
 # Kraken pending work
 
-Status: 2026-11-13, after an eight-paper evaluation: the register now carries the
+Status: 2026-11-11, after an eight-paper evaluation and the first copy-backed
+branch-fork implementation: the register now carries the
 pages/forks/scoring path the evaluation recommends, and the papers it refuses with
 reasons. See `docs/PAPER-EVALUATION-2026-11.md`.
 
@@ -11,8 +12,8 @@ runs.
 
 ## Evidence rules
 
-- The release CPU suite passes 8045/8045 checks and the ASan build of the whole
-  suite passes 8044/8044 (`build-cpu`, and `build-asan` with
+- The release CPU suite passes 8123/8123 checks and the ASan build of the whole
+  suite passes 8122/8122 (`build-cpu`, and `build-asan` with
   `detect_leaks=1:halt_on_error=1`). The one-check difference is deliberate: the
   wall-clock ratio gate in `test_batch_decode` is skipped under instrumentation,
   because ASan re-times two code paths unevenly and the number would be about the
@@ -81,14 +82,21 @@ Status labels:
   `test_prefill_chunk_bitexact`) plus a measured non-regression on the
   single-sequence path, where one page lookup per block is the cost.
   See `docs/PAPER-EVALUATION-2026-11.md` section 1 (PagedAttention).
-- [ ] **Exact branch forking** (CODE). Generalise the row metadata from
-  `(slot, position)` to `(trunk, branch, position)` and build the attention mask
-  from it, so sibling branches cannot see each other and each branch is
-  bit-identical to an isolated run; add the two-call recurrent path (trunk
-  segments produce the state, branch segments continue from it by index, no copy).
-  This is the shared primitive behind multi-branch prefix reuse, beam/tree
-  speculation, and the recurrent half of the speculation item below.
-  See `docs/PAPER-EVALUATION-2026-11.md` section 2 (Flide).
+- [ ] **Exact branch forking** (CODE). A first copy-backed surface now exists:
+  `Engine::batch_fork` accepts complete branch prompts, checks the parent's
+  token-prefix, copies the trunk KV rows into each free sequence slot, then
+  prefills only the suffix. `test_batch_fork` checks isolated-run token parity
+  for the f16-KV fixture, nested forks, slot/refusal handling, and confirms
+  the parent continuation is not inherited. A CPU int8 probe changed greedy
+  branch tokens under the different prefill partitioning, so forks currently
+  refuse lossy KV modes rather than claim parity. This is a correct
+  independent-slot baseline, not yet Flide's shared branch stream: it duplicates
+  KV storage and copies the full trunk per branch. Remaining: KV pages/refcounts/CoW, the
+  `(trunk, branch, position)` visibility mask, compressed-state fork support,
+  and the two-call recurrent path (trunk segments produce state, branch segments
+  continue from it by index, no copy). Keep this item open until those land.
+  The shared primitive is still needed for multi-branch prefix reuse and
+  beam/tree speculation. See `docs/PAPER-EVALUATION-2026-11.md` section 2 (Flide).
 - [ ] **Per-option scoring surface** (CODE). A request that returns the output
   head normalised over a caller-supplied option set (Flide's Eq. 1), on both the
   serial and the session path, so a decision model can be served and measured at

@@ -32179,6 +32179,299 @@ static void test_cancel_phases() {
 }
 
 // ---------------------------------------------------------------------------
+// B2.3d -- forking a sequence into branches
+// ---------------------------------------------------------------------------
+//
+// One state, several questions about it, is the shape a decision request has and
+// the shape a chat branch has. Served as N requests it costs N passes over the
+// state; served as a fork it costs one pass plus N short prefills, because the
+// branches inherit the trunk's KV rows by copy.
+//
+// The copies make the exactness claim almost free, which is exactly why it still
+// needs a test: a branch that started at the wrong position, inherited the wrong
+// number of rows, or saw the parent's own generated tokens would still produce
+// fluent text. So every branch is compared token for token against the same
+// request run alone, and the fork point is asserted to be the end of the PARENT'S
+// PROMPT -- not of its continuations, which a branch must never inherit.
+static void test_batch_fork() {
+    Backend *cpu = make_cpu_backend();
+    const std::string path = "kraken-batch-fork.gguf";
+    MoeSpec s;
+    s.dense = false;
+    s.n_expert = 4;
+    s.n_expert_used = 2;
+    s.shared = true;
+    s.varied = true;
+    CHECK(build_tiny_moe_model(path, s), "wrote a MoE fixture for the fork test");
+
+    auto open = [&](Engine *engine, i32 slots, std::string *err) {
+        EngineConfig cfg;
+        cfg.model_path = path;
+        cfg.n_ctx = 64;
+        cfg.prefill_chunk = 8;
+        cfg.n_slots = slots;
+        return engine->init(cpu, cfg, err);
+    };
+    auto params = [](const std::string &prompt, i32 max_tokens) {
+        GenerateParams p;
+        p.prompt = prompt;
+        p.max_tokens = max_tokens;
+        p.sampler.greedy = true;
+        p.sampler.temp = 0.0f;
+        p.sample_host = true;
+        return p;
+    };
+    const std::string trunk = "the the";
+    const char *branch_text[2] = {" the", " a"};
+    const std::string branch_prompt[2] = {trunk + branch_text[0], trunk + branch_text[1]};
+
+    // --- the oracle, and the assumption it rests on --------------------------
+    std::vector<std::vector<i32>> solo(2);
+    std::vector<i32> trunk_ids, branch_ids[2], chain_ids;
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 2, &err)) {
+            CHECK(false, "the fork oracle engine initialises");
+            delete cpu;
+            return;
+        }
+        CHECK(engine.tokenizer().encode(trunk, trunk_ids, true) >= 0,
+              "the trunk prompt tokenizes");
+        for (int i = 0; i < 2; i++) {
+            GenerateParams p = params(branch_prompt[i], 4);
+            GenerateResult r;
+            CHECK(engine.generate(p, &r), "the oracle run for branch " + std::to_string(i));
+            solo[static_cast<size_t>(i)] = r.tokens;
+            // Fork requests carry the complete prompt. Its standalone
+            // tokenization must preserve the trunk's token prefix; branch IDs
+            // below are the suffix after that prefix, including any merges the
+            // tokenizer made across the text boundary.
+            std::vector<i32> both;
+            CHECK(engine.tokenizer().encode(branch_prompt[i], both, true) >= 0,
+                  "branch " + std::to_string(i) + ": the complete prompt tokenizes");
+            CHECK(both.size() > trunk_ids.size() &&
+                      std::equal(trunk_ids.begin(), trunk_ids.end(), both.begin()),
+                  "branch " + std::to_string(i) + ": the complete prompt preserves the trunk prefix");
+            branch_ids[i].assign(both.begin() + static_cast<long>(trunk_ids.size()), both.end());
+        }
+        GenerateResult chain_oracle;
+        const std::string chain_prompt = trunk + branch_text[0] + branch_text[1];
+        CHECK(engine.generate(params(chain_prompt, 3), &chain_oracle),
+              "the oracle run for the chained branch prompt");
+        solo.push_back(chain_oracle.tokens);
+        CHECK(engine.tokenizer().encode(chain_prompt, chain_ids, true) >= 0,
+              "the whole chained prompt tokenizes");
+        CHECK(chain_ids.size() > trunk_ids.size() &&
+                  std::equal(trunk_ids.begin(), trunk_ids.end(), chain_ids.begin()),
+              "the chained prompt preserves the trunk token prefix");
+    }
+
+    // --- the fork: one trunk pass, two branches -----------------------------
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 5, &err)) {
+            CHECK(false, "the fork engine initialises");
+            delete cpu;
+            return;
+        }
+        std::string why;
+        CHECK(engine.batch_open(&why), std::string("a session opens: ") + why);
+        GenerateParams pp = params(trunk, 3);
+        GenerateResult pr;
+        CHECK(engine.batch_join(pp, &pr, &why), std::string("the trunk joins: ") + why);
+        std::vector<i32> finished;
+        CHECK(engine.batch_step(&finished), "the trunk's prefill runs");
+        CHECK(pr.generated >= 1, "the parent started decoding after its prefill");
+        CHECK(engine.batch_active() == 1, "the parent is the only sequence");
+
+        std::vector<GenerateParams> forks;
+        for (int i = 0; i < 2; i++) forks.push_back(params(branch_prompt[i], 4));
+        std::vector<GenerateResult> outs;
+        CHECK(engine.batch_fork(0, forks, &outs, &why),
+              std::string("the trunk forks into two branches: ") + why);
+        CHECK(outs.size() == 2, "both branches come back");
+        CHECK(engine.batch_free_slots() == 2, "each branch took a slot (5 - 1 parent - 2)");
+        CHECK(engine.batch_active() == 3, "the parent and both branches are attached");
+        for (int i = 0; i < 2; i++) {
+            CHECK(outs[static_cast<size_t>(i)].prompt_tokens ==
+                      static_cast<i32>(trunk_ids.size() + branch_ids[i].size()),
+                  "branch " + std::to_string(i) +
+                      ": the prompt it reports is the trunk plus its own tokens");
+            CHECK(outs[static_cast<size_t>(i)].generated == 0,
+                  "branch " + std::to_string(i) + ": forking generates nothing");
+        }
+
+        int guard = 0;
+        while (engine.batch_active() > 0 && guard++ < 64) {
+            finished.clear();
+            CHECK(engine.batch_step(&finished), "the forked session steps");
+        }
+        CHECK(engine.batch_active() == 0, "the session drains");
+        for (int i = 0; i < 2; i++) {
+            const GenerateResult &r = outs[static_cast<size_t>(i)];
+            CHECK(r.finish == FinishLength, "branch " + std::to_string(i) + " stopped at its limit");
+            CHECK(r.generated == 4, "branch " + std::to_string(i) + " generated its four tokens");
+            CHECK(r.tokens == solo[static_cast<size_t>(i)],
+                  "branch " + std::to_string(i) +
+                      ": the forked tokens are the tokens the same request produces alone");
+        }
+        CHECK(pr.generated >= 1 && pr.finish != FinishError,
+              "the parent was not disturbed by the fork");
+        engine.batch_close();
+    }
+
+    // --- a branch of a branch ------------------------------------------------
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 4, &err)) {
+            CHECK(false, "the chained-fork engine initialises");
+            delete cpu;
+            return;
+        }
+        std::string why;
+        CHECK(engine.batch_open(&why), "a session opens for the chained fork");
+        GenerateParams pp = params(trunk, 2);
+        GenerateResult pr;
+        CHECK(engine.batch_join(pp, &pr, &why), "the trunk joins");
+        std::vector<i32> finished;
+        CHECK(engine.batch_step(&finished), "the trunk prefills");
+
+        std::vector<GenerateParams> first{params(branch_prompt[0], 6)};
+        std::vector<GenerateResult> mid;
+        CHECK(engine.batch_fork(0, first, &mid, &why), "the trunk forks once");
+        CHECK(engine.batch_step(&finished), "the branch prefills");
+        CHECK(mid[0].generated >= 1, "the branch is decoding");
+
+        // The grandchild inherits the branch's prompt rows: trunk + branch text.
+        std::vector<GenerateParams> second{params(trunk + branch_text[0] + branch_text[1], 3)};
+        std::vector<GenerateResult> leaf;
+        CHECK(engine.batch_fork(1, second, &leaf, &why),
+              std::string("a branch can itself be forked: ") + why);
+        CHECK(leaf[0].prompt_tokens == static_cast<i32>(chain_ids.size()),
+              "the grandchild's prompt is the whole chain");
+        int guard = 0;
+        while (engine.batch_active() > 0 && guard++ < 64) {
+            finished.clear();
+            CHECK(engine.batch_step(&finished), "the chained session steps");
+        }
+        CHECK(leaf[0].tokens == solo[2],
+              "a branch of a branch matches the same complete chain run alone");
+        engine.batch_close();
+    }
+
+    // --- refusals ------------------------------------------------------------
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 2, &err)) {
+            CHECK(false, "the refusal engine initialises");
+            delete cpu;
+            return;
+        }
+        std::string why;
+        CHECK(engine.batch_open(&why), "a session opens for the refusal arms");
+        GenerateParams pp = params(trunk, 3);
+        GenerateResult pr;
+        CHECK(engine.batch_join(pp, &pr, &why), "the trunk joins");
+
+        // Still prefilling: the fork point does not exist yet.
+        std::vector<GenerateParams> one{params(branch_prompt[0], 2)};
+        std::vector<GenerateResult> outs;
+        CHECK(!engine.batch_fork(0, one, &outs, &why),
+              "a sequence that has not been prefilled cannot be forked");
+        CHECK(why.find("prefill") != std::string::npos,
+              std::string("and says why: ") + why);
+
+        std::vector<i32> finished;
+        CHECK(engine.batch_step(&finished), "the trunk prefills");
+
+        // Two slots, one taken: a fork of two has nowhere to put the second.
+        std::vector<GenerateParams> two{params(branch_prompt[0], 2), params(branch_prompt[1], 2)};
+        CHECK(!engine.batch_fork(0, two, &outs, &why), "a fork that does not fit is refused");
+        CHECK(why.find("2 free") != std::string::npos,
+              std::string("and names the slot count: ") + why);
+        CHECK(outs.size() == 2 && outs[0].finish == FinishError && !outs[0].error.empty(),
+              "every branch of a refused fork is failed, not answered");
+        std::vector<GenerateParams> too_many{params(branch_prompt[0], 2),
+                                             params(branch_prompt[1], 2),
+                                             params(branch_prompt[0], 2)};
+        CHECK(!engine.batch_fork(0, too_many, &outs, &why),
+              "more branches than total slots are rejected before tokenizing");
+        CHECK(why.find("more branches than") != std::string::npos,
+              std::string("and names the capacity limit: ") + why);
+
+        // An empty branch prompt has no rows to write and no row to sample.
+        std::vector<GenerateParams> empty{params("", 2)};
+        CHECK(!engine.batch_fork(0, empty, &outs, &why), "an empty branch is refused");
+        CHECK(why.find("zero tokens") != std::string::npos,
+              std::string("and says why: ") + why);
+
+        // An index that is not a sequence.
+        std::vector<GenerateParams> ok{params(branch_prompt[0], 2)};
+        CHECK(!engine.batch_fork(7, ok, &outs, &why), "a fork of no sequence is refused");
+        CHECK(why.find("index 7") != std::string::npos,
+              std::string("and names the index: ") + why);
+
+        std::vector<GenerateParams> wrong_prefix{params("xyz", 2)};
+        CHECK(!engine.batch_fork(0, wrong_prefix, &outs, &why),
+              "a branch whose complete prompt does not preserve the trunk is refused");
+        CHECK(why.find("prefix") != std::string::npos,
+              std::string("and explains the prefix mismatch: ") + why);
+
+        int drain = 0;
+        while (engine.batch_active() > 0 && drain++ < 16)
+            CHECK(engine.batch_step(&finished), "the refusal-arm parent finishes");
+        CHECK(engine.batch_active() == 0, "the refusal-arm parent finished");
+        CHECK(!engine.batch_fork(0, ok, &outs, &why),
+              "a finished sequence cannot be forked");
+        CHECK(why.find("finished") != std::string::npos,
+              std::string("and says the parent finished: ") + why);
+
+        engine.batch_close();
+        CHECK(!engine.batch_fork(0, ok, &outs, &why), "a fork with no session is refused");
+    }
+
+    // Quantized KV produces a different greedy branch under the fork's changed
+    // prefill partition in this CPU fixture. Until that path is characterized,
+    // the exact-fork API refuses it rather than promising solo-run parity.
+    {
+        Engine engine;
+        EngineConfig cfg;
+        cfg.model_path = path;
+        cfg.n_ctx = 64;
+        cfg.prefill_chunk = 8;
+        cfg.n_slots = 3;
+        cfg.kv_quant = 1;
+        std::string err;
+        if (!engine.init(cpu, cfg, &err)) {
+            CHECK(false, std::string("the int8 fork refusal engine initializes: ") + err);
+            delete cpu;
+            return;
+        }
+        std::string why;
+        CHECK(engine.batch_open(&why), "the int8 batch session opens");
+        GenerateParams pp = params(trunk, 3);
+        GenerateResult pr;
+        CHECK(engine.batch_join(pp, &pr, &why), "the int8 trunk joins");
+        std::vector<i32> finished;
+        CHECK(engine.batch_step(&finished), "the int8 trunk prefills");
+        std::vector<GenerateParams> qbranch{params(branch_prompt[0], 2)};
+        std::vector<GenerateResult> qout;
+        CHECK(!engine.batch_fork(0, qbranch, &qout, &why),
+              "forking with int8 KV is refused until parity is established");
+        CHECK(why.find("quantized-cache parity") != std::string::npos,
+              std::string("and explains the evidence gap: ") + why);
+        engine.batch_close();
+    }
+
+    std::remove(path.c_str());
+    delete cpu;
+}
+
+// ---------------------------------------------------------------------------
 // B2.3a -- prefill interleaved with decode
 // ---------------------------------------------------------------------------
 //
@@ -33551,6 +33844,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_batch_decode)
     TEST_GROUP(test_prefix_partial_reuse)
     TEST_GROUP(test_cancel_phases)
+    TEST_GROUP(test_batch_fork)
     TEST_GROUP(test_batch_prefill_interleave)
     TEST_GROUP(test_batch_admission)
     TEST_GROUP_SERIAL(test_batch_throughput,
