@@ -28,6 +28,19 @@ static inline int krk_test_unsetenv(const char *name) { return _putenv_s(name, "
 #endif
 #endif
 #include <algorithm>
+
+// Whether this binary is built with AddressSanitizer. One arm below is a
+// wall-clock RATIO between two code paths, and an instrumented build re-times
+// it unevenly (the batched path makes fewer, larger calls), so under ASan the
+// number says nothing about the thing the gate is about. The tokens are still
+// compared there; only the ratio is skipped.
+#if defined(__SANITIZE_ADDRESS__)
+#define KRK_TESTS_ASAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define KRK_TESTS_ASAN 1
+#endif
+#endif
 #include <condition_variable>
 #include <mutex>
 #include <string>
@@ -32688,9 +32701,15 @@ static void test_batch_decode() {
         // Not a speed gate on a one-layer model: there is almost no weight to
         // share. It is a gate against batching costing a factor. The number that
         // matters is `kraken-batch-bench`.
+#ifdef KRK_TESTS_ASAN
+        std::fprintf(stderr,
+                     "[batch] instrumented build: ratio not gated (%.2f ms batched "
+                     "vs %.2f ms serial)\n", batch_ms, solo_ms);
+#else
         CHECK(batch_ms < solo_ms * 2.0,
               "a wave is not twice the work of the same serial runs (" +
                   std::to_string(batch_ms) + " ms vs " + std::to_string(solo_ms) + " ms)");
+#endif
     }
 
     // --- a slot count of one is the serial engine ----------------------------

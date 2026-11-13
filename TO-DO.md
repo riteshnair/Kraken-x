@@ -1,6 +1,7 @@
 # Kraken pending work
 
-Status: 2026-11-12, after the documentation support-state correction.
+Status: 2026-11-11, after the scheduler work: iteration-level admission,
+prefill interleaved with decode, a cancellation audit, and prefix-reuse tests.
 
 This is the only pending-work list. Historical plans, audits, campaign logs, and
 transcripts were removed because their claims and line references had become
@@ -9,7 +10,12 @@ runs.
 
 ## Evidence rules
 
-- The release CPU and Debug ASan suites currently pass 7579/7579 checks.
+- The release CPU suite passes 8045/8045 checks and the ASan build of the whole
+  suite passes 8044/8044 (`build-cpu`, and `build-asan` with
+  `detect_leaks=1:halt_on_error=1`). The one-check difference is deliberate: the
+  wall-clock ratio gate in `test_batch_decode` is skipped under instrumentation,
+  because ASan re-times two code paths unevenly and the number would be about the
+  sanitizer. ASan runs every group, so a leak in one is not hidden by another.
 - ASan validation uses `detect_leaks=1:halt_on_error=1`, without suppressions.
 - A synthetic fixture proves only the behavior it constructs. It does not prove
   real-model coherence, output quality, acceptance rate, or throughput.
