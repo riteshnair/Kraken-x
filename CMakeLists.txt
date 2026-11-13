@@ -130,6 +130,7 @@ set(KRK_CORE_SOURCES
     src/expert_cpu.cpp
     src/expert_replay.cpp
     src/kv_tier.cpp
+    src/kv_pages.cpp
     src/engine.cpp
     src/backend_cpu.cpp
     src/npu/npu_offload.cpp
