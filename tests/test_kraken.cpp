@@ -2481,9 +2481,226 @@ static void test_kv_quant_int8() {
     delete cpu;
 }
 
+static void test_kv_page_attention() {
+    // This is the backend contract used by Engine page tables: append writes
+    // page-local rows, and attention resolves logical positions across a block
+    // boundary. Keep the reference path scalar so both arms use the same order.
+    setenv("KRK_CPU_ATTN_SCALAR", "1", 1);
+    Backend *cpu = make_cpu_backend();
+    constexpr i64 n = 4, dim = 4, page_rows = 2;
+    KvPagePool kpool, vpool;
+    CHECK(kpool.init(static_cast<size_t>(page_rows * dim) * sizeof(f32), 2) &&
+              vpool.init(static_cast<size_t>(page_rows * dim) * sizeof(f32), 2),
+          "K and V page arenas initialise for two page-boundary blocks");
+    KvBlockTable kt(&kpool, page_rows), vt(&vpool, page_rows);
+    CHECK(kt.writable_page(0) && kt.writable_page(page_rows) &&
+              vt.writable_page(0) && vt.writable_page(page_rows),
+          "append destinations allocate pages on both sides of the boundary");
+
+    std::vector<f32> keys(static_cast<size_t>(n * dim));
+    std::vector<f32> vals(static_cast<size_t>(n * dim));
+    std::vector<f32> queries(static_cast<size_t>(n * dim));
+    for (i64 r = 0; r < n; ++r) {
+        for (i64 c = 0; c < dim; ++c) {
+            keys[static_cast<size_t>(r * dim + c)] =
+                static_cast<f32>((r + 1) * (c + 1)) * 0.125f;
+            vals[static_cast<size_t>(r * dim + c)] =
+                static_cast<f32>((r + 2) * (c - 1)) * 0.25f;
+            queries[static_cast<size_t>(r * dim + c)] =
+                static_cast<f32>((r + c + 1) % 5) * 0.2f;
+        }
+    }
+    const i64 positions[n] = {0, 1, 2, 3};
+    std::vector<void *> kp(static_cast<size_t>(n * 2));
+    std::vector<void *> vp(static_cast<size_t>(n * 2));
+    for (i64 r = 0; r < n; ++r) {
+        for (i64 b = 0; b < 2; ++b) {
+            kp[static_cast<size_t>(r * 2 + b)] =
+                const_cast<u8 *>(kpool.data(kt.block(static_cast<size_t>(b))));
+            vp[static_cast<size_t>(r * 2 + b)] =
+                const_cast<u8 *>(vpool.data(vt.block(static_cast<size_t>(b))));
+        }
+    }
+
+    AttnDesc d;
+    d.n_head = d.n_kv = 1;
+    d.hd = dim;
+    d.n_tok = n;
+    d.row_pos = positions;
+    d.pos_stride = dim;
+    d.scale = static_cast<f32>(1.0 / std::sqrt(static_cast<f64>(dim)));
+    d.page_rows = page_rows;
+    d.page_table_stride = 2;
+    d.row_k_pages = kp.data();
+    d.row_v_pages = vp.data();
+    CHECK(cpu->attn_paged_kv_supported(),
+          "CPU reference advertises page-table-aware append and attention");
+    cpu->kv_append(nullptr, nullptr, keys.data(), vals.data(), d);
+
+    AttnDesc flat = d;
+    flat.row_k_pages = nullptr;
+    flat.row_v_pages = nullptr;
+    flat.page_rows = flat.page_table_stride = 0;
+    std::vector<f32> fk(static_cast<size_t>(n * dim), 0.0f);
+    std::vector<f32> fv(static_cast<size_t>(n * dim), 0.0f);
+    cpu->kv_append(fk.data(), fv.data(), keys.data(), vals.data(), flat);
+    std::vector<f32> paged_out(static_cast<size_t>(n * dim), 0.0f);
+    std::vector<f32> flat_out(static_cast<size_t>(n * dim), 0.0f);
+    cpu->attention(paged_out.data(), queries.data(), nullptr, nullptr, d);
+    cpu->attention(flat_out.data(), queries.data(), fk.data(), fv.data(), flat);
+    bool exact = paged_out == flat_out;
+    CHECK(exact, "page-mapped append and attention match contiguous KV across a boundary");
+
+    // Packed rows use byte strides rather than float-element strides. Exercise
+    // int8 so page-local addressing cannot accidentally multiply those offsets
+    // by sizeof(float).
+    const i64 q8_stride = static_cast<i64>(cpu->kv_row_bytes(dim, KvQuant::Int8));
+    KvPagePool k8pool, v8pool;
+    const size_t q8_page_bytes = static_cast<size_t>(page_rows * q8_stride);
+    CHECK(k8pool.init(q8_page_bytes, 2) && v8pool.init(q8_page_bytes, 2),
+          "int8 page arenas use the packed byte row geometry");
+    KvBlockTable k8t(&k8pool, page_rows), v8t(&v8pool, page_rows);
+    CHECK(k8t.writable_page(0) && k8t.writable_page(page_rows) &&
+              v8t.writable_page(0) && v8t.writable_page(page_rows),
+          "int8 append allocates both packed pages");
+    std::vector<void *> k8p(static_cast<size_t>(n * 2));
+    std::vector<void *> v8p(static_cast<size_t>(n * 2));
+    for (i64 r = 0; r < n; ++r) {
+        for (i64 b = 0; b < 2; ++b) {
+            k8p[static_cast<size_t>(r * 2 + b)] =
+                const_cast<u8 *>(k8pool.data(k8t.block(static_cast<size_t>(b))));
+            v8p[static_cast<size_t>(r * 2 + b)] =
+                const_cast<u8 *>(v8pool.data(v8t.block(static_cast<size_t>(b))));
+        }
+    }
+    AttnDesc q8 = d;
+    q8.kv_int8 = true;
+    q8.pos_stride = q8_stride;
+    q8.row_k_pages = k8p.data();
+    q8.row_v_pages = v8p.data();
+    cpu->kv_append(nullptr, nullptr, keys.data(), vals.data(), q8);
+    AttnDesc q8flat = q8;
+    q8flat.row_k_pages = q8flat.row_v_pages = nullptr;
+    q8flat.page_rows = q8flat.page_table_stride = 0;
+    std::vector<u8> k8flat(static_cast<size_t>(n * q8_stride));
+    std::vector<u8> v8flat(k8flat.size());
+    cpu->kv_append(k8flat.data(), v8flat.data(), keys.data(), vals.data(), q8flat);
+    std::vector<f32> q8page_out(static_cast<size_t>(n * dim));
+    std::vector<f32> q8flat_out(q8page_out.size());
+    cpu->attention(q8page_out.data(), queries.data(), nullptr, nullptr, q8);
+    cpu->attention(q8flat_out.data(), queries.data(), k8flat.data(), v8flat.data(), q8flat);
+    CHECK(q8page_out == q8flat_out,
+          "page-mapped int8 append and attention match contiguous packed KV");
+
+    // Exercise the visibility invariant for a fork point inside a page. Both
+    // children share the three-row trunk, then write different K/V at position
+    // three. COW must give each branch a private page, and causal row_pos must
+    // keep the shared page's later sibling data out of the attention prefix.
+    KvPagePool tree_k, tree_v;
+    const size_t f32_page_bytes = static_cast<size_t>(page_rows * dim) * sizeof(f32);
+    CHECK(tree_k.init(f32_page_bytes, 4) && tree_v.init(f32_page_bytes, 4),
+          "tree attention page pools initialise");
+    KvBlockTable trunk_k(&tree_k, page_rows), trunk_v(&tree_v, page_rows);
+    CHECK(trunk_k.writable_page(0) && trunk_k.writable_page(2) &&
+              trunk_v.writable_page(0) && trunk_v.writable_page(2),
+          "trunk rows occupy the shared partial page");
+    std::vector<f32> trunk_keys(keys.begin(), keys.begin() + 3 * dim);
+    std::vector<f32> trunk_vals(vals.begin(), vals.begin() + 3 * dim);
+    const i64 trunk_positions[3] = {0, 1, 2};
+    std::vector<void *> trunk_k_pages(6), trunk_v_pages(6);
+    for (i64 r = 0; r < 3; ++r)
+        for (i64 b = 0; b < 2; ++b) {
+            trunk_k_pages[static_cast<size_t>(r * 2 + b)] =
+                const_cast<u8 *>(tree_k.data(trunk_k.block(static_cast<size_t>(b))));
+            trunk_v_pages[static_cast<size_t>(r * 2 + b)] =
+                const_cast<u8 *>(tree_v.data(trunk_v.block(static_cast<size_t>(b))));
+        }
+    AttnDesc trunk_desc = d;
+    trunk_desc.n_tok = 3;
+    trunk_desc.row_pos = trunk_positions;
+    trunk_desc.row_k_pages = trunk_k_pages.data();
+    trunk_desc.row_v_pages = trunk_v_pages.data();
+    cpu->kv_append(nullptr, nullptr, trunk_keys.data(), trunk_vals.data(), trunk_desc);
+    KvBlockTable left_k(&tree_k, page_rows), left_v(&tree_v, page_rows);
+    KvBlockTable right_k(&tree_k, page_rows), right_v(&tree_v, page_rows);
+    CHECK(left_k.clone_prefix_from(trunk_k, 3) && left_v.clone_prefix_from(trunk_v, 3) &&
+              right_k.clone_prefix_from(trunk_k, 3) &&
+              right_v.clone_prefix_from(trunk_v, 3),
+          "sibling attention tables inherit the same trunk prefix");
+    const std::vector<f32> left_key = {0.8f, -0.3f, 0.1f, 0.5f};
+    const std::vector<f32> left_val = {1.0f, 0.5f, -0.25f, 0.75f};
+    const std::vector<f32> right_key = {-0.7f, 0.2f, 0.9f, -0.1f};
+    const std::vector<f32> right_val = {-0.5f, 1.25f, 0.3f, -0.8f};
+    const i64 branch_pos = 3;
+    auto branch_attention = [&](KvBlockTable &bk, KvBlockTable &bv,
+                                 const std::vector<f32> &last_k,
+                                 const std::vector<f32> &last_v,
+                                 std::vector<f32> *answer) {
+        CHECK(bk.writable_page(static_cast<size_t>(branch_pos)) &&
+                  bv.writable_page(static_cast<size_t>(branch_pos)),
+              "branch detaches its partial shared page before append");
+        void *kp2[2] = {const_cast<u8 *>(tree_k.data(bk.block(0))),
+                        const_cast<u8 *>(tree_k.data(bk.block(1)))};
+        void *vp2[2] = {const_cast<u8 *>(tree_v.data(bv.block(0))),
+                        const_cast<u8 *>(tree_v.data(bv.block(1)))};
+        AttnDesc append = d;
+        append.n_tok = 1;
+        append.row_pos = &branch_pos;
+        append.row_k_pages = kp2;
+        append.row_v_pages = vp2;
+        cpu->kv_append(nullptr, nullptr, last_k.data(), last_v.data(), append);
+        AttnDesc attend = append;
+        cpu->attention(answer->data(), queries.data() + 3 * dim, nullptr, nullptr,
+                       attend);
+    };
+    std::vector<f32> left_out(dim), right_out(dim);
+    branch_attention(left_k, left_v, left_key, left_val, &left_out);
+    branch_attention(right_k, right_v, right_key, right_val, &right_out);
+    auto flat_branch = [&](const std::vector<f32> &last_k,
+                           const std::vector<f32> &last_v) {
+        std::vector<f32> all_k = trunk_keys, all_v = trunk_vals;
+        all_k.insert(all_k.end(), last_k.begin(), last_k.end());
+        all_v.insert(all_v.end(), last_v.begin(), last_v.end());
+        const i64 all_positions[4] = {0, 1, 2, 3};
+        AttnDesc all = flat;
+        all.n_tok = 4;
+        all.row_pos = all_positions;
+        std::vector<f32> cache_k(4 * dim), cache_v(4 * dim);
+        cpu->kv_append(cache_k.data(), cache_v.data(), all_k.data(), all_v.data(), all);
+        AttnDesc final = flat;
+        final.n_tok = 1;
+        final.pos0 = 3;
+        final.row_pos = &branch_pos;
+        std::vector<f32> out(dim);
+        cpu->attention(out.data(), queries.data() + 3 * dim,
+                       cache_k.data(), cache_v.data(), final);
+        return out;
+    };
+    const std::vector<f32> left_ref = flat_branch(left_key, left_val);
+    const std::vector<f32> right_ref = flat_branch(right_key, right_val);
+    CHECK(left_out == left_ref && right_out == right_ref,
+          "each branch sees the trunk and its own suffix, never its sibling's");
+    CHECK(left_out != right_out,
+          "distinct sibling K/V suffixes produce distinct branch answers");
+
+    // An incomplete ancestry/table must be refused as a whole, not dereferenced
+    // or partially attended. Position 3 needs page 1.
+    void *saved = kp[static_cast<size_t>(3 * 2 + 1)];
+    kp[static_cast<size_t>(3 * 2 + 1)] = nullptr;
+    std::fill(paged_out.begin(), paged_out.end(), 1.0f);
+    cpu->attention(paged_out.data(), queries.data(), nullptr, nullptr, d);
+    CHECK(std::all_of(paged_out.begin(), paged_out.end(),
+                      [](f32 x) { return x == 0.0f; }),
+          "attention fails closed when a required physical page is absent");
+    kp[static_cast<size_t>(3 * 2 + 1)] = saved;
+    delete cpu;
+}
+
 static void test_kv_page_cow() {
     KvPagePool pool;
     CHECK(pool.init(16, 2), "bounded KV page arena initialises");
+    CHECK(pool.resident_bytes() == 0,
+          "page payload memory is lazy rather than reserved for the whole context");
     KvBlockTable parent(&pool, 2); // two logical KV rows per page
     CHECK(!parent.writable_page(std::numeric_limits<size_t>::max()) &&
               parent.block_count() == 0,
@@ -2491,8 +2708,9 @@ static void test_kv_page_cow() {
     u8 *page = parent.writable_page(0);
     CHECK(page, "first write allocates the first page");
     const KvPagePool::PageId parent_page = parent.block(0);
-    CHECK(pool.live_pages() == 1 && pool.ref_count(parent_page) == 1,
-          "an allocated page has exactly one owner");
+    CHECK(pool.live_pages() == 1 && pool.ref_count(parent_page) == 1 &&
+              pool.resident_bytes() == 16,
+          "an allocated page has one owner and only one page of payload is resident");
     if (page) {
         page[0] = 0x31;
         page[8] = 0x42;
@@ -2506,7 +2724,7 @@ static void test_kv_page_cow() {
     CHECK(page, "writing a shared partial page detaches it with copy-on-write");
     const KvPagePool::PageId child_page = child.block(0);
     CHECK(child_page != parent_page && pool.ref_count(parent_page) == 1 &&
-              pool.ref_count(child_page) == 1,
+              pool.ref_count(child_page) == 1 && pool.resident_bytes() == 32,
           "COW gives the writer a private page and balances references");
     if (page) page[8] = 0x99;
     CHECK(pool.data(parent_page)[8] == 0x42 && pool.data(child_page)[8] == 0x99,
@@ -2533,6 +2751,36 @@ static void test_kv_page_cow() {
           "a closed slot can allocate from the reclaimed page pool");
     reused.reset();
     CHECK(pool.live_pages() == 0, "slot reuse leaves no outstanding page references");
+
+    // Prefix forks share only the pages needed to read the trunk. The final
+    // shared page may contain rows after the fork point, but each branch detaches
+    // before writing there, and branch positions limit attention to its prefix.
+    KvPagePool tree_pool;
+    CHECK(tree_pool.init(16, 5), "tree-fork page arena initialises");
+    KvBlockTable trunk(&tree_pool, 2);
+    for (size_t pos : {size_t{0}, size_t{2}, size_t{4}})
+        CHECK(trunk.writable_page(pos), "trunk allocates each successive page");
+    const auto trunk_prefix_page = trunk.block(1);
+    trunk.writable_page(3)[8] = 0x72;
+    KvBlockTable left(&tree_pool, 2), right(&tree_pool, 2);
+    CHECK(left.clone_prefix_from(trunk, 3) && right.clone_prefix_from(trunk, 3),
+          "sibling branches retain only the trunk prefix block table");
+    CHECK(left.block_count() == 2 && right.block_count() == 2 &&
+              left.block(1) == trunk_prefix_page &&
+              right.block(1) == trunk_prefix_page &&
+              left.block(2) == KvPagePool::kInvalidPage,
+          "branch tables omit the trunk page beyond the fork prefix");
+    left.writable_page(3)[8] = 0xa1;
+    right.writable_page(3)[8] = 0xb2;
+    CHECK(tree_pool.data(trunk_prefix_page)[8] == 0x72 &&
+              tree_pool.data(left.block(1))[8] == 0xa1 &&
+              tree_pool.data(right.block(1))[8] == 0xb2,
+          "nested sibling writes detach independently and preserve the trunk");
+    left.reset();
+    right.reset();
+    trunk.reset();
+    CHECK(tree_pool.live_pages() == 0,
+          "trunk and sibling teardown balances every shared-page reference");
 }
 
 static void test_kv_tier_per_layer_widths() {
@@ -34139,6 +34387,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_http_listener_lifetime)
     TEST_GROUP(test_par_pool_covers_every_block)
     TEST_GROUP(test_kv_quant_int8)
+    TEST_GROUP(test_kv_page_attention)
     TEST_GROUP(test_kv_page_cow)
     TEST_GROUP(test_kv_tier_per_layer_widths)
     TEST_GROUP(test_kv_tier_no_kv_layers)

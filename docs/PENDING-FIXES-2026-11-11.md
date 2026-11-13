@@ -127,16 +127,21 @@ fallback.
 ### 5. Add paged KV storage and copy-on-write
 
 The engine's active KV storage is still contiguous per slot and the fork path
-still copies rows. A bounded page arena and sequence block-table primitive now
-exist in `include/krk/kv_pages.hpp` / `src/kv_pages.cpp`; the primitive covers
-shared references, write-time COW, truncation/reset, exhaustion, and reuse. It is
-not yet wired into Engine allocation or backend attention, so it does not yet
-reduce runtime KV allocation or fork copies. Treat this as groundwork, not the
-paged-KV feature being complete. The next work is physical page addressing in
-KV append/attention (including the supported quantized formats and backend
-capability refusal), then wiring sequence slot lifecycle and forks through the
-tables. This should reduce KV reservation/duplication; it does not reduce
-expert-weight residency directly.
+still copies rows. A bounded, lazy-payload page arena and sequence block-table primitive exist
+in `include/krk/kv_pages.hpp` / `src/kv_pages.cpp`; they cover shared references,
+write-time COW, truncation/reset, exhaustion, and reuse. `AttnDesc` now carries
+optional per-row physical K/V page tables, and the CPU reference backend honors
+them in KV append and dense/sparse attention (including packed cache row
+addressing); incomplete tables fail closed. HIP and NPU do not advertise the
+capability. Backend tests compare page-mapped append/attention with contiguous
+results across page boundaries, including int8 rows; a CPU sibling-fork fixture
+checks that two branches see the shared trunk plus only their own suffix. The
+Engine still allocates and addresses active KV contiguously, and batch forks
+still copy rows, so the runtime does not yet save memory or fork-copy bandwidth.
+The next work is wiring tables into Engine allocation, per-sequence lifecycle,
+rollback, reset/close and fork paths; the current branch-local ancestry test is
+not Engine fork coverage. This should reduce KV reservation/duplication; it does
+not reduce expert-weight residency directly.
 
 **Acceptance:** existing batch and prefill exactness tests remain green; add
 page-boundary, allocation-failure, reset/close, slot reuse, and refcount-balance
@@ -145,14 +150,17 @@ a benefit.
 
 ### 6. Add trunk/branch visibility metadata for shared-tree forks
 
-Pages alone do not say which branch may read which generated rows. Extend the
-row/attention metadata to represent trunk, branch ancestry, and position. A branch
-may see the shared prompt and its own ancestors, never a sibling's suffix.
+The CPU backend fixture now checks the core page-table invariant directly: two
+prefix-cloned sibling tables share trunk pages, detach a partial page on write,
+and causal row positions make each answer see only its own suffix. This is not
+yet Engine/session coverage. Wire ancestry/prefix limits into the sequence and
+attention row tables so an Engine fork may see the shared prompt and its own
+ancestors, never a sibling's suffix.
 
 **Acceptance:** compare nested and sibling branch logits/tokens with isolated
-standalone runs, including page boundaries and slot/page reuse. Land only after
-paged storage is correct. This is the missing shared-trunk part of Flide; the
-current copy-backed f16 forks are not that implementation.
+standalone runs through the Engine, including page boundaries and slot/page
+reuse. Land only after paged storage is correct. This is the missing shared-trunk
+part of Flide; the current copy-backed f16 forks are not that implementation.
 
 ### 7. Add the per-option scoring surface before MMDM
 

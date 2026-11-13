@@ -153,6 +153,16 @@ struct AttnDesc {
     // row for the right prefix length.
     const i64 *row_pos = nullptr;      // [n_tok] position of each query row
     const i64 *row_kv_base = nullptr;  // [n_tok] element offset into the KV plane
+    // Optional paged KV mapping, currently consumed by the CPU reference
+    // backend. Each row owns page_table_stride page pointers; page p stores
+    // positions [p*page_rows, (p+1)*page_rows). Entries point at the beginning
+    // of a physical page for this layer and plane. When absent, the historical
+    // contiguous layout above is used. K and V have independent tables because
+    // their physical pools are independent.
+    void *const *row_k_pages = nullptr; // [n_tok, page_table_stride]
+    void *const *row_v_pages = nullptr; // [n_tok, page_table_stride]
+    i64 page_rows = 0;
+    i64 page_table_stride = 0;
     i64 layer = 0;
     i64 layer_stride = 0;  // elements between layers in the KV cache
     i64 pos_stride = 0;    // elements between positions in the KV cache
@@ -1108,6 +1118,10 @@ public:
     // wrong sequence -- the failure mode batching makes possible. The CPU
     // backend implements both (see attn_pos/attn_kv_base in backend_cpu.cpp).
     virtual bool attn_multiseq_supported() const { return false; }
+    // True when attention()/kv_append() honor AttnDesc's physical page tables.
+    // A caller must not pass row_k_pages/row_v_pages to a backend that does not
+    // advertise this capability.
+    virtual bool attn_paged_kv_supported() const { return false; }
 
     // Per-row rotary positions, for a forward that carries rows from different
     // sequences (the batching case AttnDesc::row_pos exists for). Row t is

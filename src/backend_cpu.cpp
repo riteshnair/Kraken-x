@@ -402,6 +402,60 @@ inline i64 attn_kv_base(const AttnDesc &d, i64 t) {
     return d.row_kv_base ? d.row_kv_base[t] : 0;
 }
 
+inline bool attn_paged(const AttnDesc &d) {
+    return d.row_k_pages != nullptr || d.row_v_pages != nullptr;
+}
+
+inline i64 attn_elem_bytes(const AttnDesc &d) {
+    return (d.kv_int8 || d.kv_turbo || d.kv_rot4) ? 1 : sizeof(f32);
+}
+
+// Resolve one logical cache row. The page pointer is already layer- and
+// plane-specific; the contiguous arm preserves the old element/byte units.
+inline const u8 *attn_row_ptr(const AttnDesc &d, const void *cache, bool value,
+                              i64 t, i64 pos) {
+    const i64 elem_bytes = attn_elem_bytes(d);
+    if (attn_paged(d)) {
+        if (!d.row_k_pages || !d.row_v_pages || d.page_rows <= 0 ||
+            d.page_table_stride <= 0 || t < 0 || pos < 0)
+            return nullptr;
+        const i64 block = pos / d.page_rows;
+        if (block >= d.page_table_stride) return nullptr;
+        void *const *table = value ? d.row_v_pages : d.row_k_pages;
+        void *page = table[t * d.page_table_stride + block];
+        if (!page) return nullptr;
+        return static_cast<u8 *>(page) +
+               (pos % d.page_rows) * d.pos_stride * elem_bytes;
+    }
+    if (!cache) return nullptr;
+    return static_cast<const u8 *>(cache) +
+           (d.layer * d.layer_stride + attn_kv_base(d, t) +
+            pos * d.pos_stride) * elem_bytes;
+}
+
+// Validate every position the operation will touch before launching parallel
+// work. A missing block is a named refusal, never a null dereference or a
+// partial cache write.
+inline bool attn_pages_cover(const AttnDesc &d, bool append) {
+    if (!attn_paged(d)) return true;
+    if (!d.row_k_pages || !d.row_v_pages || d.page_rows <= 0 ||
+        d.page_table_stride <= 0)
+        return false;
+    for (i64 t = 0; t < d.n_tok; ++t) {
+        const i64 last = (!append && !d.causal && !d.row_pos)
+                             ? d.pos0 + d.n_tok - 1
+                             : attn_pos(d, t);
+        if (last < 0 || last / d.page_rows >= d.page_table_stride) return false;
+        void *const *kt = d.row_k_pages + t * d.page_table_stride;
+        void *const *vt = d.row_v_pages + t * d.page_table_stride;
+        const i64 last_block = last / d.page_rows;
+        for (i64 b = 0; b <= last_block; ++b)
+            if (!kt[b] || !vt[b]) return false;
+        if (append && (!kt[last_block] || !vt[last_block])) return false;
+    }
+    return true;
+}
+
 // The same two questions for the latent-attention descriptors: which position
 // is row t at, and where does its region start. Null tables are the historical
 // single-sequence answer, so every existing caller is bit-for-bit unchanged.
@@ -422,7 +476,7 @@ inline i64 mla_row_base(const MlaSharedDesc &d, i64 t) {
 // copies one head's slices out of ONE contiguous run of keys, so it has no
 // meaning here and the per-row paths below are used instead.
 inline bool attn_multiseq(const AttnDesc &d) {
-    return d.row_pos != nullptr || d.row_kv_base != nullptr;
+    return d.row_pos != nullptr || d.row_kv_base != nullptr || attn_paged(d);
 }
 
 inline AttnRange attn_range(const AttnDesc &d, i64 t) {
@@ -2017,6 +2071,10 @@ public:
                    const AttnDesc &d) override {
         KRK_KTIME("kv_append");
         npu_flush_();
+        if (attn_paged(d) && !attn_pages_cover(d, true)) {
+            KRK_ERROR("kv append: paged KV table is incomplete or out of range");
+            return;
+        }
         if (d.kv_turbo || d.kv_rot4) {
             // Packed cache in the ROTATED basis: turbo3 (one row scale) or
             // rot4 (a Q4_0 block scale per 32 values). One body for both -- the
@@ -2027,8 +2085,6 @@ public:
             const i64 hd = d.hd;
             const i64 rowb = static_cast<i64>(krk::pk_row_bytes(hd, kind));
             const i64 kv_dim = d.n_kv * hd;
-            u8 *kc = static_cast<u8 *>(kcache) + d.layer * d.layer_stride;
-            u8 *vc = static_cast<u8 *>(vcache) + d.layer * d.layer_stride;
             const f32 *ks = static_cast<const f32 *>(k);
             const f32 *vs = static_cast<const f32 *>(v);
             par_for(2 * d.n_tok * d.n_kv, 1,
@@ -2043,8 +2099,9 @@ public:
                             const i64 h = r - t * d.n_kv;
                             const f32 *src = (is_v ? vs : ks) +
                                              t * kv_dim + h * hd;
-                            u8 *row = (is_v ? vc : kc) + attn_kv_base(d, t) +
-                                      attn_pos(d, t) * d.pos_stride + h * rowb;
+                            u8 *row = const_cast<u8 *>(attn_row_ptr(
+                                          d, is_v ? vcache : kcache, is_v, t,
+                                          attn_pos(d, t))) + h * rowb;
                             krk::pk_quant_row(
                                 src, hd,
                                 krk::turbo_seed(static_cast<i32>(d.layer),
@@ -2087,8 +2144,6 @@ public:
         }
         if (d.kv_int8) {
             const i64 kv_dim = d.n_kv * d.hd;
-            u8 *kc = static_cast<u8 *>(kcache) + d.layer * d.layer_stride;
-            u8 *vc = static_cast<u8 *>(vcache) + d.layer * d.layer_stride;
             const f32 *ks = static_cast<const f32 *>(k);
             const f32 *vs = static_cast<const f32 *>(v);
             // K rows and V rows are disjoint destinations.
@@ -2102,8 +2157,9 @@ public:
                             // Per-row base and position: zero and pos0 + t for
                             // every caller that does not set the tables, so this
                             // is the old address for the old shape.
-                            u8 *row = (is_v ? vc : kc) + attn_kv_base(d, t) +
-                                      attn_pos(d, t) * d.pos_stride;
+                            u8 *row = const_cast<u8 *>(attn_row_ptr(
+                                d, is_v ? vcache : kcache, is_v, t,
+                                attn_pos(d, t)));
                             f32 *sc = reinterpret_cast<f32 *>(row + kv_dim);
                             for (i64 o = 0; o < kv_dim; o += 32) {
                                 const i64 nn = std::min<i64>(32, kv_dim - o);
@@ -2124,20 +2180,20 @@ public:
                     });
             return;
         }
-        f32 *kc = static_cast<f32 *>(kcache) + d.layer * d.layer_stride;
-        f32 *vc = static_cast<f32 *>(vcache) + d.layer * d.layer_stride;
         const f32 *ks = static_cast<const f32 *>(k);
         const f32 *vs = static_cast<const f32 *>(v);
-        // Tokens land at disjoint cache slots.
+        // Tokens land at disjoint cache slots/pages.
         par_for(d.n_tok, 4, 2.0 * static_cast<f64>(d.n_tok) * d.pos_stride,
                 [&](i64 b, i64 e) {
                     for (i64 t = b; t < e; t++) {
-                        const i64 dst = attn_kv_base(d, t) +
-                                        attn_pos(d, t) * d.pos_stride;
-                        std::memcpy(kc + dst, ks + t * d.pos_stride,
-                                    static_cast<size_t>(d.pos_stride) * 4);
-                        std::memcpy(vc + dst, vs + t * d.pos_stride,
-                                    static_cast<size_t>(d.pos_stride) * 4);
+                        u8 *kd = const_cast<u8 *>(attn_row_ptr(
+                            d, kcache, false, t, attn_pos(d, t)));
+                        u8 *vd = const_cast<u8 *>(attn_row_ptr(
+                            d, vcache, true, t, attn_pos(d, t)));
+                        std::memcpy(kd, ks + t * d.pos_stride,
+                                    static_cast<size_t>(d.pos_stride) * sizeof(f32));
+                        std::memcpy(vd, vs + t * d.pos_stride,
+                                    static_cast<size_t>(d.pos_stride) * sizeof(f32));
                     }
                 });
     }
@@ -2146,6 +2202,7 @@ public:
     // above (int8, f32 vector, f32 scalar, sparse) and kv_append() resolve the
     // row's own position and region base.
     bool attn_multiseq_supported() const override { return true; }
+    bool attn_paged_kv_supported() const override { return true; }
 
     bool gather_rows_supported() const override { return true; }
 
@@ -2214,16 +2271,9 @@ public:
                 f32 mx = -INFINITY;
                 for (const auto &rn : runs) {
                     for (i64 j = rn.first; j < rn.second; j++, k++) {
-                        const char *kb = static_cast<const char *>(kcache);
-                        // Base in ELEMENTS plus j's stride, the same address
-                        // every other attention path forms. This one used to
-                        // multiply the region base by pos_stride as well, which
-                        // was invisible while no caller set row_kv_base and
-                        // would have read past the cache as soon as one did.
-                        const i64 off = (d.layer * d.layer_stride +
-                                         attn_kv_base(d, t) +
-                                         j * d.pos_stride + kh * hd);
-                        const f32 *kv = reinterpret_cast<const f32 *>(kb + off * 4);
+                        const f32 *kv = reinterpret_cast<const f32 *>(
+                                            attn_row_ptr(d, kcache, false, t, j)) +
+                                        kh * hd;
                         f32 s = 0.0f;
                         for (i64 i = 0; i < hd; i++) s += qh[i] * kv[i];
                         s *= d.scale;
@@ -2250,16 +2300,9 @@ public:
                 for (const auto &rn : runs) {
                     for (i64 j = rn.first; j < rn.second; j++, k++) {
                         const f32 p = sc[static_cast<size_t>(k)] * inv;
-                        const char *vb = static_cast<const char *>(vcache);
-                        // Base in ELEMENTS plus j's stride, the same address
-                        // every other attention path forms. This one used to
-                        // multiply the region base by pos_stride as well, which
-                        // was invisible while no caller set row_kv_base and
-                        // would have read past the cache as soon as one did.
-                        const i64 off = (d.layer * d.layer_stride +
-                                         attn_kv_base(d, t) +
-                                         j * d.pos_stride + kh * hd);
-                        const f32 *vv = reinterpret_cast<const f32 *>(vb + off * 4);
+                        const f32 *vv = reinterpret_cast<const f32 *>(
+                                            attn_row_ptr(d, vcache, true, t, j)) +
+                                        kh * hd;
                         for (i64 i = 0; i < hd; i++) oh[i] += p * vv[i];
                     }
                 }
@@ -2280,6 +2323,12 @@ public:
         // npu_flush_ first: q is usually the output of a GEMM still queued on
         // the device, and the gather below reads it on the host.
         npu_flush_();
+        if (attn_paged(d) && !attn_pages_cover(d, false)) {
+            KRK_ERROR("attention: paged KV table is incomplete or out of range");
+            std::memset(out, 0,
+                        static_cast<size_t>(d.n_tok * d.n_head * d.hd) * sizeof(f32));
+            return;
+        }
         // Block-sparse (MSA) before anything else: the NPU hand-off and the
         // gather path both assume a contiguous key range, so an MSA call is
         // taken here rather than being handed to a kernel that would read it
@@ -2296,7 +2345,7 @@ public:
             attn_sparse_rows(out, q, kcache, vcache, d);
             return;
         }
-        if (npu_) {
+        if (npu_ && !attn_paged(d)) {
             // Everything that can make this call unrepresentable is handed over
             // rather than tested here, so the decision, the counting and the
             // run-summary wording all come from one place (npu::attention).
@@ -2348,10 +2397,6 @@ public:
             const i64 hd = d.hd;
             const i64 rowb = static_cast<i64>(krk::pk_row_bytes(hd, kind));
             const f32 *qf = static_cast<const f32 *>(q);
-            const u8 *kc =
-                static_cast<const u8 *>(kcache) + d.layer * d.layer_stride;
-            const u8 *vc =
-                static_cast<const u8 *>(vcache) + d.layer * d.layer_stride;
             f32 *of = static_cast<f32 *>(out);
             const i64 units = d.n_tok * d.n_head;
             par_for(units, 1,
@@ -2365,7 +2410,6 @@ public:
                             const i64 t = u / d.n_head;
                             const i64 h = u - t * d.n_head;
                             const i64 pos = attn_pos(d, t);
-                            const i64 kvb = attn_kv_base(d, t);
                             const i64 n_keys = pos + 1;
                             const i64 j_lo = d.window > 0
                                                  ? std::max<i64>(0, n_keys - d.window)
@@ -2391,8 +2435,8 @@ public:
                                     scores[static_cast<size_t>(j)] = -FLT_MAX;
                                     continue;
                                 }
-                                const u8 *row = kc + kvb +
-                                                (j_lo + j) * d.pos_stride +
+                                const u8 *row = attn_row_ptr(
+                                                    d, kcache, false, t, j_lo + j) +
                                                 hkv * rowb;
                                 f32 sv = krk::pk_dot(qr.data(), row, hd, kind) * d.scale;
                                 if (d.softcap > 0.0f)
@@ -2419,8 +2463,8 @@ public:
                             for (i64 j = 0; j < n_vis; j++) {
                                 const f32 p = scores[static_cast<size_t>(j)] * inv;
                                 if (p == 0.0f) continue;
-                                const u8 *row = vc + kvb +
-                                                (j_lo + j) * d.pos_stride +
+                                const u8 *row = attn_row_ptr(
+                                                    d, vcache, true, t, j_lo + j) +
                                                 hkv * rowb;
                                 krk::pk_decode_row(row, hd, kind, vrow.data());
                                 for (i64 i = 0; i < hd; i++)
@@ -2440,8 +2484,6 @@ public:
             // the 8-bit quantisation of the cached activation itself.
             const i64 kv_dim = d.n_kv * d.hd;
             const f32 *qf = static_cast<const f32 *>(q);
-            const u8 *kc = static_cast<const u8 *>(kcache) + d.layer * d.layer_stride;
-            const u8 *vc = static_cast<const u8 *>(vcache) + d.layer * d.layer_stride;
             f32 *of = static_cast<f32 *>(out);
             const i64 units = d.n_tok * d.n_head;
             par_for(units, 1,
@@ -2452,7 +2494,6 @@ public:
                             const i64 t = u / d.n_head;
                             const i64 h = u - t * d.n_head;
                             const i64 pos = attn_pos(d, t);
-                            const i64 kvb = attn_kv_base(d, t);
                             const i64 n_keys = pos + 1;
                             const i64 j_lo = d.window > 0
                                                  ? std::max<i64>(0, n_keys - d.window)
@@ -2482,7 +2523,8 @@ public:
                                     scores[static_cast<size_t>(j)] = -FLT_MAX;
                                     continue;
                                 }
-                                const u8 *row = kc + kvb + (j_lo + j) * d.pos_stride;
+                                const u8 *row = attn_row_ptr(d, kcache, false, t,
+                                                                    j_lo + j);
                                 const f32 *sc =
                                     reinterpret_cast<const f32 *>(row + kv_dim);
                                 f32 dot = 0.0f;
@@ -2529,7 +2571,8 @@ public:
                             for (i64 i = 0; i < d.hd; i++) oh[i] = 0.0f;
                             for (i64 j = 0; j < n_vis; j++) {
                                 const f32 p = scores[static_cast<size_t>(j)] * inv;
-                                const u8 *row = vc + kvb + (j_lo + j) * d.pos_stride;
+                                const u8 *row = attn_row_ptr(d, vcache, true, t,
+                                                                    j_lo + j);
                                 const f32 *sc =
                                     reinterpret_cast<const f32 *>(row + kv_dim);
                                 for (i64 i = 0; i < d.hd; i++) {
@@ -2601,7 +2644,8 @@ public:
         // Multi-sequence batches therefore take the per-row paths below; the
         // copy is an amortisation, not a requirement, and it is the next thing
         // to generalise once the batched path is measured.
-        if (attn_vec && n_gather > 0 && d.n_tok > 1 && !attn_multiseq(d)) {
+        if (attn_vec && !attn_paged(d) && n_gather > 0 && d.n_tok > 1 &&
+            !attn_multiseq(d)) {
             par_for(d.n_head, 1,
                     4.0 * static_cast<f64>(units) * (d.pos0 + d.n_tok) * d.hd,
                     [&](i64 hb, i64 he) {
@@ -2643,7 +2687,7 @@ public:
                     });
             return;
         }
-        if (attn_vec) {
+        if (attn_vec && !attn_paged(d)) {
             par_for(units, 1,
                     4.0 * static_cast<f64>(units) * (d.pos0 + d.n_tok) * d.hd,
                     [&](i64 b, i64 e) {
@@ -2678,7 +2722,6 @@ public:
                         const i64 t = u / d.n_head;
                         const i64 h = u - t * d.n_head;
                         const i64 pos = attn_pos(d, t);
-                        const i64 kvb = attn_kv_base(d, t);
                         const i64 n_keys = pos + 1;
                         // Sliding window (laguna's hybrid layers): the query
                         // sees only the `window` most recent keys, so the ones
@@ -2713,8 +2756,10 @@ public:
                                 scores[static_cast<size_t>(j)] = -FLT_MAX;
                                 continue;
                             }
-                            const f32 *kj =
-                                kc + kvb + (j_lo + j) * d.pos_stride + hkv * d.hd;
+                            const f32 *kj = reinterpret_cast<const f32 *>(
+                                                attn_row_ptr(d, kcache, false, t,
+                                                             j_lo + j)) +
+                                            hkv * d.hd;
                             f32 dot = 0;
                             for (i64 i = 0; i < d.hd; i++) dot += qh[i] * kj[i];
                             f32 sv = dot * d.scale;
@@ -2747,8 +2792,10 @@ public:
                         for (i64 i = 0; i < d.hd; i++) oh[i] = 0;
                         for (i64 j = 0; j < n_vis; j++) {
                             const f32 p = scores[static_cast<size_t>(j)] * inv;
-                            const f32 *vj =
-                                vc + kvb + (j_lo + j) * d.pos_stride + hkv * d.hd;
+                            const f32 *vj = reinterpret_cast<const f32 *>(
+                                                attn_row_ptr(d, vcache, true, t,
+                                                             j_lo + j)) +
+                                            hkv * d.hd;
                             for (i64 i = 0; i < d.hd; i++) oh[i] += p * vj[i];
                         }
                     }
