@@ -466,6 +466,37 @@ public:
     // warmup and prefetch, which is neither, so the three never double-count.
     enum Phase { PhaseOther = 0, PhasePrefill = 1, PhaseDecode = 2 };
     void set_phase(Phase p) { phase_ = p; }
+
+    // Does traffic in the current phase get a vote in the replacement policy?
+    //
+    // PREFILL does not, by default. A chunk of a few hundred rows touches every
+    // expert of the layer it runs, once each, and it does that for every layer:
+    // 2000 tokens at top-8 and 60 layers is ~1M acquires, every one of them a
+    // fresh count on a slot that decode will never select again. Those votes do
+    // not describe the traffic the cache is protecting. They also AGE it: the
+    // decay window is counted in acquires, so the same prefill cycles every
+    // counter hundreds of times and unpins the warmup set before the first
+    // token is generated -- and the seeded warmup already measured what a
+    // ranking from other traffic costs (1011 -> 1391 promotions, 24.4 -> 21.3
+    // tok/s on laguna-xs2).
+    //
+    // So prefill acquires still do everything that is not a vote: they load,
+    // promote, evict and are served. They just do not raise a counter and do
+    // not run the decay clock. The set decode inherits is then the set the
+    // prefill actually left resident plus the counts the warmup earn, which is
+    // the ranking that was measured to be worth having.
+    //
+    // KRK_EXPERT_PREFILL_VOTE=1 restores the old behaviour (every acquire votes)
+    // for an A/B, because this is a policy change and the only thing that can
+    // settle it is a tok/s on a real file.
+    bool policy_votes() const {
+        static const bool prefill_votes = [] {
+            const char *e = std::getenv("KRK_EXPERT_PREFILL_VOTE");
+            return e && e[0] == '1';
+        }();
+        return prefill_votes || phase_ != PhasePrefill;
+    }
+
     f64 prefill_promote_ms() const { return pf_promote_ms_; }
     f64 prefill_read_ms() const { return pf_read_ms_; }
     f64 prefill_room_ms() const { return pf_room_ms_; }
@@ -767,7 +798,11 @@ private:
     };
 
     // One acquire on a resident slot: counters earn pins, pins are never free.
+    // A phase that does not vote (see policy_votes) leaves the counter alone.
     void touch(Slot &s);
+    // Counts one voting acquire and runs the decay window when it fills. All
+    // acquire paths go through it, so the phase gate cannot be half-applied.
+    void note_acquire();
     // Frees the device copy. Leaves the footprint, counter and load order in
     // place — a slot that is only in the host tier still knows what it is.
     void drop(Slot &s);
@@ -988,6 +1023,29 @@ private:
     // tok/s that moved.
     i32 table_host_cells_ = 0;
 };
+
+// Which experts of the device tier's OVERFLOW the host arm computes, when the
+// hybrid CPU+GPU split is on. `permille` is `--hybrid-frac` in thousandths:
+// 0 leaves every overflow expert to the cache (all promoted, the pre-hybrid
+// behaviour) and 1000 gives all of it to the host (the default).
+//
+// The decision has to be a function of (layer, expert) and not of a counter or
+// of arrival order: the same experts then move together layer after layer, so
+// two arms of a sweep differ in placement rather than in which weight went
+// where. It is also what makes the choice replayable -- see
+// `expert_replay.hpp`, which must reach the same answer as the engine or the
+// tuner would be predicting a different run.
+//
+// Only experts that are NOT resident are candidates. A resident expert stays on
+// the device whatever the share says: its bytes are already there, and moving
+// the arithmetic off the card while keeping the copy spends VRAM to go slower.
+inline bool expert_split_share(i32 layer, i32 expert, int permille) {
+    if (permille <= 0) return false;
+    if (permille >= 1000) return true;
+    const u32 hsh = static_cast<u32>(layer) * 2654435761u +
+                    static_cast<u32>(expert) * 40503u;
+    return static_cast<int>(hsh % 1000u) < permille;
+}
 
 } // namespace krk
 

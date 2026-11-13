@@ -149,7 +149,27 @@ Prefetch and prediction, all opt-in and all measured before being believed:
   **9% slower** on REAP-320, which is why nothing here is on by default.
 - `--hybrid-experts` / `--hybrid-frac` move the overflow of the device tier to
   host compute at a fixed cache size, which is how the two arms are swept
-  against each other. With no device present there is nothing to overflow.
+  against each other. The share is a share of the OVERFLOW, per (layer, expert):
+  `1.0` (the default) gives all of it to the host, `0` promotes all of it, and a
+  value in between splits it. Resident experts are never moved: their bytes are
+  already on the card. With no device present there is nothing to overflow.
+
+Replacement policy, and what is allowed to vote in it:
+
+- Prefill traffic does not vote. A prefill chunk touches every expert of every
+  layer once, and 2000 tokens at top-8 over 60 layers is ~1M acquires whose
+  counters describe a routing decode never repeats; since the decay window is
+  counted in acquires, those votes also aged the warmup set away before the
+  first token. `ExpertCache::policy_votes()` freezes counters and decay for the
+  prefill phase while still loading, promoting and evicting. `KRK_EXPERT_PREFILL_VOTE=1`
+  restores the old behaviour for an A/B.
+- The policy changes above are unit-tested, not hardware-validated: the tok/s
+  arm is on the pending list in `TO-DO.md`, and no native measurement of it has
+  been recorded here.
+
+Both the cache size and the host share can be chosen offline before any of this
+is run: `scripts/moe_cache_tune.py` replays a recorded `KRK_TRACE_EXPERTS` trace
+through the real cache and predicts a per-token time (see the user guide).
 
 ## 4. Model families
 

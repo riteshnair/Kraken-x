@@ -69,6 +69,7 @@ static inline int krk_test_unsetenv(const char *name) { return _putenv_s(name, "
 #include "krk/backend.hpp"
 #include "krk/engine.hpp"
 #include "krk/expert_cpu.hpp"
+#include "krk/expert_replay.hpp"
 #include "krk/host_time.hpp"
 #include "krk/kernel_time.hpp"
 #include "krk/gguf.hpp"
@@ -12134,6 +12135,248 @@ static void test_expert_cache_policy() {
 
     cache.clear();
     std::remove(path.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// Replaying a recorded trace through the real cache
+// ---------------------------------------------------------------------------
+//
+// Answering "what cache size, pin budget and host share should this machine
+// run" costs a model load per arm today, and each arm is a tok/s two percent
+// away from the last. The routing that decides those numbers is already
+// recorded (`KRK_TRACE_EXPERTS=1`), so `scripts/moe_cache_tune.py` replays it
+// offline through ExpertCache itself (include/krk/expert_replay.hpp) instead of
+// through a second, drifting model of the policy.
+//
+// That is only worth anything if the replay takes the same decisions the engine
+// takes, which is what this group pins: the byte budget and eviction policy are
+// the cache's own by construction, but the LEASES (a layer's experts stay held
+// until the layer ends) and the HOST SHARE of the overflow (only a full tier
+// overflows, and only `--hybrid-frac` chooses which overflow experts leave the
+// device) are decided around it. The comparison below is an explicit
+// engine-shaped loop against the replay on identical events; a change to either
+// side that changes residency fails here rather than in a benchmark nobody can
+// attribute.
+static void test_expert_replay() {
+    const std::string path = "kraken-replay.gguf";
+    CHECK(build_expert_source_model_mixed(path),
+          "wrote the replay GGUF");
+    Gguf g;
+    std::string err;
+    CHECK(g.load(path, &err), "loaded the replay GGUF");
+    if (!err.empty()) std::fprintf(stderr, "  (replay gguf: %s)\n", err.c_str());
+    const ExpertSource s0 = expert_source_of(g, 0);
+    const ExpertSource s1 = expert_source_of(g, 1);
+    const ExpertSource *srcs[2] = {&s0, &s1};
+    CHECK(s0.present() && s1.present(), "both replay expert sources are complete");
+    // 256 bytes of corpus: 4 x 24 in layer 0, 4 x 40 in layer 1. A budget of 64
+    // therefore holds two of layer 0's experts or one of layer 1's, so the
+    // tier is genuinely full for the share arms below.
+    CHECK(s1.per_expert(s1.up) > s0.per_expert(s0.up),
+          "the replay fixture has two layers with different expert footprints");
+
+    std::vector<ReplayEvent> events;
+    const int kSteps = 64;
+    for (int step = 0; step < kSteps; step++) {
+        for (int layer = 0; layer < 2; layer++)
+            for (int e = 0; e < 4; e++)
+                events.push_back(ReplayEvent{layer, e});
+    }
+    CHECK(replay_steps(events.data(), events.size()) == static_cast<u64>(kSteps),
+          "a forward pass is one decrease of the layer index");
+    CHECK(replay_steps(nullptr, 0) == 0, "an empty trace has no steps");
+
+    // The engine's shape, spelled out: leases per layer, the host arm on the
+    // OVERFLOW only, and the same share hash the engine calls.
+    struct Ref {
+        u64 hits = 0, promotions = 0, loads = 0, host = 0, evictions = 0;
+    };
+    auto reference = [&](size_t budget, size_t warm, int share) {
+        Backend *cpu = make_cpu_backend();
+        ExpertCache cache;
+        cache.configure(cpu, budget, warm, 0);
+        std::vector<std::pair<i32, i32>> leased;
+        i32 cur = -1;
+        Ref r;
+        for (const ReplayEvent &ev : events) {
+            if (ev.layer != cur) {
+                for (const auto &le : leased) cache.set_lease(le.first, le.second, false);
+                leased.clear();
+                cur = ev.layer;
+            }
+            const ExpertSource &src = *srcs[ev.layer];
+            if (!cache.in_vram(ev.layer, ev.expert) && cache.full_for(src) &&
+                expert_split_share(ev.layer, ev.expert, share)) {
+                r.host++;
+                continue;
+            }
+            const ResidentExpert *re = cache.acquire(src, ev.layer, ev.expert);
+            if (!re) continue;
+            cache.set_lease(ev.layer, ev.expert, true);
+            leased.emplace_back(ev.layer, ev.expert);
+        }
+        r.hits = cache.hits();
+        r.promotions = cache.host_hits();
+        r.loads = cache.loads();
+        r.evictions = cache.evictions();
+        cache.clear();
+        delete cpu;
+        return r;
+    };
+
+    auto replay = [&](size_t budget, size_t warm, int share) {
+        Backend *cpu = make_cpu_backend();
+        ReplayConfig cfg;
+        cfg.budget_bytes = budget;
+        cfg.warm_bytes = warm;
+        cfg.share_permille = share;
+        const ReplayResult r =
+            replay_expert_trace(cpu, srcs, 2, events.data(), events.size(), cfg);
+        delete cpu;
+        return r;
+    };
+
+    // The byte budget is the cache's own in both arms, so equality here is the
+    // claim the tuner makes: replaying the trace predicts what the run did.
+    const size_t kTight = 64;
+    for (int share : {0, 500, 1000}) {
+        const Ref ref = reference(kTight, /*warm=*/0, share);
+        const ReplayResult rep = replay(kTight, /*warm=*/0, share);
+        CHECK(rep.hits == ref.hits, "replay and the engine-shaped loop agree on hits");
+        CHECK(rep.promotions == ref.promotions,
+              "replay and the engine-shaped loop agree on promotions");
+        CHECK(rep.loads == ref.loads, "replay and the engine-shaped loop agree on loads");
+        CHECK(rep.host_takes == ref.host,
+              "replay and the engine-shaped loop agree on the host arm's share");
+        CHECK(rep.evictions == ref.evictions,
+              "replay and the engine-shaped loop agree on evictions");
+        CHECK(rep.hits + rep.promotions + rep.loads + rep.host_takes ==
+                  static_cast<u64>(events.size()),
+              "every replayed event is served, promoted, read or handed to the host");
+    }
+
+    // The share is a share of the overflow, and 0/1000 are its ends: at a full
+    // tier 0 promotes everything and 1000 promotes nothing.
+    const ReplayResult none = replay(kTight, 0, 0);
+    const ReplayResult half = replay(kTight, 0, 500);
+    const ReplayResult all = replay(kTight, 0, 1000);
+    CHECK(none.host_takes == 0, "a zero share leaves every overflow expert to the cache");
+    CHECK(all.host_takes > 0, "a full share computes the overflow on the host");
+    CHECK(all.host_takes > half.host_takes && half.host_takes > none.host_takes,
+          "the share orders the host arm between its two ends");
+    // A host-computed expert is never loaded, so the share is visible in the
+    // file traffic and not in the promotion count: with WARM off there is no
+    // promotion to save, and the tier arm below covers that case.
+    CHECK(half.loads < none.loads,
+          "the host's half of the overflow is file traffic the device never pays");
+    CHECK(all.loads < half.loads, "a full share reads less than half of it");
+
+    // A budget that holds the whole corpus has no overflow, so a hybrid run
+    // with any share behaves exactly like one with the arm switched off.
+    const size_t kWhole = 4 * 24 + 4 * 40;
+    const ReplayResult whole_all = replay(kWhole, 0, 1000);
+    CHECK(whole_all.host_takes == 0,
+          "a budget that holds the routed set never sends an expert to the host");
+    CHECK(whole_all.evictions == 0, "a budget that holds the corpus evicts nothing");
+
+    // WARM turns a re-read of the file into a promotion. Two things have to be
+    // true for the tier to have anything to do, and the first version of this
+    // arm got both wrong:
+    //   * a SMALL hot set never evicts at all -- once each slot reaches
+    //     kPinThreshold the pins hold it resident past the byte budget, which is
+    //     the documented guarantee, so the cyclic trace is what evicts;
+    //   * the tier has to be wider than the corpus: admissions are laid out as
+    //     ONE aligned block per expert, so a tier sized to the experts' raw
+    //     bytes is short by the padding and evicts the copy it just made.
+    //     Measured on the replay tool with 8 experts: exactly 8 slots promoted
+    //     nothing out of 512 reads, 12 slots promoted 504.
+    auto replay_warm = [&](size_t warm_bytes) {
+        Backend *cpu = make_cpu_backend();
+        ReplayConfig cfg;
+        cfg.budget_bytes = kTight;
+        cfg.warm_bytes = warm_bytes;
+        cfg.share_permille = 0;
+        const ReplayResult r = replay_expert_trace(cpu, srcs, 2, events.data(),
+                                                   events.size(), cfg);
+        delete cpu;
+        return r;
+    };
+    const ReplayResult no_warm = replay_warm(0);
+    const ReplayResult warm = replay_warm(1024);
+    CHECK(no_warm.promotions == 0, "without a WARM tier there is nothing to promote");
+    CHECK(warm.promotions > 0,
+          "a WARM tier serves the re-reads an eviction would have made cold");
+    CHECK(warm.bytes_read < no_warm.bytes_read,
+          "a WARM tier reads fewer bytes out of the mapping");
+    CHECK(warm.hits + warm.promotions + warm.loads + warm.host_takes ==
+              static_cast<u64>(events.size()),
+          "every event of the WARM trace is still served exactly once");
+}
+
+// ---------------------------------------------------------------------------
+// Prefill traffic does not vote in the replacement policy
+// ---------------------------------------------------------------------------
+//
+// A prefill chunk touches every expert of every layer it runs, once each, and
+// does it for the whole prompt: 2000 tokens at top-8 over 60 layers is ~1M
+// acquires whose counters describe a routing decode will never repeat. Worse,
+// the decay window is counted in acquires, so the same prefill ages every
+// counter hundreds of times and unpins the warmup set before the first token is
+// generated -- and the seeded-warmup experiment already measured what ranking
+// from other traffic costs (1011 -> 1391 promotions, 24.4 -> 21.3 tok/s).
+//
+// So ExpertCache::policy_votes() freezes the counters and the decay clock for
+// PhasePrefill. Prefill acquires still load, promote, evict and are served; they
+// just do not vote. This group pins both halves: a prefill that cannot pin, and
+// a decode that still can.
+static void test_expert_prefill_phase() {
+    const std::string path = "kraken-prefill-vote.gguf";
+    CHECK(build_expert_source_model(path), "wrote the prefill-phase GGUF");
+    Gguf g;
+    std::string err;
+    CHECK(g.load(path, &err), "loaded the prefill-phase GGUF");
+    if (!err.empty()) std::fprintf(stderr, "  (prefill gguf: %s)\n", err.c_str());
+    const ExpertSource src = expert_source(g);
+    CHECK(src.present(), "the prefill-phase expert source is complete");
+
+    Backend *cpu = make_cpu_backend();
+    ExpertCache cache;
+    cache.configure(cpu, 96); // the whole four-expert corpus
+    // Three windows of acquires, far more than a decay period, without one
+    // counter moving: the traffic is real (every acquire is served) and none of
+    // it votes.
+    cache.set_phase(ExpertCache::PhasePrefill);
+    for (int i = 0; i < 3 * static_cast<int>(ExpertCache::kPinDecay) + 8; i++) {
+        const ResidentExpert *re = cache.acquire(src, 0, 0);
+        CHECK(re != nullptr, "a prefill acquire is still served");
+        if (!re) break;
+    }
+    CHECK(cache.hits() > 0, "the prefill acquires were served from the resident slot");
+    CHECK(cache.touch_count(0, 0) < ExpertCache::kPinThreshold,
+          "prefill traffic does not earn a pin");
+    CHECK(cache.pinned_slots() == 0, "no slot is pinned by prefill traffic");
+
+    // The same slot, now in decode: the counter moves and the pin is earned.
+    cache.set_phase(ExpertCache::PhaseDecode);
+    for (int i = 0; i < static_cast<int>(ExpertCache::kPinThreshold) + 2; i++)
+        cache.acquire(src, 0, 0);
+    CHECK(cache.touch_count(0, 0) >= ExpertCache::kPinThreshold,
+          "decode traffic still earns the pin prefill was denied");
+    CHECK(cache.pinned_slots() >= 1, "the decode-phase pin is real");
+
+    // PhaseOther is load-time warmup and must vote: the seeded ranking it
+    // produces is the reason this gate is scoped to prefill and not to "any
+    // phase that is not decode".
+    ExpertCache warm;
+    warm.configure(cpu, 96);
+    warm.set_phase(ExpertCache::PhaseOther);
+    for (int i = 0; i < static_cast<int>(ExpertCache::kPinThreshold) + 2; i++)
+        warm.acquire(src, 0, 1);
+    CHECK(warm.pinned_slots() >= 1, "load-time warmup still earns its pins");
+
+    cache.clear();
+    warm.clear();
+    delete cpu;
 }
 
 // ---------------------------------------------------------------------------
@@ -32166,6 +32409,8 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_expert_cache_policy)
     TEST_GROUP(test_expert_cache_byte_budget)
     TEST_GROUP(test_expert_cache_warm_tier)
+    TEST_GROUP(test_expert_replay)
+    TEST_GROUP(test_expert_prefill_phase)
     TEST_GROUP(test_expert_dispatch_table)
     TEST_GROUP(test_expert_dispatch_host_backed)
     TEST_GROUP(test_draft_head)
