@@ -27,12 +27,12 @@ Verdicts:
 | 3 | PagedAttention (Kwon et al., 2023) | **Build now** | KV storage, per-slot regions | KV pages with refcounts and copy-on-write |
 | 2 | Flide (Li et al., 2026) | **Build now** | row tables, attention mask, recurrent state | Exact branch forking |
 | 1 | Edge0 (Lin et al., 2026) | **Build now**, partly | MoE disk tier, per-step stack assembly | Incremental expert stack; unmerged LoRA |
-| 1 | Edge0, prediction-as-routing | **Refuse** | routing | rejected line |
+| 1 | Edge0, prediction-as-routing | **Investigate**, opt-in only | routing, quality-dependent | named predictor + quality evaluation |
 | 4 | LowRAM (Delgado et al., 2026) | **Build later** | KV compression above quantisation | Value amortisation (experimental) |
 | 7 | MMDM (Shen et al., 2026) | **Build later** | no scoring surface yet | decision benchmark, parked |
 | 5 | e-means (Bessa et al., 2026) | **Reference only** | offline codebook tuning only | none (reference) |
 | 6 | SparseRead (Liu et al., 2026) | **Reference only** | agent-side, not engine-side | none (reference) |
-| 8 | Tree-Ising (Salloum & Ali, 2026) | **Refuse** | weights are read-only here | rejected line |
+| 8 | Tree-Ising (Salloum & Ali, 2026) | **Investigate an external sidecar** | keep the source GGUF read-only | compatible repair artifact + quality evidence |
 
 The order that follows is the ranking, not the order the papers were sent in: the
 number in the first column is the position in the original list.
@@ -124,15 +124,17 @@ analogue of.
    depends only on stream length, so a small family of captured graphs serves any
    mix of requests.
 
-**Kraken today.** The row-table mechanism is already the right place: one forward
-can carry rows of different sequences (`AttnDesc` rows in
-`include/krk/backend.hpp:138`-`142`), which is how the batch path serves several
-sequences per pass. What a row carries is `(slot, position)` — a slot is a
-sequence, so siblings cannot exist. Two consequences are visible in the register
-and in the code: "more than one resident prefix" is impossible (the item now says
-so), and the batch path refuses recurrent models outright ("a recurrent model
-keeps one sequence's delta-rule state", `Engine::batch_refusal`), while the
-serial path supports them (`ModelConfig::is_recurrent`, `recurrent_reset`).
+**Kraken today.** The row-table mechanism carries `(slot, position)` for
+attention rows. `Engine::batch_fork` now has correctness-first fallbacks where
+trunk state cannot yet be shared: compressed-attention and recurrent branches
+clear their destination slot and replay the complete branch prompt. Recurrent
+convolution/scan state is allocated per slot, and recurrent decode forwards are
+serialized one sequence at a time; `test_batch_fork` compares two sibling branch
+runs with isolated complete-prompt oracles. Ordinary f16 attention still reuses
+its trunk KV rows through copying. Lossy KV remains gated because a nonzero-slot
+full-prompt replay has not matched the single-slot oracle. These paths establish
+fixture parity only; compressed/recurrent trunk reuse, quantized parity, CoW
+pages, and a shared sibling-node visibility mask remain unimplemented.
 
 **What we would build.** Generalise the row metadata from `(slot, position)` to
 `(trunk, branch, position)` and derive the attention mask from it, then add the
@@ -227,13 +229,20 @@ because the delta (RMS ~1e-3) sits below the 4-bit group step.
    existing contract (wrong guess ⇒ wasted read), and the evidence is candidate
    precision plus bit-identical output. It is a FILE item for that reason.
 
-**What we would refuse.** *Prediction as routing.* It replaces the model's router,
-so the model computes a different function of its weights and the checkpoint's
-routing is no longer what runs. Kraken's rules forbid silently changing what the
-model computes, and the batch path's whole value is that a sequence in a batch is
-bit-identical to itself alone. The paper pays for this choice in training
-(a recovery adapter trained on the student path); we have no training stack, so
-we could only take the approximation without the payment.
+**Prediction as routing: investigate, never silently substitute.** Directly using
+predicted experts changes the function computed and can change output quality;
+it is not interchangeable with the existing exact staging predictor. A possible
+implementation is an explicitly enabled routing policy that consumes a separate,
+user-supplied predictor artifact while leaving the base GGUF unchanged. It must
+never become the default merely because staging precision is high. Prerequisites
+are a named model, a predictor trained for that model/router path, a documented
+artifact format, and held-out evaluations of route agreement, expert I/O, latency,
+perplexity and task quality. Test the mode against itself in isolated and batched
+execution, and preserve an exact baseline/fallback for requests not opting in.
+The paper's recovery adapter is part of its quality story; without a compatible
+trained artifact, we must not imply the paper's quality results transfer. Until
+those prerequisites exist, the current staging-only signal remains the exact
+baseline and prediction-as-routing remains an unimplemented investigation.
 
 ---
 
@@ -353,7 +362,7 @@ argmax.
 
 ---
 
-## 8. Tree-Ising: weight repair by discrete optimisation (refuse)
+## 8. Tree-Ising: weight repair by discrete optimisation (sidecar investigation)
 
 *Tree-Ising: Repairing Language Models with Bit-Level Ising Edits.* Salloum, Ali.
 arXiv:2611.14210v1.
@@ -366,21 +375,28 @@ Qwen3.5-0.8B: 54.6% MATH-500 against 51.7% for a frontier agent's edit and 7.9%
 for the base model, with 13–17% fewer weights changed, 2.2–2.3× fewer bit flips,
 four forward passes, and about $0.90 of GPU time per repair.
 
-**Kraken today.** Inference only. No optimiser, no gradients, no calibration or
-evaluation pipeline, and weight handling is read-only by rule ("Do not silently
-convert models or GGUF weights during optimization").
+**Kraken today.** Inference only. No optimiser, gradients, calibration or
+quality-evaluation pipeline exists. Preserve read-only source weights and do not
+silently convert or rewrite GGUFs during optimization.
 
-**Verdict: refuse for this repository.** It is a post-training repair method; the
-deliverable is a modified checkpoint, and producing one is outside what an
-inference engine should do, while *applying* one silently would violate the rules
-above.
+**Investigate a sidecar path, not in-place repair.** A separate offline tool could
+write a distinctly named repair artifact while keeping the original GGUF
+byte-identical; the inference engine could optionally load that artifact as a
+runtime overlay. This leaves the source file read-only, but the effective model
+still changes, so such a mode requires explicit opt-in, a compatible named
+checkpoint, clear provenance, and quality validation. A lower-risk router-only
+correction could be evaluated as an opt-in policy without changing stored
+weights, but it also changes model behavior and must be evaluated as such. Neither
+approach is implemented or approved as a default.
 
-One observation is worth keeping, and it is structural rather than algorithmic:
-our group-quantised layouts are themselves shared-exponent state trees (a group
-shares an exponent, a scale, and a set of mantissas), so "edits must preserve the
-group maximum" is exactly the constraint a bit-level edit to one of our files would
-have to satisfy. If weight repair ever enters scope, that is the invariant to
-start from. Today it does not.
+The implementation prerequisite is to determine whether the paper's edit
+variables map to Kraken's actual quantized layouts and whether their group-scale
+constraints survive as an external overlay. Preserve a base-file hash, report the
+changed values/routes, compare exact unmodified output with the ordinary path, and
+measure held-out perplexity/task quality before claiming a repair. The existing
+structural observation remains useful: group-quantized layouts share scales and
+codebooks, so constraints must be derived per supported dtype rather than assumed
+to match the paper's BF16 state tree.
 
 ---
 
@@ -392,12 +408,13 @@ about where *weights* live. Those three are engine work and the first two are th
 same job, split into a storage half and an execution half. The order is pages,
 then forks, then the scoring surface that gives forks a consumer.
 
-The other five are not engine work: a clustering algorithm for offline codebooks
-(e-means), an agent-side reading policy (SparseRead), a benchmark gated on a
-surface we do not have (MMDM), a weight-repair method outside our scope
-(Tree-Ising), and the one part of Edge0 that would change what the model computes
-(prediction-as-routing). Recording them here is the point; the register's rejected
-section carries the reasons so that none of them is re-proposed as new.
+The remaining items have different prerequisites: e-means is offline codebook
+research, SparseRead is agent-side, and MMDM is gated on a scoring surface we do
+not yet have. Tree-Ising and prediction-as-routing are open, opt-in investigations
+rather than accepted defaults: the former needs a source-preserving repair-sidecar
+path compatible with supported quantization, and the latter needs a trained
+predictor plus quality evidence. Both must preserve the exact unmodified baseline;
+neither has a usable artifact or measured result yet.
 
 Two things none of these papers settles for us, and which stay as they are in the
 register: no number here was reproduced on our hardware, and the native-HIP side

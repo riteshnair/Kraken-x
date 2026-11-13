@@ -1911,14 +1911,16 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
         // n_embd x 4 bytes per layer, which is 1.2 MiB on the 24B file.
         sc_hist_ = static_cast<i64>(sc_kern - 1) + 16;
         sc_state_span_ = sc_hist_ * static_cast<i64>(n_embd_);
-        sc_state_ = alloc(static_cast<size_t>(mc.n_layer) *
+        sc_state_ = alloc(static_cast<size_t>(n_slots_) *
+                          static_cast<size_t>(mc.n_layer) *
                           static_cast<size_t>(sc_state_span_) * as);
         if (!check_alloc(sc_state_, "sc_state")) return false;
         // Zeroed: the first chunk of a session reads no negative taps (the
         // kernel skips p < 0), so this is belt and braces -- but a ring that
         // starts at whatever the allocator left is the kind of thing that only
         // shows up as a first-token difference.
-        be_->fill0(sc_state_, static_cast<size_t>(mc.n_layer) *
+        be_->fill0(sc_state_, static_cast<size_t>(n_slots_) *
+                               static_cast<size_t>(mc.n_layer) *
                                static_cast<size_t>(sc_state_span_) * as);
         KRK_INFO("lfm2 short conv: %d layer(s), kernel %d, %lld-row history "
                  "ring per layer",
@@ -1956,10 +1958,12 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
                                                       mc.ssm_dt_rank)) * as);
             if (!check_alloc(ws_m2in_, "ws_m2in")) return false;
         }
-        conv_state_ = alloc(static_cast<size_t>(rec_layers_) *
+        conv_state_ = alloc(static_cast<size_t>(n_slots_) *
+                            static_cast<size_t>(rec_layers_) *
                             static_cast<size_t>(conv_state_span_) * sizeof(f32));
         if (!check_alloc(conv_state_, "conv_state")) return false;
-        rec_state_ = alloc(static_cast<size_t>(rec_layers_) *
+        rec_state_ = alloc(static_cast<size_t>(n_slots_) *
+                           static_cast<size_t>(rec_layers_) *
                            static_cast<size_t>(mamba2_state_span_ > 0
                                ? mamba2_state_span_ : rec_state_span_) *
                            sizeof(f32));
@@ -2712,8 +2716,10 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     }
     if (model_.is_recurrent()) {
         recurrent_reset();
-        const f64 rec_mb = static_cast<f64>(rec_layers_) *
-                           static_cast<f64>(conv_state_span_ + rec_state_span_) * 4.0 /
+        const i64 rs = mamba2_state_span_ > 0 ? mamba2_state_span_ : rec_state_span_;
+        const f64 rec_mb = static_cast<f64>(n_slots_) *
+                           static_cast<f64>(rec_layers_) *
+                           static_cast<f64>(conv_state_span_ + rs) * 4.0 /
                            (1024.0 * 1024.0);
         KRK_INFO("recurrent state: %d layers, %.1f MiB f32", rec_layers_, rec_mb);
     }
@@ -8607,18 +8613,42 @@ void Engine::recurrent_reset() {
     // that owns neither delta-net buffer (lfm2moe does). Zeroing it is what
     // makes a full rewind plus replay read the same taps as a fresh session.
     if (sc_state_)
-        be_->fill0(sc_state_, static_cast<size_t>(model_.cfg().n_layer) *
+        be_->fill0(sc_state_, static_cast<size_t>(n_slots_) *
+                               static_cast<size_t>(model_.cfg().n_layer) *
                                static_cast<size_t>(sc_state_span_) *
                                be_->act_size());
     if (!conv_state_ || !rec_state_) return;
-    be_->fill0(conv_state_, static_cast<size_t>(rec_layers_) *
+    be_->fill0(conv_state_, static_cast<size_t>(n_slots_) *
+                                  static_cast<size_t>(rec_layers_) *
                                   static_cast<size_t>(conv_state_span_) * sizeof(f32));
     // The mamba-2 span and the GDN span are the same allocation site: the
     // recomputed version says exactly how much the scan owns, and fill0
     // zeroes the real span whichever layout the model uses.
     const i64 rs = mamba2_state_span_ > 0 ? mamba2_state_span_ : rec_state_span_;
-    be_->fill0(rec_state_, static_cast<size_t>(rec_layers_) *
+    be_->fill0(rec_state_, static_cast<size_t>(n_slots_) *
+                                 static_cast<size_t>(rec_layers_) *
                                  static_cast<size_t>(rs) * sizeof(f32));
+}
+
+void Engine::recurrent_reset_slot(i32 slot) {
+    if (slot < 0 || slot >= n_slots_ || !be_) return;
+    const size_t sn = static_cast<size_t>(slot);
+    if (sc_state_) {
+        const size_t span = static_cast<size_t>(model_.cfg().n_layer) *
+                            static_cast<size_t>(sc_state_span_) * be_->act_size();
+        be_->fill0(static_cast<char *>(sc_state_) + sn * span, span);
+    }
+    if (conv_state_) {
+        const size_t span = static_cast<size_t>(rec_layers_) *
+                            static_cast<size_t>(conv_state_span_) * sizeof(f32);
+        be_->fill0(static_cast<char *>(conv_state_) + sn * span, span);
+    }
+    if (rec_state_) {
+        const i64 rs = mamba2_state_span_ > 0 ? mamba2_state_span_ : rec_state_span_;
+        const size_t span = static_cast<size_t>(rec_layers_) *
+                            static_cast<size_t>(rs) * sizeof(f32);
+        be_->fill0(static_cast<char *>(rec_state_) + sn * span, span);
+    }
 }
 
 void Engine::compressed_reset() {
@@ -8630,6 +8660,37 @@ void Engine::compressed_reset() {
     for (auto &v : idx_key_) std::fill(v.begin(), v.end(), 0.0f);
     for (auto &k : comp_kpos_) std::fill(k.begin(), k.end(), 0);
     std::fill(comp_nblocks_.begin(), comp_nblocks_.end(), 0);
+}
+
+// Clear one sequence's compressed-attention state when a batch slot is reused.
+// These arrays are host-resident and laid out as n_slots equal spans per layer.
+void Engine::compressed_reset_slot(i32 slot) {
+    if (slot < 0 || slot >= n_slots_) return;
+    auto clear_f32 = [&](std::vector<f32> &v) {
+        if (v.empty()) return;
+        const size_t span = v.size() / static_cast<size_t>(n_slots_);
+        const size_t off = static_cast<size_t>(slot) * span;
+        std::fill(v.begin() + static_cast<ptrdiff_t>(off),
+                  v.begin() + static_cast<ptrdiff_t>(off + span), 0.0f);
+    };
+    auto clear_i64 = [&](std::vector<i64> &v) {
+        if (v.empty()) return;
+        const size_t span = v.size() / static_cast<size_t>(n_slots_);
+        const size_t off = static_cast<size_t>(slot) * span;
+        std::fill(v.begin() + static_cast<ptrdiff_t>(off),
+                  v.begin() + static_cast<ptrdiff_t>(off + span), 0);
+    };
+    for (auto &v : comp_state_kv_) clear_f32(v);
+    for (auto &v : comp_state_sc_) clear_f32(v);
+    for (auto &v : comp_pooled_) clear_f32(v);
+    for (auto &v : idx_state_kv_) clear_f32(v);
+    for (auto &v : idx_state_sc_) clear_f32(v);
+    for (auto &v : idx_key_) clear_f32(v);
+    for (auto &v : comp_kpos_) clear_i64(v);
+    if (!comp_nblocks_.empty())
+        for (i32 l = 0; l < model_.cfg().n_layer; l++)
+            comp_nblocks_[static_cast<size_t>(l) * static_cast<size_t>(n_slots_) +
+                          static_cast<size_t>(slot)] = 0;
 }
 
 // The Mamba-2 block forward (nemotron_h / nemotron_h_moe). The engine does
@@ -8704,8 +8765,10 @@ void Engine::mamba2_forward(const LayerWeights &L, i32 l, i32 n) {
 
     // 3. The causal short convolution with this block's bias, and the SiLU
     //    that follows it. After this ws_qkv_ holds post-conv xBC only.
+    const i32 state_slot = fwd_row_slot_ ? fwd_row_slot_[0] : 0;
     f32 *cstate = static_cast<f32 *>(conv_state_) +
-                  static_cast<size_t>(ri) * static_cast<size_t>(conv_state_span_);
+                  (static_cast<size_t>(state_slot) * static_cast<size_t>(rec_layers_) +
+                   static_cast<size_t>(ri)) * static_cast<size_t>(conv_state_span_);
     be_->conv1d_silu(ws_qkv_, ws_qkv_, cstate, L.ssm_conv1d.data,
                      L.ssm_conv1d.type, n, cdim, ksize, L.ssm_conv_bias);
     dump_row("m2.conv", l, ws_qkv_, cdim, n);
@@ -8713,7 +8776,8 @@ void Engine::mamba2_forward(const LayerWeights &L, i32 l, i32 n) {
     // 4. The SSD scan. Reads dtA from ws_beta_, A/bias/D from the layer, and
     //    keeps this layer's [head][p][s] f32 state in the shared arena.
     f32 *state = static_cast<f32 *>(rec_state_) +
-                 static_cast<size_t>(ri) * static_cast<size_t>(mamba2_state_span_);
+                 (static_cast<size_t>(state_slot) * static_cast<size_t>(rec_layers_) +
+                  static_cast<size_t>(ri)) * static_cast<size_t>(mamba2_state_span_);
     be_->ssd_scan(ws_h_, state, ws_qkv_, ws_beta_, L.ssm_a, L.ssm_dt, L.ssm_d,
                   n, n_head, hd, mc.ssm_d_state, mc.ssm_n_group, inner, cdim,
                   L.ssm_d != nullptr);
@@ -9412,12 +9476,15 @@ bool Engine::mla_shared_forward_compressed(const LayerWeights &L, i32 l, i32 n,
 // block is 4 ops where the delta net is a dozen.
 void Engine::lfm_conv_forward(const LayerWeights &L, i32 l, i32 n, i64 pos0) {
     KRK_TRACE_COMP("lfm-conv-forward");
+    if (fwd_row_pos_) pos0 = fwd_row_pos_[0];
     const i32 kern = model_.cfg().ssm_d_conv > 0 ? model_.cfg().ssm_d_conv : 3;
     // ws_xn_ was filled by the layer's pre-norm before the mixer ran.
     gemm_w(ws_sc_, ws_xn_, L.sc_in, 3 * n_embd_, n_embd_, n);
+    const i32 state_slot = fwd_row_slot_ ? fwd_row_slot_[0] : 0;
     void *state = static_cast<char *>(sc_state_) +
-                  static_cast<size_t>(l) *
-                      static_cast<size_t>(sc_state_span_) *
+                  (static_cast<size_t>(state_slot) *
+                       static_cast<size_t>(model_.cfg().n_layer) +
+                   static_cast<size_t>(l)) * static_cast<size_t>(sc_state_span_) *
                       static_cast<size_t>(be_->act_size());
     be_->shortconv(ws_sc2_, ws_sc_, state, L.sc_conv.data, n, n_embd_, kern,
                    sc_hist_, pos0);
@@ -9491,8 +9558,10 @@ void Engine::gdn_forward(const LayerWeights &L, i32 l, i32 n) {
 
     // 2. The causal short convolution, carrying the previous ksize-1 steps, and
     //    the SiLU that follows it. After this ws_qkv_ is the post-conv block.
+    const i32 state_slot = fwd_row_slot_ ? fwd_row_slot_[0] : 0;
     f32 *cstate = static_cast<f32 *>(conv_state_) +
-                  static_cast<size_t>(ri) * static_cast<size_t>(conv_state_span_);
+                  (static_cast<size_t>(state_slot) * static_cast<size_t>(rec_layers_) +
+                   static_cast<size_t>(ri)) * static_cast<size_t>(conv_state_span_);
     be_->conv1d_silu(ws_qkv_, ws_qkv_, cstate, L.ssm_conv1d.data, L.ssm_conv1d.type,
                      n, cdim, ksize);
     dump_row("gdn.conv", l, ws_qkv_, cdim, n);
@@ -9526,7 +9595,8 @@ void Engine::gdn_forward(const LayerWeights &L, i32 l, i32 n) {
 
     // 5. The delta rule, in order, carrying this layer's state to the next token.
     f32 *state = static_cast<f32 *>(rec_state_) +
-                 static_cast<size_t>(ri) * static_cast<size_t>(rec_state_span_);
+                 (static_cast<size_t>(state_slot) * static_cast<size_t>(rec_layers_) +
+                  static_cast<size_t>(ri)) * static_cast<size_t>(rec_state_span_);
     be_->delta_rule(ws_h_, state, qbase, kbase, vbase, ws_ssm_, ws_beta_, n,
                     mc.ssm_n_group, mc.ssm_dt_rank, mc.ssm_d_state, mc.ssm_d_state,
                     cdim);
@@ -15672,8 +15742,6 @@ std::string Engine::batch_refusal() const {
     // silent: a batch that reads the wrong history still writes fluent text.
     if (mc.diffusion)
         return "a masked-diffusion pass denoises one sequence and appends no KV";
-    if (model_.is_recurrent())
-        return "a recurrent model keeps one sequence's delta-rule state";
     // MLA and the V4 compressed layers are addressable per row (see
     // mla_multiseq_supported and the per-slot state in mla_shared_compressed).
     // A backend that has not implemented that says so here.
@@ -15828,6 +15896,8 @@ bool Engine::batch_join(const GenerateParams &p, GenerateResult *res,
     s.p = &p;
     s.res = res;
     s.slot = slot;
+    compressed_reset_slot(slot);
+    recurrent_reset_slot(slot);
     if (tokenize_prompt(p.prompt, s.ids) < 0) {
         res->finish = FinishError;
         res->error = "prompt could not be tokenized";
@@ -16000,10 +16070,14 @@ bool Engine::batch_fork(i32 index, const std::vector<GenerateParams> &branches,
     if (!parent.active) return fail_all("the sequence to fork is not attached");
     if (parent.prefill)
         return fail_all("the sequence to fork is still prefilling its prompt");
-    if (!comp_nblocks_.empty())
-        return fail_all("compressed-attention state is not fork-copyable yet");
+    // Quantized multi-slot attention has not yet passed solo-output parity:
+    // even a full-prompt replay in a nonzero slot differs from the single-slot
+    // oracle on the CPU fixture. Keep it refused until row-base/quant-kernel
+    // parity is fixed. Compressed attention has a safe, slower full-prompt
+    // replay fallback below; ordinary f16 keeps the prefix-copy fast path.
     if (kv_quant_of(cfg_) != KvQuant::F16)
-        return fail_all("forking currently requires f16 KV; quantized-cache parity is not established");
+        return fail_all("quantized KV forks are gated on multi-slot solo-output parity");
+    const bool reuse_trunk = comp_nblocks_.empty() && !model_.is_recurrent();
     // The fork point, and the rows that exist behind it.
     const i64 base = std::min<i64>(parent.prompt_rows, parent.pos);
     if (base <= 0) return fail_all("the sequence to fork has no prompt rows to inherit");
@@ -16036,21 +16110,22 @@ bool Engine::batch_fork(i32 index, const std::vector<GenerateParams> &branches,
                         ": full prompt does not preserve the parent's prompt token prefix";
             return fail_all(res.error);
         }
-        const i64 room = kv_cap_ - base;
+        const i64 prefix = reuse_trunk ? base : 0;
+        const i64 room = kv_cap_ - prefix;
         if (room <= 0) {
             res.finish = FinishError;
             res.error = "branch " + std::to_string(b) + ": the fork point is already at "
                         "the context limit";
             return fail_all(res.error);
         }
-        const i64 suffix = static_cast<i64>(bids[b].size()) - base;
-        if (suffix > room) {
-            bids[b].resize(static_cast<size_t>(base + room));
-            KRK_WARN("branch %zu: prompt truncated to the %lld-token context after a "
-                     "%lld-row trunk", b, static_cast<long long>(room),
-                     static_cast<long long>(base));
+        if (static_cast<i64>(bids[b].size()) > prefix + room) {
+            bids[b].resize(static_cast<size_t>(prefix + room));
+            KRK_WARN("branch %zu: prompt truncated to the %lld-token context", b,
+                     static_cast<long long>(kv_cap_));
         }
-        bids[b].erase(bids[b].begin(), bids[b].begin() + static_cast<ptrdiff_t>(base));
+        if (reuse_trunk)
+            bids[b].erase(bids[b].begin(),
+                          bids[b].begin() + static_cast<ptrdiff_t>(base));
     }
 
     const i32 need = static_cast<i32>(branches.size());
@@ -16070,9 +16145,11 @@ bool Engine::batch_fork(i32 index, const std::vector<GenerateParams> &branches,
         if (!batch_run_->slot_used[static_cast<size_t>(i)]) fork_slots.push_back(i);
     if (static_cast<i32>(fork_slots.size()) != need)
         return fail_all("the free KV slot count changed while preparing the fork");
-    for (i32 slot : fork_slots) {
-        if (!batch_copy_slot_rows(parent.slot, slot, base))
-            return fail_all("the trunk's KV rows could not be copied into every branch slot");
+    if (reuse_trunk) {
+        for (i32 slot : fork_slots) {
+            if (!batch_copy_slot_rows(parent.slot, slot, base))
+                return fail_all("the trunk's KV rows could not be copied into every branch slot");
+        }
     }
 
     for (size_t b = 0; b < branches.size(); b++) {
@@ -16087,19 +16164,26 @@ bool Engine::batch_fork(i32 index, const std::vector<GenerateParams> &branches,
         // The history is the trunk the branch inherited plus its own prompt, so
         // the sampler's repetition window sees exactly what the model read --
         // the same thing an isolated run of the concatenation would see.
-        s.ids.assign(parent.ids.begin(), parent.ids.begin() + static_cast<size_t>(base));
-        s.ids.insert(s.ids.end(), bids[b].begin(), bids[b].end());
-        s.prefill_ids = bids[b];
+        if (reuse_trunk) {
+            s.ids.assign(parent.ids.begin(), parent.ids.begin() + static_cast<size_t>(base));
+            s.ids.insert(s.ids.end(), bids[b].begin(), bids[b].end());
+            s.prefill_ids = bids[b];
+        } else {
+            s.ids = bids[b];
+            s.prefill_ids = bids[b];
+            compressed_reset_slot(slot);
+            recurrent_reset_slot(slot);
+        }
         res.prompt_tokens = static_cast<i32>(s.ids.size());
         s.sampler.reset(p.sampler);
         s.sampler.accept(s.ids.data(), static_cast<int>(s.ids.size()));
         s.emit.reset(new TokenEmitter(p, tok_, s.sampler, &res, s.ids));
         s.logits.assign(static_cast<size_t>(n_vocab_), 0.0f);
-        s.pos = base + static_cast<i64>(bids[b].size());
+        s.pf_base = reuse_trunk ? base : 0;
+        s.pos = s.pf_base + static_cast<i64>(s.prefill_ids.size());
         s.active = true;
         s.prefill = true;
         s.pf_off = 0;
-        s.pf_base = base;   // this branch's prompt starts where the trunk ended
         s.prompt_rows = s.pos;
         s.decode_t0 = std::chrono::steady_clock::now();
         batch_run_->slot_used[static_cast<size_t>(slot)] = true;
@@ -16219,14 +16303,43 @@ bool Engine::batch_step(std::vector<i32> *finished) {
         run.samples.push_back(static_cast<i32>(i));
     }
     bool ok = true;
-    if (!run.tokens.empty()) {
+    if (!run.tokens.empty() && model_.is_recurrent()) {
+        // Recurrent state is sequence-local and cannot be represented by an
+        // attention row mask. Keep the session semantics, but run one row per
+        // sequence so every forward selects that slot's private recurrence.
+        for (i32 sample : run.samples) {
+            BatchRun::Seq &s = *run.seqs[static_cast<size_t>(sample)];
+            run.row_slot.assign(1, s.slot);
+            run.row_pos.assign(1, s.pos);
+            {
+                BatchRowsGuard guard{&fwd_row_slot_, &fwd_row_pos_};
+                fwd_row_slot_ = run.row_slot.data();
+                fwd_row_pos_ = run.row_pos.data();
+                ok = forward(&s.pending, 1, 0, false);
+            }
+            if (!ok) break;
+            head_compute(0);
+            be_->sync();
+            be_->download_f32(s.logits.data(), ws_logits_, n_vocab_);
+            s.pos++;
+            s.steps++;
+        }
+        if (!ok) {
+            const std::string msg = forward_failure_error();
+            for (auto &sp : run.seqs) {
+                BatchRun::Seq &s = *sp;
+                if (!s.active) continue;
+                s.res->error = msg;
+                s.res->finish = FinishError;
+                s.active = false;
+            }
+        }
+    } else if (!run.tokens.empty()) {
         BatchRowsGuard guard{&fwd_row_slot_, &fwd_row_pos_};
         fwd_row_slot_ = run.row_slot.data();
         fwd_row_pos_ = run.row_pos.data();
         ok = forward(run.tokens.data(), static_cast<i32>(run.tokens.size()), 0,
                      false);
-        fwd_row_slot_ = nullptr;
-        fwd_row_pos_ = nullptr;
         if (ok) {
             // Rows are read out one at a time: head_compute projects row r from
             // the final residual, and every row lands in the same workspace

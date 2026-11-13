@@ -1,9 +1,9 @@
 # Kraken pending work
 
 Status: 2026-11-11, after an eight-paper evaluation and the first copy-backed
-branch-fork implementation: the register now carries the
-pages/forks/scoring path the evaluation recommends, and the papers it refuses with
-reasons. See `docs/PAPER-EVALUATION-2026-11.md`.
+branch-fork implementation: the register tracks the pages/forks/scoring path and
+records both firm constraints and opt-in investigations. See
+`docs/PAPER-EVALUATION-2026-11.md`.
 
 This is the only pending-work list. Historical plans, audits, campaign logs, and
 transcripts were removed because their claims and line references had become
@@ -12,8 +12,8 @@ runs.
 
 ## Evidence rules
 
-- The release CPU suite passes 8123/8123 checks and the ASan build of the whole
-  suite passes 8122/8122 (`build-cpu`, and `build-asan` with
+- The release CPU suite passes 8188/8188 checks; the ASan build passes 8187/8187
+  across all 187 groups (`build-cpu`, and `build-asan` with
   `detect_leaks=1:halt_on_error=1`). The one-check difference is deliberate: the
   wall-clock ratio gate in `test_batch_decode` is skipped under instrumentation,
   because ASan re-times two code paths unevenly and the number would be about the
@@ -25,7 +25,8 @@ runs.
   Kernel throughput is not model-wide tokens per second.
 - Do not silently convert models or GGUF weights during optimization.
 - Lossy changes require quality evaluation and explicit opt-in.
-- Do not reopen a rejected optimization without new falsifying evidence.
+- Revisit proposed optimizations when requested, but keep quality-changing modes
+  opt-in and require the stated correctness/quality evidence before promotion.
 
 Status labels:
 
@@ -82,22 +83,22 @@ Status labels:
   `test_prefill_chunk_bitexact`) plus a measured non-regression on the
   single-sequence path, where one page lookup per block is the cost.
   See `docs/PAPER-EVALUATION-2026-11.md` section 1 (PagedAttention).
-- [ ] **Exact branch forking** (CODE). A first copy-backed surface now exists:
-  `Engine::batch_fork` accepts complete branch prompts, checks the parent's
-  token-prefix, copies the trunk KV rows into each free sequence slot, then
-  prefills only the suffix. `test_batch_fork` checks isolated-run token parity
-  for the f16-KV fixture, nested forks, slot/refusal handling, and confirms
-  the parent continuation is not inherited. A CPU int8 probe changed greedy
-  branch tokens under the different prefill partitioning, so forks currently
-  refuse lossy KV modes rather than claim parity. On the tested ordinary-
-  attention f16 fixture, this is an independent-slot baseline, not yet Flide's
-  shared branch stream: it duplicates KV storage and copies the full trunk per
-  branch. Remaining: KV pages/refcounts/CoW, the
-  `(trunk, branch, position)` visibility mask, compressed-state fork support,
-  and the two-call recurrent path (trunk segments produce state, branch segments
-  continue from it by index, no copy). Keep this item open until those land.
-  The shared primitive is still needed for multi-branch prefix reuse and
-  beam/tree speculation. See `docs/PAPER-EVALUATION-2026-11.md` section 2 (Flide).
+- [ ] **Exact branch forking** (CODE). `Engine::batch_fork` accepts complete
+  branch prompts and checks the parent's token-prefix. On ordinary f16-KV
+  attention it copies trunk rows into independent slots and prefills only the
+  suffix; `test_batch_fork` covers solo parity, nested forks, slot/refusal cases,
+  and parent-continuation isolation. Compressed-attention and recurrent forks
+  now work through a correctness-first complete-prompt replay into a cleared
+  slot; the recurrent batch scheduler carries separate per-slot state and steps
+  one sequence at a time. The fixture asserts output parity, not a speedup.
+  Lossy KV remains refused: even full-prompt replay in a nonzero slot has not
+  matched the single-slot oracle, so the multi-slot quantized attention path must
+  be debugged before enabling it. Remaining for Flide: KV pages/refcounts/CoW,
+  `(trunk, branch, position)` visibility masks, snapshots that let compressed and
+  recurrent forks reuse the trunk (including the two-call recurrent continuation
+  by index), and quantized multi-slot parity. The copy-backed API still duplicates
+  KV storage; no shared branch stream or throughput result is claimed. See
+  `docs/PAPER-EVALUATION-2026-11.md` section 2 (Flide).
 - [ ] **Per-option scoring surface** (CODE). A request that returns the output
   head normalised over a caller-supplied option set (Flide's Eq. 1), on both the
   serial and the session path, so a decision model can be served and measured at
@@ -187,12 +188,27 @@ Status labels:
   smaller than the group step -- the same arithmetic the paper reports, and the
   same reason it would be lost here. Independent of the paper: it is what makes
   any adapter servable at all.
-- [ ] **Trained routing predictor, staging only** (FILE). A learned per-layer
-  next-layer predictor as a prefetch signal, with the existing contract (a wrong
-  guess is a wasted read, never a different output) and the existing evidence
-  (candidate precision plus bit-identical tokens). Needs a training artifact this
-  repository does not have. Prediction-as-routing is deliberately refused -- see
-  the rejected section.
+- [ ] **Prediction-as-routing experiment** (FILE + MEASURE, opt-in). Preserve
+  `MoeRoutePredictor` staging-only as the default exact path. Investigate serving
+  a separately supplied, trained predictor as an experimental routing policy
+  without modifying the base GGUF; this necessarily changes the computed function
+  and is quality-dependent, unlike staging. Prerequisites: a named checkpoint,
+  predictor trained against that router/model path, an explicit opt-in interface,
+  route agreement and expert-load metrics, held-out perplexity/task-quality
+  evaluation, plus base-file hashes and standalone-vs-batch isolation tests.
+  Do not claim parity or promote to default based on staging precision. No trained
+  artifact or quality result currently exists; see the Edge0 investigation in
+  `docs/PAPER-EVALUATION-2026-11.md`.
+- [ ] **Tree-Ising-compatible repair sidecar investigation** (DESIGN + FILE).
+  Keep source GGUF weights read-only. Assess an offline tool that emits an
+  independently named repair sidecar or a runtime-only, opt-in overlay loaded
+  alongside the unchanged base; never rewrite/requantize the source checkpoint.
+  Establish support for the model's quantization/layout first, quantify changed
+  parameters/routes and task quality, hash the base before/after, and verify the
+  unmodified path remains exact. A sidecar still changes effective model behavior
+  and needs a named checkpoint, explicit user opt-in, and quality evidence; no
+  optimizer/artifact is currently available. See Tree-Ising in
+  `docs/PAPER-EVALUATION-2026-11.md`.
 - [ ] **Value amortisation for the KV cache** (CODE, experimental, needs a named
   checkpoint). Per-head key-to-value map fitted during prefill with residuals for
   the worst-reconstructed tokens, keys unchanged, opt-in only. Evidence required:
@@ -267,12 +283,13 @@ Status labels:
   prompt is prefilled one chunk per step while anything is decoding, and drained
   in one call when nothing is.
 - Do not describe them as missing.
-- Prediction-as-routing is refused (Edge0): replacing the model's router makes
-  the checkpoint's own routing no longer what runs, and the quality payment for
-  it is training we do not do. Staging-only prediction is the accepted form.
-- Weight repair by discrete optimisation is refused (Tree-Ising): the deliverable
-  is a modified checkpoint, which is outside an inference engine's scope and
-  would violate the read-only rule for weights.
+- Prediction-as-routing (Edge0) and Tree-Ising are open investigations, not
+  approved default behavior: both can change model outputs. Preserve the ordinary
+  router and read-only GGUF path as defaults. Explore opt-in modes that load
+  user-provided predictor/repair sidecars without changing source weights, and
+  gate them on explicit quality, routing-agreement, artifact-integrity, and
+  standalone-vs-batch verification. Staging-only prediction remains the exact
+  baseline; no training or repair artifact is currently available here.
 - Agent-side sparse reading (SparseRead) and offline EMA k-means (e-means) have
   no engine surface: recorded in `docs/PAPER-EVALUATION-2026-11.md`, not work
   items.
