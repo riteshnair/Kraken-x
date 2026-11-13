@@ -12314,6 +12314,72 @@ static void test_expert_replay() {
 }
 
 // ---------------------------------------------------------------------------
+// Prefill traffic does not vote in the replacement policy
+// ---------------------------------------------------------------------------
+//
+// A prefill chunk touches every expert of every layer it runs, once each, and
+// does it for the whole prompt: 2000 tokens at top-8 over 60 layers is ~1M
+// acquires whose counters describe a routing decode will never repeat. Worse,
+// the decay window is counted in acquires, so the same prefill ages every
+// counter hundreds of times and unpins the warmup set before the first token is
+// generated -- and the seeded-warmup experiment already measured what ranking
+// from other traffic costs (1011 -> 1391 promotions, 24.4 -> 21.3 tok/s).
+//
+// So ExpertCache::policy_votes() freezes the counters and the decay clock for
+// PhasePrefill. Prefill acquires still load, promote, evict and are served; they
+// just do not vote. This group pins both halves: a prefill that cannot pin, and
+// a decode that still can.
+static void test_expert_prefill_phase() {
+    const std::string path = "kraken-prefill-vote.gguf";
+    CHECK(build_expert_source_model(path), "wrote the prefill-phase GGUF");
+    Gguf g;
+    std::string err;
+    CHECK(g.load(path, &err), "loaded the prefill-phase GGUF");
+    if (!err.empty()) std::fprintf(stderr, "  (prefill gguf: %s)\n", err.c_str());
+    const ExpertSource src = expert_source(g);
+    CHECK(src.present(), "the prefill-phase expert source is complete");
+
+    Backend *cpu = make_cpu_backend();
+    ExpertCache cache;
+    cache.configure(cpu, 96); // the whole four-expert corpus
+    // Three windows of acquires, far more than a decay period, without one
+    // counter moving: the traffic is real (every acquire is served) and none of
+    // it votes.
+    cache.set_phase(ExpertCache::PhasePrefill);
+    for (int i = 0; i < 3 * static_cast<int>(ExpertCache::kPinDecay) + 8; i++) {
+        const ResidentExpert *re = cache.acquire(src, 0, 0);
+        CHECK(re != nullptr, "a prefill acquire is still served");
+        if (!re) break;
+    }
+    CHECK(cache.hits() > 0, "the prefill acquires were served from the resident slot");
+    CHECK(cache.touch_count(0, 0) < ExpertCache::kPinThreshold,
+          "prefill traffic does not earn a pin");
+    CHECK(cache.pinned_slots() == 0, "no slot is pinned by prefill traffic");
+
+    // The same slot, now in decode: the counter moves and the pin is earned.
+    cache.set_phase(ExpertCache::PhaseDecode);
+    for (int i = 0; i < static_cast<int>(ExpertCache::kPinThreshold) + 2; i++)
+        cache.acquire(src, 0, 0);
+    CHECK(cache.touch_count(0, 0) >= ExpertCache::kPinThreshold,
+          "decode traffic still earns the pin prefill was denied");
+    CHECK(cache.pinned_slots() >= 1, "the decode-phase pin is real");
+
+    // PhaseOther is load-time warmup and must vote: the seeded ranking it
+    // produces is the reason this gate is scoped to prefill and not to "any
+    // phase that is not decode".
+    ExpertCache warm;
+    warm.configure(cpu, 96);
+    warm.set_phase(ExpertCache::PhaseOther);
+    for (int i = 0; i < static_cast<int>(ExpertCache::kPinThreshold) + 2; i++)
+        warm.acquire(src, 0, 1);
+    CHECK(warm.pinned_slots() >= 1, "load-time warmup still earns its pins");
+
+    cache.clear();
+    warm.clear();
+    delete cpu;
+}
+
+// ---------------------------------------------------------------------------
 // The device dispatch table's HOST half
 // ---------------------------------------------------------------------------
 //
@@ -32344,6 +32410,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_expert_cache_byte_budget)
     TEST_GROUP(test_expert_cache_warm_tier)
     TEST_GROUP(test_expert_replay)
+    TEST_GROUP(test_expert_prefill_phase)
     TEST_GROUP(test_expert_dispatch_table)
     TEST_GROUP(test_expert_dispatch_host_backed)
     TEST_GROUP(test_draft_head)

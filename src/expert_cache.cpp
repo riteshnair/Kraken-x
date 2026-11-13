@@ -693,8 +693,20 @@ void ExpertCache::set_pin_budget(size_t bytes) {
 }
 
 void ExpertCache::touch(Slot &s) {
+    // A phase that does not vote leaves the counter alone: see policy_votes().
+    // The slot is still resident and still served; it just does not earn (or
+    // defend) a lasting rank from traffic that will not repeat.
+    if (!policy_votes()) return;
     s.count++;
     if (!s.pinned && s.count >= pin_threshold()) set_pinned(s, true);
+}
+
+// The decay clock, driven by the acquires that vote. Kept in one place so the
+// phase gate cannot be applied to the counters and forgotten on the aging side,
+// which would cool every pin during a prefill anyway.
+void ExpertCache::note_acquire() {
+    if (!policy_votes()) return;
+    if (++acquires_ >= decay_period()) decay();
 }
 
 void ExpertCache::finish_stage(Slot &s) {
@@ -770,7 +782,7 @@ const ResidentExpert *ExpertCache::acquire_inplace(const ExpertSource &src,
     ++inplace_hits_;
     touch(s);
     xtrace(layer, expert, 1);
-    if (++acquires_ >= decay_period()) decay();
+    note_acquire();
     return &s.h;
 }
 
@@ -1641,7 +1653,7 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
                     KRK_INFO("expert dbg: acq=%llu L%d E%d HIT staged slots=%zu/%zu bytes=%zu/%zu",
                              (unsigned long long)acquires_, layer, expert,
                              vram_slots_, capacity_, bytes_, budget_);
-                if (++acquires_ >= decay_period()) decay();
+                note_acquire();
                 return &s.m;
             }
             // Hit: the traffic that makes an expert hot happens here.
@@ -1652,7 +1664,7 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
                 KRK_INFO("expert dbg: acq=%llu L%d E%d HIT slots=%zu/%zu bytes=%zu/%zu",
                          (unsigned long long)acquires_, layer, expert,
                          vram_slots_, capacity_, bytes_, budget_);
-            if (++acquires_ >= decay_period()) decay();
+            note_acquire();
             return &s.m;
         }
         if (dbg && acquires_ < 40)
@@ -1670,7 +1682,7 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
             touch(s);
             host_hits_++;
             xtrace(layer, expert, 1);
-            if (++acquires_ >= decay_period()) decay();
+            note_acquire();
             return &s.m;
         }
         // No promotion (device allocation failed). The cold path below rebuilds
@@ -1885,7 +1897,7 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
         ++pool_refusals_;
         return nullptr;
     }
-    if (++acquires_ >= decay_period()) decay();
+    note_acquire();
     return &ins.first->second.m;
 }
 

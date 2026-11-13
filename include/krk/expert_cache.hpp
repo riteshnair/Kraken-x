@@ -466,6 +466,37 @@ public:
     // warmup and prefetch, which is neither, so the three never double-count.
     enum Phase { PhaseOther = 0, PhasePrefill = 1, PhaseDecode = 2 };
     void set_phase(Phase p) { phase_ = p; }
+
+    // Does traffic in the current phase get a vote in the replacement policy?
+    //
+    // PREFILL does not, by default. A chunk of a few hundred rows touches every
+    // expert of the layer it runs, once each, and it does that for every layer:
+    // 2000 tokens at top-8 and 60 layers is ~1M acquires, every one of them a
+    // fresh count on a slot that decode will never select again. Those votes do
+    // not describe the traffic the cache is protecting. They also AGE it: the
+    // decay window is counted in acquires, so the same prefill cycles every
+    // counter hundreds of times and unpins the warmup set before the first
+    // token is generated -- and the seeded warmup already measured what a
+    // ranking from other traffic costs (1011 -> 1391 promotions, 24.4 -> 21.3
+    // tok/s on laguna-xs2).
+    //
+    // So prefill acquires still do everything that is not a vote: they load,
+    // promote, evict and are served. They just do not raise a counter and do
+    // not run the decay clock. The set decode inherits is then the set the
+    // prefill actually left resident plus the counts the warmup earn, which is
+    // the ranking that was measured to be worth having.
+    //
+    // KRK_EXPERT_PREFILL_VOTE=1 restores the old behaviour (every acquire votes)
+    // for an A/B, because this is a policy change and the only thing that can
+    // settle it is a tok/s on a real file.
+    bool policy_votes() const {
+        static const bool prefill_votes = [] {
+            const char *e = std::getenv("KRK_EXPERT_PREFILL_VOTE");
+            return e && e[0] == '1';
+        }();
+        return prefill_votes || phase_ != PhasePrefill;
+    }
+
     f64 prefill_promote_ms() const { return pf_promote_ms_; }
     f64 prefill_read_ms() const { return pf_read_ms_; }
     f64 prefill_room_ms() const { return pf_room_ms_; }
@@ -767,7 +798,11 @@ private:
     };
 
     // One acquire on a resident slot: counters earn pins, pins are never free.
+    // A phase that does not vote (see policy_votes) leaves the counter alone.
     void touch(Slot &s);
+    // Counts one voting acquire and runs the decay window when it fills. All
+    // acquire paths go through it, so the phase gate cannot be half-applied.
+    void note_acquire();
     // Frees the device copy. Leaves the footprint, counter and load order in
     // place — a slot that is only in the host tier still knows what it is.
     void drop(Slot &s);

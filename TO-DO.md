@@ -119,6 +119,19 @@ Status labels:
   sensitivity, calibration, quality gates, and kernel-native evaluation.
 - [ ] **Ternary and BITCOS evaluation** (MEASURE). Require useful accuracy and
   throughput, not merely lower storage.
+- [ ] **Native validation of the prefill-freeze policy** (HARDWARE). The gate is
+  unit-tested; what is missing is a matched A/B on a real MoE file: same prompt,
+  same cache size, `KRK_EXPERT_PREFILL_VOTE=1` against the default, reporting
+  tok/s, decode hit rate, pinned slots at the first generated token, and the
+  promotion count. No native result for this has been recorded.
+- [ ] **Sweep the host share with the replay tuner** (MEASURE). Pick the share
+  and the cache size for one real file from one recorded trace, then check the
+  prediction against a live run. The tuner exists
+  (`scripts/moe_cache_tune.py`); what is unverified is its prediction error.
+- [ ] **Multi-device expert residency** (CODE and HARDWARE). The cache is one
+  pool on one device; a per-GPU split (as llama.cpp's `--moe-cache-mib` does)
+  would need tensor-sharded multi-device model loading first, which this engine
+  does not implement.
 
 ## P2: measurements and observability
 
