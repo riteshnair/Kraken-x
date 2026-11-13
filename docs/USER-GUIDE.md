@@ -307,9 +307,15 @@ curl -N http://127.0.0.1:8080/v1/chat/completions \
 ```
 
 A failed streaming write raises the request cancellation flag and stops decoding
-at the next token. Prefix reuse can avoid repeated prefill for matching prompts.
-Cached token usage is an execution metric, not evidence of response correctness.
-The held prefix is not a general radix tree.
+at the next token. Prefix reuse avoids repeated prefill for the part of a prompt
+that matches the previous run's rows: the shared part does not have to be the
+whole record, so two turns that share a system prompt and diverge after it reuse
+the shared part and prefill only the rest. One token is always prefilled, because
+the row a run samples from is the row its last prefill produces. Cached token
+usage is an execution metric, not evidence of response correctness, and it is
+`0` on the batch path, where every slot is written from row 0 of its own region.
+The held prefix is one record, not a general radix tree: a second branch's rows
+cannot stay resident beside the first.
 
 Available endpoints are `/`, `/health`, `/v1/models`, `/v1/tools/rv32`,
 `/v1/completions`, and `/v1/chat/completions`. The service loads one model.

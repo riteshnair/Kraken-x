@@ -56,8 +56,14 @@ Status labels:
   the number: time to first token for a request arriving mid-generation over
   HTTP, with one slot against several, on a model whose steps are long enough to
   measure.
-- [ ] **Radix prefix reuse** (CODE). Reuse shared prefixes shorter than the
-  whole record, with exact-output tests.
+- [ ] **More than one resident prefix** (CODE, needs the KV tier with batching).
+  The cache is one linear KV region, so the longest prefix that can be resident
+  is the last run's; reuse of prefixes SHORTER than that record works and is
+  pinned by `test_prefix_partial_reuse` (same prompt, a branch diverging
+  mid-prompt, an extension, and nothing shared -- each compared against a cold
+  engine). Reusing two branches at once needs per-sequence page ownership, which
+  is the same work as the KV-tier-with-batching item below, so the two are one
+  job rather than two.
 - [ ] **Prefix persistence, journal, TTL, and size bounds** (CODE). Verify
   restart recovery, expiry, corruption handling, and bounded storage.
 - [ ] **KV tier with batching** (CODE). Replace whole-layer, single-sequence

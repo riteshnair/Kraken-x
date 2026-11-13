@@ -31727,6 +31727,167 @@ static void test_cli_arg_refusal() {
 #define TEST_GROUP_SERIAL(fn, why) {#fn, fn, why},
 
 // ---------------------------------------------------------------------------
+// B2.2b -- prefix reuse shorter than the whole record
+// ---------------------------------------------------------------------------
+//
+// The cache holds one record: the last run's prompt plus the tokens it accepted,
+// cut to the rows that actually exist. Reuse is the longest common prefix of the
+// new prompt with that record -- which is usually SHORTER than the record, and
+// that is the case a chat branch is made of: two turns share a system prompt and
+// diverge after it.
+//
+// Two things have to hold, and only the second is interesting. The reused count
+// must be the true common prefix (leaving at least one token for the prefill,
+// because the row a run samples from is the one its last prefill produces), and
+// the answer must be identical to the same request on a cold engine: a prefix
+// that is reused is reused exactly, so the text cannot tell you where the
+// prefill started. A wrong skip would still read rows at the right positions for
+// the tokens it skipped, so only the divergent arm can catch an off-by-one --
+// there the skipped rows and the prompt disagree.
+static void test_prefix_partial_reuse() {
+    if (!build_tiny_model(kTestModelPath, false)) {
+        CHECK(false, "prefix reuse test: build_tiny_model failed");
+        return;
+    }
+    Backend *cpu = make_cpu_backend();
+    auto open = [&](Engine *engine, std::string *err) {
+        EngineConfig cfg;
+        cfg.model_path = kTestModelPath;
+        cfg.n_ctx = 64;
+        cfg.prefill_chunk = 8;
+        return engine->init(cpu, cfg, err);
+    };
+    struct Body {
+        int status = 0;
+        std::string text;
+        i64 cached = -1;
+        i64 prompt_tokens = -1;
+        bool parsed = false;
+    };
+    struct NullConn : HttpConn {
+        bool write_raw(const char *, size_t) override { return true; }
+    };
+    auto ask = [](OpenAiService &svc, HttpConn &conn, const std::string &prompt,
+                  i32 max_tokens) {
+        HttpRequest req;
+        req.method = "POST";
+        req.path = "/v1/completions";
+        req.body = std::string("{\"prompt\":") + JsonValue(prompt).dump() +
+                   ",\"max_tokens\":" + std::to_string(max_tokens) +
+                   ",\"temperature\":0,\"repeat_penalty\":1.0}";
+        HttpResponse res;
+        Body b;
+        if (!svc.handle(req, res, conn)) return b;
+        b.status = res.status;
+        JsonValue j;
+        std::string e;
+        if (!json_parse(res.body, &j, &e)) return b;
+        b.parsed = true;
+        const JsonValue *choices = j.find("choices");
+        if (choices && choices->is_array() && !choices->items().empty())
+            choices->items()[0].get_string("text", &b.text);
+        const JsonValue *usage = j.find("usage");
+        if (usage) {
+            b.prompt_tokens = usage->get_int("prompt_tokens", -1);
+            const JsonValue *details = usage->find("prompt_tokens_details");
+            if (details) b.cached = details->get_int("cached_tokens", -1);
+        }
+        return b;
+    };
+    // The shared length in TOKENS, which is what the server compares. Text
+    // matching is not enough: the same characters can tokenize differently.
+    auto common_tokens = [](const std::vector<i32> &a, const std::vector<i32> &b) {
+        size_t n = 0;
+        while (n < a.size() && n < b.size() && a[n] == b[n]) n++;
+        return static_cast<i64>(n);
+    };
+
+    const char *warm_prompt = "the a the a the";
+    struct Case {
+        const char *ask;
+        i32 max_tokens;
+        const char *label;
+    } cases[4] = {
+        {"the a the a the", 2, "the same prompt again"},          // whole record
+        {"the a b the a", 3, "a branch that diverges mid-prompt"}, // partial
+        {"the a the a the a the", 4, "an extension of the record"},
+        {"a the a", 2, "nothing shared at the first token"},
+    };
+
+    std::vector<i32> warm_ids;
+    {
+        Engine tokenizer_engine;
+        std::string err;
+        if (!open(&tokenizer_engine, &err)) {
+            CHECK(false, "prefix reuse test: the tokenizer engine initialises");
+            delete cpu;
+            return;
+        }
+        CHECK(tokenizer_engine.tokenizer().encode(warm_prompt, warm_ids, true) >= 0,
+              "the warm prompt tokenizes");
+        CHECK(warm_ids.size() >= 4, "the warm prompt is several tokens long");
+    }
+
+    for (const Case &c : cases) {
+        const std::string tag = c.label;
+        // Warm: one completed run, so the record is its prompt plus the tokens
+        // it accepted.
+        Engine warm;
+        std::string err;
+        if (!open(&warm, &err)) {
+            CHECK(false, tag + ": the warm engine initialises");
+            delete cpu;
+            return;
+        }
+        std::mutex mu;
+        OpenAiService svc(&warm, 0.0f, &mu);
+        NullConn conn;
+        const Body first = ask(svc, conn, warm_prompt, 4);
+        CHECK(first.status == 200 && first.parsed, tag + ": the warm-up request is served");
+        CHECK(first.cached == 0,
+              tag + ": a request against an empty cache reuses nothing (" +
+                  std::to_string(first.cached) + ")");
+        CHECK(!first.text.empty(), tag + ": and the warm-up produced text");
+
+        const Body warm_answer = ask(svc, conn, c.ask, c.max_tokens);
+        // What the shared prefix is, computed from the same tokenizer the server
+        // used. The record is at least the warm prompt, and one token always has
+        // to be prefilled.
+        std::vector<i32> ask_ids;
+        CHECK(warm.tokenizer().encode(c.ask, ask_ids, true) >= 0,
+              tag + ": the request tokenizes");
+        i64 expect = common_tokens(warm_ids, ask_ids);
+        expect = std::min<i64>(expect, static_cast<i64>(ask_ids.size()) - 1);
+        CHECK(warm_answer.status == 200, tag + ": the request is served");
+        CHECK(warm_answer.cached == expect,
+              tag + ": cached_tokens is the shared prefix, " +
+                  std::to_string(expect) + " (got " +
+                  std::to_string(warm_answer.cached) + ")");
+        CHECK(warm_answer.cached < warm_answer.prompt_tokens,
+              tag + ": at least one token was still prefilled");
+
+        // The answer must be the one a cold engine gives: reuse is exact, so
+        // where the prefill started cannot be visible in the output.
+        Engine cold;
+        if (!open(&cold, &err)) {
+            CHECK(false, tag + ": the cold engine initialises");
+            delete cpu;
+            return;
+        }
+        std::mutex cold_mu;
+        OpenAiService cold_svc(&cold, 0.0f, &cold_mu);
+        NullConn cold_conn;
+        const Body cold_answer = ask(cold_svc, cold_conn, c.ask, c.max_tokens);
+        CHECK(cold_answer.status == 200 && cold_answer.cached == 0,
+              tag + ": the cold engine serves the same request with no reuse");
+        CHECK(warm_answer.text == cold_answer.text,
+              tag + ": the reused-prefix answer is the cold-engine answer");
+    }
+
+    delete cpu;
+}
+
+// ---------------------------------------------------------------------------
 // B2.1b -- cancellation at every phase a session has
 // ---------------------------------------------------------------------------
 //
@@ -33369,6 +33530,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_kv_tier_per_plane_cold_files)
     TEST_GROUP(test_moe_batch_ops)
     TEST_GROUP(test_batch_decode)
+    TEST_GROUP(test_prefix_partial_reuse)
     TEST_GROUP(test_cancel_phases)
     TEST_GROUP(test_batch_prefill_interleave)
     TEST_GROUP(test_batch_admission)
