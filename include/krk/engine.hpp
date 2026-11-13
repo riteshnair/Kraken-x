@@ -431,6 +431,46 @@ public:
     // already n rows wide).
     bool generate_batch(const std::vector<GenerateParams> &reqs,
                         std::vector<GenerateResult> *outs);
+
+    // ---- iteration-level batched serving -----------------------------------
+    //
+    // generate_batch() is one call for a whole wave: it returns when the LAST
+    // sequence of the wave finishes, so a request that arrives one step in waits
+    // for up to `max_tokens` steps of somebody else's decoding before its own
+    // prefill starts. A session keeps the slots between calls instead, and a
+    // sequence joins or leaves at a STEP boundary.
+    //
+    // Admission is safe because of a property batching already had: the per-row
+    // arithmetic is identical to a solo run (same kernels, same order), so a
+    // sequence's tokens do not depend on who else was in the pass or on when it
+    // joined. What changes is only WHEN it is admitted.
+    bool batch_open(std::string *err);
+    // Attach `p` to a free slot: tokenize the prompt, reserve the slot and
+    // return. The prompt itself is prefilled by the following batch_step()
+    // calls, one chunk per step, so admission costs a tokenization rather than
+    // a whole prompt. False, with `err` set, when the session is not open, no
+    // slot is free, or the prompt cannot be tokenized; a prompt-level failure
+    // also fills `res` so the caller can report it.
+    bool batch_join(const GenerateParams &p, GenerateResult *res, std::string *err);
+    // One iteration over every attached sequence: one prefill chunk for a
+    // waiting prompt, then one decode step for every sequence already
+    // generating. The join indices of the sequences that finished during it --
+    // by generation, cancellation, or a failed forward -- are appended to
+    // `finished`; the caller reads them with batch_seq_result(). Returns false
+    // only when the forward pass failed, in which case every attached sequence
+    // is finished with that error.
+    bool batch_step(std::vector<i32> *finished);
+    i32 batch_active() const;
+    i32 batch_free_slots() const;
+    // Ends the session and releases its slots. Safe to call when none is open,
+    // and called by shutdown(), so a caller cannot leave the KV regions marked
+    // in use.
+    void batch_close();
+    bool batch_running() const { return batch_run_ != nullptr; }
+    // The result of join index `i`, or null outside the session or past its
+    // end. A sequence's result is only complete once its index was reported by
+    // batch_step().
+    const GenerateResult *batch_seq_result(i32 i) const;
     bool moe_prediction_enabled() const { return moe_predict_enabled_; }
     u64 moe_predictions_issued() const { return moe_predictor_.predictions_issued(); }
     u64 moe_prediction_candidates() const { return moe_predictor_.candidates(); }
@@ -792,6 +832,20 @@ private:
     const i64 *fwd_row_pos_ = nullptr;
     std::vector<i64> fwd_kv_base_row_;
     i32 n_slots_ = 1;
+
+    // The open iteration-level session (see batch_open). One at a time: the
+    // slots it holds ARE the batch state, and two sessions would fight over the
+    // same KV regions.
+    struct BatchRun;
+    BatchRun *batch_run_ = nullptr;
+    // Finalizes one sequence of the session: closes its stream, decodes its
+    // text, records its timings and releases its slot.
+    void batch_finalize(i32 index);
+    // One chunk of one sequence's prompt, so a prefill can be interleaved with
+    // other sequences' decode steps instead of blocking them for a whole
+    // prompt. Sets the sequence's first-token logits when it consumes the last
+    // chunk; returns false when the chunk failed or the request was cancelled.
+    bool batch_prefill_slice(i32 index);
 
     // Cooperative cancellation (see GenerateParams::cancel). Read once per
     // prefill chunk and once per generated token; the decode loops stop through

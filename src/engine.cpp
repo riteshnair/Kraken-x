@@ -1392,7 +1392,14 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     }
 
     const size_t as = be_->act_size();
-    const i64 C = chunk_;
+    // The WIDEST pass this engine can run, in rows. A prefill is bounded by the
+    // chunk, but a batched decode is bounded by the sequence count -- one row
+    // per sequence -- and those two numbers are independent. Sizing the row
+    // workspaces by the chunk alone meant `--chunk 1` with more than one slot
+    // ran a two-row pass through one-row buffers: ASan reported a heap overrun
+    // in the per-row exponent array (`ws_rexp_`) the first time a batched decode
+    // ran with a chunk smaller than the slot count.
+    const i64 C = std::max<i64>(chunk_, n_slots_);
     // The ledger's baseline: what the device already had taken before this
     // engine allocated anything. Without it, `unaccounted` at the end of init is
     // ambiguous between "a buffer we forgot" and "the desktop and the driver",
@@ -2904,6 +2911,10 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
 }
 
 void Engine::shutdown() {
+    // An open session holds KV regions and result pointers into its caller's
+    // stack. Closing it here is what keeps a shutdown from leaving the slot
+    // table pointing at freed sequences.
+    batch_close();
     // The dump's end marker, before anything else: a run that ends by crashing
     // in a later teardown still leaves the line that says it produced N rows.
     dump_close();
@@ -15209,10 +15220,14 @@ bool Engine::cancel_requested(const GenerateParams &p) const {
 void Engine::mark_cancelled(const GenerateParams &p, GenerateResult *res, i64 held) {
     res->cancelled = true;
     res->finish = FinishStop;
-    kv_pos_ = std::max<i64>(0, held);
+    // The cursor is a property of the whole KV cache, so only a serial run owns
+    // it. In a session it is a high-water mark over several sequences with their
+    // own positions, and one sequence stopping must not drag it back under the
+    // rows another sequence is still reading.
+    if (!batch_run_) kv_pos_ = std::max<i64>(0, held);
     p.sink.emit(nullptr, -1, true);
     KRK_DEBUG("run cancelled by the caller after %lld prompt row(s) and %d generated token(s)",
-              static_cast<long long>(kv_pos_), res->generated);
+              static_cast<long long>(held), res->generated);
 }
 
 bool Engine::generate(const GenerateParams &p, GenerateResult *res) {
@@ -15697,6 +15712,410 @@ struct BatchRowsGuard {
 };
 } // namespace
 
+// ---------------------------------------------------------------------------
+// Iteration-level batched serving
+// ---------------------------------------------------------------------------
+//
+// The batch used to be one call: a wave of up to n_slots requests went in and
+// came back when the LAST of them finished. A request arriving one step into a
+// wave therefore waited for the whole wave -- up to `max_tokens` steps of
+// somebody else's decoding -- before its prefill even started, which is the
+// latency a queue shows and none of the latency batching is supposed to buy.
+//
+// A session keeps the slots between calls instead. Sequences join at a step
+// boundary, leave when they finish, and the prefill of a newcomer runs between
+// two steps of the others. Nothing about the per-row arithmetic changes: same
+// kernels, same order, same logits, so a sequence's tokens do not depend on who
+// else was in the pass or on when it joined. That equality is the contract, and
+// test_batch_admission pins it against the solo path.
+struct Engine::BatchRun {
+    struct Seq {
+        const GenerateParams *p = nullptr;
+        GenerateResult *res = nullptr;
+        std::vector<i32> ids;      // prompt + accepted tokens
+        std::vector<f32> logits;   // this sequence's logits row
+        Sampler sampler;
+        std::unique_ptr<TokenEmitter> emit;
+        i64 pos = 0;               // next position to append
+        i32 slot = -1;
+        i32 pending = -1;          // token to feed on the next step
+        bool active = false;
+        // The prompt is still being prefilled: the sequence holds a slot and an
+        // index but has no first token yet, and the decode half of a step must
+        // skip it.
+        bool prefill = false;
+        i64 pf_off = 0;            // prompt tokens already written to the slot
+        bool done = false;         // finalized: result complete, slot released
+        i64 steps = 0;
+        f64 prefill_ms = 0.0;
+        std::chrono::steady_clock::time_point decode_t0{};
+    };
+
+    // unique_ptr, not Seq by value: TokenEmitter keeps a reference to its
+    // sequence's sampler and id vector, and a vector that reallocates as
+    // requests are admitted would leave that reference to a moved-from
+    // sampler. The pointer also makes "the address never changes" explicit.
+    std::vector<std::unique_ptr<Seq>> seqs;
+    std::vector<bool> slot_used;
+    // The row tables one forward pass reads. Kept here, not on the caller's
+    // stack, because a step is now a call of its own.
+    std::vector<i32> row_slot;
+    std::vector<i64> row_pos;
+    std::vector<i32> tokens;
+    std::vector<i32> samples;
+};
+
+bool Engine::batch_open(std::string *err) {
+    if (batch_run_) batch_close();
+    if (!be_ || n_vocab_ <= 0) {
+        if (err) *err = "the engine has no backend or no vocabulary";
+        return false;
+    }
+    if (n_slots_ < 2) {
+        if (err) *err = "this engine holds one sequence";
+        return false;
+    }
+    const std::string why = batch_refusal();
+    if (!why.empty()) {
+        if (err) *err = why;
+        return false;
+    }
+    // A session starts a new set of sequences: the same reset every
+    // single-sequence run does, because the rows below are about to be rewritten.
+    kv_pos_ = 0;
+    mtp_fed_ = 0;
+    if (trace_hash_on_) trace_stage_.clear();
+    if (!comp_nblocks_.empty()) compressed_reset();
+    if (moe_predict_enabled_) moe_predictor_.reset();
+    moe_predict_ids_.clear();
+    batch_run_ = new BatchRun();
+    batch_run_->slot_used.assign(static_cast<size_t>(n_slots_), false);
+    return true;
+}
+
+bool Engine::batch_join(const GenerateParams &p, GenerateResult *res,
+                        std::string *err) {
+    if (!batch_run_) {
+        if (err) *err = "no batch session is open";
+        return false;
+    }
+    if (!res) {
+        if (err) *err = "no result to fill";
+        return false;
+    }
+    i32 slot = -1;
+    for (i32 i = 0; i < n_slots_; i++) {
+        if (!batch_run_->slot_used[static_cast<size_t>(i)]) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        if (err) *err = "no free KV slot";
+        return false;
+    }
+
+    std::unique_ptr<BatchRun::Seq> owned(new BatchRun::Seq());
+    BatchRun::Seq &s = *owned;
+    s.p = &p;
+    s.res = res;
+    s.slot = slot;
+    if (tokenize_prompt(p.prompt, s.ids) < 0) {
+        res->finish = FinishError;
+        res->error = "prompt could not be tokenized";
+        if (err) *err = res->error;
+        return false;
+    }
+    if (s.ids.empty()) {
+        res->finish = FinishError;
+        res->error = "prompt encoded to zero tokens";
+        if (err) *err = res->error;
+        return false;
+    }
+    if (static_cast<i64>(s.ids.size()) > kv_cap_) {
+        s.ids.resize(static_cast<size_t>(kv_cap_));
+        KRK_WARN("prompt truncated to the %lld-token context (slot %d)",
+                 static_cast<long long>(kv_cap_), static_cast<int>(slot));
+    }
+    res->prompt_tokens = static_cast<i32>(s.ids.size());
+    s.sampler.reset(p.sampler);
+    s.sampler.accept(s.ids.data(), static_cast<int>(s.ids.size()));
+    s.emit.reset(new TokenEmitter(p, tok_, s.sampler, res, s.ids));
+    s.logits.assign(static_cast<size_t>(n_vocab_), 0.0f);
+    s.pos = static_cast<i64>(s.ids.size());
+    s.active = true;
+    // The prompt is prefilled by batch_step(), one chunk per step, so that a
+    // request arriving during a long prefill does not stop the sequences
+    // already decoding from advancing. Admission is therefore cheap: a
+    // tokenization and a slot reservation.
+    s.prefill = true;
+    s.pf_off = 0;
+    s.decode_t0 = std::chrono::steady_clock::now();
+    batch_run_->slot_used[static_cast<size_t>(slot)] = true;
+    batch_run_->seqs.push_back(std::move(owned));
+    return true;
+}
+
+// One chunk of a prompt, into that sequence's slot. Rows of a prefill are
+// consecutive positions of ONE sequence, so the chunk never shares a pass with
+// another sequence's rows; what it does share is the STEP, which is the point:
+// the sequences already decoding get their iteration in the same call.
+bool Engine::batch_prefill_slice(i32 index) {
+    if (!batch_run_) return false;
+    if (index < 0 || static_cast<size_t>(index) >= batch_run_->seqs.size())
+        return false;
+    BatchRun::Seq &s = *batch_run_->seqs[static_cast<size_t>(index)];
+    if (!s.active || !s.prefill) return false;
+    const GenerateParams &p = *s.p;
+    GenerateResult *res = s.res;
+    const i64 total = static_cast<i64>(s.ids.size());
+
+    // Cancellation is checked per chunk, so a cancelled request stops within
+    // one chunk of the caller asking, and its slot comes back at the next
+    // finalize rather than at the end of the prompt.
+    if (cancel_requested(p)) {
+        mark_cancelled(p, res, s.pf_off);
+        s.active = false;
+        return false;
+    }
+
+    const i32 n = static_cast<i32>(std::min<i64>(chunk_, total - s.pf_off));
+    batch_run_->row_slot.assign(static_cast<size_t>(n), s.slot);
+    batch_run_->row_pos.resize(static_cast<size_t>(n));
+    for (i32 t = 0; t < n; t++)
+        batch_run_->row_pos[static_cast<size_t>(t)] = s.pf_off + t;
+
+    expert_phase(ExpertCache::PhasePrefill);
+    krk::HostTime::set_phase(krk::HostTime::kPrefill);
+    const Timer pt;
+    const bool last = (s.pf_off + n) == total;
+    bool ok = true;
+    {
+        BatchRowsGuard guard{&fwd_row_slot_, &fwd_row_pos_};
+        fwd_row_slot_ = batch_run_->row_slot.data();
+        fwd_row_pos_ = batch_run_->row_pos.data();
+        ok = forward(s.ids.data() + s.pf_off, n, static_cast<i32>(s.pf_off), last);
+        fwd_row_slot_ = nullptr;
+        fwd_row_pos_ = nullptr;
+    }
+    s.prefill_ms += pt.ms();
+    expert_phase(ExpertCache::PhaseDecode);
+    krk::HostTime::set_phase(krk::HostTime::kDecode);
+    if (!ok) {
+        res->error = forward_failure_error();
+        res->finish = FinishError;
+        s.active = false;
+        return false;
+    }
+    s.pf_off += n;
+    if (last) {
+        // The last chunk's row is the prompt's last row, so it carries the
+        // first decode token's logits. One download per sequence, as the
+        // serial path does.
+        be_->sync();
+        be_->download_f32(s.logits.data(), ws_logits_, n_vocab_);
+        s.prefill = false;
+        s.steps = 0;
+        s.decode_t0 = std::chrono::steady_clock::now();
+    }
+    return true;
+}
+
+void Engine::batch_finalize(i32 index) {
+    if (!batch_run_) return;
+    if (index < 0 || static_cast<size_t>(index) >= batch_run_->seqs.size()) return;
+    BatchRun::Seq &s = *batch_run_->seqs[static_cast<size_t>(index)];
+    if (s.done) return;
+    // Every sequence ends with its stream closed, whether it stopped, hit the
+    // limit, or was cancelled -- the same contract the serial loop has.
+    if (s.emit) s.emit->finish(s.res->finish == FinishStop);
+    s.res->prefill_ms = s.prefill_ms;
+    // Per sequence now, not the whole loop's wall time: a sequence that joined
+    // an hour into a session must not report the session's decode time.
+    s.res->decode_ms = std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - s.decode_t0)
+                           .count();
+    s.res->decode_steps = s.steps;
+    if (!s.res->tokens.empty() || !s.res->text.empty() || s.res->generated > 0)
+        s.res->text = tok_.decode(s.res->tokens.data(),
+                                  static_cast<int>(s.res->tokens.size()));
+    if (s.res->finish != FinishError)
+        KRK_DEBUG("slot %d: %d prompt + %d generated token(s), %lld batched step(s)",
+                  static_cast<int>(s.slot), s.res->prompt_tokens, s.res->generated,
+                  static_cast<long long>(s.steps));
+    batch_run_->slot_used[static_cast<size_t>(s.slot)] = false;
+    s.done = true;
+    s.active = false;
+}
+
+bool Engine::batch_step(std::vector<i32> *finished) {
+    if (!batch_run_) return false;
+    BatchRun &run = *batch_run_;
+    i32 active = 0;
+    for (const auto &sp : run.seqs)
+        if (sp->active) active++;
+    if (active == 0) return true;
+
+    // 0. prefill: one chunk of the oldest waiting prompt, then decode.
+    //
+    // One chunk per step keeps the promise that a decode iteration never waits
+    // longer than a single chunk for a new request, no matter how long its
+    // prompt is. When nothing is decoding there is nobody to starve, so the
+    // prompt is drained in the same call -- otherwise a cold server would
+    // prefill one chunk per step for no reason.
+    bool had_decoders = false;
+    for (const auto &sp : run.seqs) {
+        if (sp->active && !sp->prefill) { had_decoders = true; break; }
+    }
+    for (;;) {
+        i32 waiting = -1;
+        for (size_t i = 0; i < run.seqs.size(); i++) {
+            const BatchRun::Seq &s = *run.seqs[i];
+            if (s.active && s.prefill) { waiting = static_cast<i32>(i); break; }
+        }
+        if (waiting < 0) break;
+        // A cancelled or failed chunk leaves the sequence inactive, so the next
+        // pass of this loop skips it and phase 3 finalizes it.
+        batch_prefill_slice(waiting);
+        // One chunk per step while somebody is decoding; drain every waiting
+        // prompt when there was no decoder at entry, because then there is no
+        // one to starve and a cold server would otherwise spend one step per
+        // chunk for nothing.
+        if (had_decoders) break;
+    }
+
+    // 1. each active sequence picks its next token from its own row
+    for (size_t i = 0; i < run.seqs.size(); i++) {
+        BatchRun::Seq &s = *run.seqs[i];
+        if (!s.active || s.prefill) continue;
+        const GenerateParams &p = *s.p;
+        const i32 token = s.sampler.sample(s.logits.data(), n_vocab_);
+        if (token == tok_.eos()) {
+            s.res->finish = FinishEos;
+            s.active = false;
+            continue;
+        }
+        // accept() streams the delta and reports a stop string OR the caller's
+        // cancellation; both end this sequence and both have recorded the token.
+        if (s.emit->accept(token)) {
+            s.res->finish = FinishStop;
+            s.active = false;
+            continue;
+        }
+        if (s.res->generated >= p.max_tokens) {
+            s.res->finish = FinishLength;
+            s.active = false;
+            continue;
+        }
+        if (s.pos >= kv_cap_) {
+            s.res->finish = FinishContext;
+            s.active = false;
+            continue;
+        }
+        s.ids.push_back(token);
+        s.pending = token;
+    }
+
+    // 2. one forward for whatever is still active
+    run.tokens.clear();
+    run.samples.clear();
+    run.row_slot.clear();
+    run.row_pos.clear();
+    for (size_t i = 0; i < run.seqs.size(); i++) {
+        BatchRun::Seq &s = *run.seqs[i];
+        if (!s.active || s.prefill) continue;
+        run.tokens.push_back(s.pending);
+        run.row_slot.push_back(s.slot);
+        run.row_pos.push_back(s.pos);
+        run.samples.push_back(static_cast<i32>(i));
+    }
+    bool ok = true;
+    if (!run.tokens.empty()) {
+        BatchRowsGuard guard{&fwd_row_slot_, &fwd_row_pos_};
+        fwd_row_slot_ = run.row_slot.data();
+        fwd_row_pos_ = run.row_pos.data();
+        ok = forward(run.tokens.data(), static_cast<i32>(run.tokens.size()), 0,
+                     false);
+        fwd_row_slot_ = nullptr;
+        fwd_row_pos_ = nullptr;
+        if (ok) {
+            // Rows are read out one at a time: head_compute projects row r from
+            // the final residual, and every row lands in the same workspace
+            // buffer, so the copy has to happen between them.
+            for (size_t r = 0; r < run.samples.size(); r++) {
+                BatchRun::Seq &s = *run.seqs[static_cast<size_t>(run.samples[r])];
+                head_compute(static_cast<i32>(r));
+                be_->sync();
+                be_->download_f32(s.logits.data(), ws_logits_, n_vocab_);
+                s.pos++;
+                s.steps++;
+            }
+        } else {
+            const std::string msg = forward_failure_error();
+            for (auto &sp : run.seqs) {
+                BatchRun::Seq &s = *sp;
+                if (!s.active) continue;
+                s.res->error = msg;
+                s.res->finish = FinishError;
+                s.active = false;
+            }
+        }
+    }
+
+    // 3. anything that stopped -- by EOS, stop string, length, context, or the
+    //    failure above -- leaves the session here, and its slot becomes free for
+    //    the next admission.
+    for (size_t i = 0; i < run.seqs.size(); i++) {
+        BatchRun::Seq &s = *run.seqs[i];
+        if (s.active || s.done) continue;
+        batch_finalize(static_cast<i32>(i));
+        if (finished) finished->push_back(static_cast<i32>(i));
+    }
+    return ok;
+}
+
+i32 Engine::batch_active() const {
+    if (!batch_run_) return 0;
+    i32 n = 0;
+    for (const auto &sp : batch_run_->seqs)
+        if (sp->active) n++;
+    return n;
+}
+
+i32 Engine::batch_free_slots() const {
+    if (!batch_run_) return 0;
+    i32 n = 0;
+    for (bool used : batch_run_->slot_used)
+        if (!used) n++;
+    return n;
+}
+
+const GenerateResult *Engine::batch_seq_result(i32 i) const {
+    if (!batch_run_ || i < 0 || static_cast<size_t>(i) >= batch_run_->seqs.size())
+        return nullptr;
+    return batch_run_->seqs[static_cast<size_t>(i)]->res;
+}
+
+void Engine::batch_close() {
+    if (!batch_run_) return;
+    // A sequence still attached here ended without a step of its own (the
+    // caller stopped the loop early). Its stream is closed and its slot
+    // released the same way a normal finish is, so a closed session leaves no
+    // KV region marked in use.
+    for (size_t i = 0; i < batch_run_->seqs.size(); i++) {
+        BatchRun::Seq &s = *batch_run_->seqs[i];
+        if (s.active) {
+            s.active = false;
+            if (s.res->finish != FinishError) s.res->finish = FinishStop;
+        }
+        if (!s.done) batch_finalize(static_cast<i32>(i));
+    }
+    kv_pos_ = 0;
+    for (const auto &sp : batch_run_->seqs) kv_pos_ = std::max(kv_pos_, sp->pos);
+    delete batch_run_;
+    batch_run_ = nullptr;
+}
+
 bool Engine::generate_batch(const std::vector<GenerateParams> &reqs,
                             std::vector<GenerateResult> *outs) {
     KRK_TRACE_COMP("generate-batch");
@@ -15713,15 +16132,6 @@ bool Engine::generate_batch(const std::vector<GenerateParams> &reqs,
             ok = generate(reqs[i], &(*outs)[i]) && ok;
         return ok;
     }
-    const std::string why = batch_refusal();
-    if (!why.empty()) {
-        for (GenerateResult &r : *outs) {
-            r.finish = FinishError;
-            r.error = why;
-        }
-        KRK_ERROR("batched generation refused: %s", why.c_str());
-        return false;
-    }
     if (static_cast<i32>(reqs.size()) > n_slots_) {
         const std::string msg =
             "a wave of " + std::to_string(reqs.size()) + " request(s) does not fit " +
@@ -15734,224 +16144,34 @@ bool Engine::generate_batch(const std::vector<GenerateParams> &reqs,
         return false;
     }
 
-    // The batch is a new set of sequences: the same reset every single-sequence
-    // run does, because the rows below are about to be rewritten.
-    kv_pos_ = 0;
-    mtp_fed_ = 0;
-    if (trace_hash_on_) trace_stage_.clear();
-    if (!comp_nblocks_.empty()) compressed_reset();
-    if (moe_predict_enabled_) moe_predictor_.reset();
-    moe_predict_ids_.clear();
-
-    struct Seq {
-        const GenerateParams *p = nullptr;
-        GenerateResult *res = nullptr;
-        std::vector<i32> ids;      // prompt + accepted tokens
-        std::vector<f32> logits;   // this sequence's logits row
-        Sampler sampler;
-        std::unique_ptr<TokenEmitter> emit;
-        i64 pos = 0;               // next position to append
-        i32 slot = -1;
-        i32 pending = -1;          // token to feed on the next batched step
-        bool active = false;
-        i64 steps = 0;
-        f64 prefill_ms = 0.0;
-    };
-    std::vector<Seq> seqs(reqs.size());
-
-    // ---- tokenize, and give each sequence its slot -------------------------
+    // The wave is a session that admits everything up front and runs to the end:
+    // one code path, so a bug fixed here is fixed for the server's incremental
+    // admission too.
+    std::string err;
+    if (!batch_open(&err)) {
+        for (GenerateResult &r : *outs) {
+            r.finish = FinishError;
+            r.error = err;
+        }
+        KRK_ERROR("batched generation refused: %s", err.c_str());
+        return false;
+    }
+    bool ok = true;
     for (size_t i = 0; i < reqs.size(); i++) {
-        Seq &s = seqs[i];
-        s.p = &reqs[i];
-        s.res = &(*outs)[i];
-        s.slot = static_cast<i32>(i);
-        if (tokenize_prompt(reqs[i].prompt, s.ids) < 0) {
-            s.res->finish = FinishError;
-            s.res->error = "prompt could not be tokenized";
-            continue;
-        }
-        if (s.ids.empty()) {
-            s.res->finish = FinishError;
-            s.res->error = "prompt encoded to zero tokens";
-            continue;
-        }
-        if (static_cast<i64>(s.ids.size()) > kv_cap_) {
-            s.ids.resize(static_cast<size_t>(kv_cap_));
-            KRK_WARN("prompt truncated to the %lld-token context (slot %d)",
-                     static_cast<long long>(kv_cap_), static_cast<int>(s.slot));
-        }
-        s.res->prompt_tokens = static_cast<i32>(s.ids.size());
-        s.sampler.reset(reqs[i].sampler);
-        s.sampler.accept(s.ids.data(), static_cast<int>(s.ids.size()));
-        s.emit.reset(new TokenEmitter(reqs[i], tok_, s.sampler, s.res, s.ids));
-        s.logits.assign(static_cast<size_t>(n_vocab_), 0.0f);
-        s.pos = static_cast<i64>(s.ids.size());
-        s.active = true;
-    }
-
-    std::vector<i32> row_slot;
-    std::vector<i64> row_pos;
-    BatchRowsGuard guard{&fwd_row_slot_, &fwd_row_pos_};
-
-    // ---- prefill, one sequence at a time ----------------------------------
-    // A prefill's rows are consecutive positions of ONE sequence, so it cannot
-    // share a pass with another sequence's rows: interleaving them would put
-    // two histories in one chunk for no gain (the GEMM is already n rows wide).
-    // The rows still go through the slot table, which is what puts this
-    // sequence's KV in its own region.
-    expert_phase(ExpertCache::PhasePrefill);
-    krk::HostTime::set_phase(krk::HostTime::kPrefill);
-    for (Seq &s : seqs) {
-        if (!s.active) continue;
-        const Timer pt;
-        fwd_row_slot_ = nullptr;
-        fwd_row_pos_ = nullptr;
-        for (i64 off = 0; off < static_cast<i64>(s.ids.size()); off += chunk_) {
-            if (cancel_requested(*s.p)) {
-                mark_cancelled(*s.p, s.res, off);
-                s.active = false;
-                break;
-            }
-            const i32 n = static_cast<i32>(std::min<i64>(
-                chunk_, static_cast<i64>(s.ids.size()) - off));
-            row_slot.assign(static_cast<size_t>(n), s.slot);
-            row_pos.resize(static_cast<size_t>(n));
-            for (i32 t = 0; t < n; t++) row_pos[static_cast<size_t>(t)] = off + t;
-            fwd_row_slot_ = row_slot.data();
-            fwd_row_pos_ = row_pos.data();
-            const bool last = (off + n) == static_cast<i64>(s.ids.size());
-            if (!forward(s.ids.data() + off, n, static_cast<i32>(off), last)) {
-                s.res->error = forward_failure_error();
-                s.res->finish = FinishError;
-                s.active = false;
-                fwd_row_slot_ = nullptr;
-                fwd_row_pos_ = nullptr;
-                break;
-            }
-        }
-        fwd_row_slot_ = nullptr;
-        fwd_row_pos_ = nullptr;
-        s.prefill_ms = pt.ms();
-        if (!s.active) continue;
-        // The last chunk's row is the prompt's last row, so it is the one the
-        // first decode token comes from. One download per sequence, exactly as
-        // the serial path does it.
-        be_->sync();
-        be_->download_f32(s.logits.data(), ws_logits_, n_vocab_);
-        s.steps = 0;
-    }
-    krk::HostTime::set_phase(krk::HostTime::kDecode);
-    expert_phase(ExpertCache::PhaseDecode);
-
-    // ---- the batched decode loop ------------------------------------------
-    // One forward per step for the whole active set, each row at its own
-    // position in its own KV region. The per-row arithmetic is the same kernels
-    // in the same order as a solo run -- which is why the tokens agree -- and
-    // the weight read is the share.
-    const Timer decode_timer;
-    std::vector<i32> tokens;
-    std::vector<i32> samples;
-    while (true) {
-        const i32 active = static_cast<i32>(std::count_if(
-            seqs.begin(), seqs.end(), [](const Seq &s) { return s.active; }));
-        if (active == 0) break;
-
-        // 1. each active sequence picks its next token from its own row
-        for (Seq &s : seqs) {
-            if (!s.active) continue;
-            const GenerateParams &p = *s.p;
-            const i32 token = s.sampler.sample(s.logits.data(), n_vocab_);
-            if (token == tok_.eos()) {
-                s.res->finish = FinishEos;
-                s.active = false;
-                continue;
-            }
-            // accept() streams the delta and reports a stop string OR the
-            // caller's cancellation; both end this sequence, and both have
-            // already recorded the token.
-            if (s.emit->accept(token)) {
-                s.res->finish = FinishStop;
-                s.active = false;
-                continue;
-            }
-            if (s.res->generated >= p.max_tokens) {
-                s.res->finish = FinishLength;
-                s.active = false;
-                continue;
-            }
-            if (s.pos >= kv_cap_) {
-                s.res->finish = FinishContext;
-                s.active = false;
-                continue;
-            }
-            s.ids.push_back(token);
-            s.pending = token;
-        }
-
-        // 2. one forward for whatever is still active
-        tokens.clear();
-        samples.clear();
-        row_slot.clear();
-        row_pos.clear();
-        for (Seq &s : seqs) {
-            if (!s.active) continue;
-            tokens.push_back(s.pending);
-            row_slot.push_back(s.slot);
-            row_pos.push_back(s.pos);
-            samples.push_back(static_cast<i32>(&s - seqs.data()));
-        }
-        if (tokens.empty()) break;
-        fwd_row_slot_ = row_slot.data();
-        fwd_row_pos_ = row_pos.data();
-        const bool ok = forward(tokens.data(), static_cast<i32>(tokens.size()), 0,
-                                false);
-        fwd_row_slot_ = nullptr;
-        fwd_row_pos_ = nullptr;
-        if (!ok) {
-            const std::string msg = forward_failure_error();
-            for (Seq &s : seqs) {
-                if (!s.active) continue;
-                s.res->error = msg;
-                s.res->finish = FinishError;
-                s.active = false;
-            }
-            break;
-        }
-        // Rows are read out one at a time: head_compute projects row r from
-        // the final residual, and the row lands in the same workspace buffer
-        // for every row, so the copy has to happen between them.
-        for (size_t r = 0; r < samples.size(); r++) {
-            Seq &s = seqs[static_cast<size_t>(samples[r])];
-            head_compute(static_cast<i32>(r));
-            be_->sync();
-            be_->download_f32(s.logits.data(), ws_logits_, n_vocab_);
-            s.pos++;
-            s.steps++;
+        std::string why;
+        if (!batch_join(reqs[i], &(*outs)[i], &why)) {
+            KRK_ERROR("batched generation refused: %s", why.c_str());
+            ok = false;
         }
     }
-
-    // Every sequence ends with its stream closed, whether it stopped, hit the
-    // limit, or was cancelled -- the same contract the serial loop has.
-    for (Seq &s : seqs) {
-        if (s.emit) s.emit->finish(s.res->finish == FinishStop);
+    std::vector<i32> finished;
+    // A join that failed is already final; the loop runs until nothing is left.
+    while (ok && batch_active() > 0) {
+        finished.clear();
+        if (!batch_step(&finished)) ok = false;
     }
-    kv_pos_ = 0;
-    for (Seq &s : seqs) kv_pos_ = std::max(kv_pos_, s.pos);
-
-    const f64 total_ms = decode_timer.ms();
-    for (Seq &s : seqs) {
-        if (!s.res->tokens.empty() || !s.res->text.empty() || s.res->generated > 0)
-            s.res->text = tok_.decode(s.res->tokens.data(),
-                                      static_cast<int>(s.res->tokens.size()));
-        s.res->prefill_ms = s.prefill_ms;
-        s.res->decode_ms = total_ms;
-        s.res->decode_steps = s.steps;
-        if (s.res->finish == FinishError) continue;
-        KRK_DEBUG("slot %d: %d prompt + %d generated token(s), %lld batched step(s)",
-                  static_cast<int>(s.slot), s.res->prompt_tokens, s.res->generated,
-                  static_cast<long long>(s.steps));
-    }
-    return true;
+    batch_close();
+    return ok;
 }
 
 } // namespace krk

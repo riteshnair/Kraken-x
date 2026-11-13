@@ -307,15 +307,29 @@ curl -N http://127.0.0.1:8080/v1/chat/completions \
 ```
 
 A failed streaming write raises the request cancellation flag and stops decoding
-at the next token. Prefix reuse can avoid repeated prefill for matching prompts.
-Cached token usage is an execution metric, not evidence of response correctness.
-The held prefix is not a general radix tree.
+at the next token. Prefix reuse avoids repeated prefill for the part of a prompt
+that matches the previous run's rows: the shared part does not have to be the
+whole record, so two turns that share a system prompt and diverge after it reuse
+the shared part and prefill only the rest. One token is always prefilled, because
+the row a run samples from is the row its last prefill produces. Cached token
+usage is an execution metric, not evidence of response correctness, and it is
+`0` on the batch path, where every slot is written from row 0 of its own region.
+The held prefix is one record, not a general radix tree: a second branch's rows
+cannot stay resident beside the first.
 
 Available endpoints are `/`, `/health`, `/v1/models`, `/v1/tools/rv32`,
-`/v1/completions`, and `/v1/chat/completions`. The service loads one model and
-serializes generation. The engine also has a constrained multi-sequence API, but
-it excludes incompatible per-sequence state and is not exposed as unrestricted
-continuous batching by this server.
+`/v1/completions`, and `/v1/chat/completions`. The service loads one model.
+
+With more than one KV slot it decodes several requests in one pass and admits a
+new request between steps, so a request arriving mid-generation waits for one
+step rather than for the running set to drain. The admitted prompt is prefilled
+one `--chunk` slice per step: while anything is decoding, a step spends one
+slice on the waiting prompt and the rest of its time on the decoders, so a long
+prompt costs them one chunk of delay, not one prompt. With nothing decoding, the
+prompt is drained in the same call, because then there is nobody to starve. The batch is constrained: the
+engine refuses models and features whose state is per sequence rather than per
+row, and prefix reuse applies only to the serial path. This is iteration-level
+admission over that constrained batch, not unrestricted continuous batching.
 
 ## 7. Testing
 

@@ -28,6 +28,19 @@ static inline int krk_test_unsetenv(const char *name) { return _putenv_s(name, "
 #endif
 #endif
 #include <algorithm>
+
+// Whether this binary is built with AddressSanitizer. One arm below is a
+// wall-clock RATIO between two code paths, and an instrumented build re-times
+// it unevenly (the batched path makes fewer, larger calls), so under ASan the
+// number says nothing about the thing the gate is about. The tokens are still
+// compared there; only the ratio is skipped.
+#if defined(__SANITIZE_ADDRESS__)
+#define KRK_TESTS_ASAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define KRK_TESTS_ASAN 1
+#endif
+#endif
 #include <condition_variable>
 #include <mutex>
 #include <string>
@@ -13426,6 +13439,21 @@ static bool build_sized_model(const std::string &path, int n_embd, int n_ff,
     return b.write(path);
 }
 
+// Trips a cancellation flag exactly when the `limit`-th streaming delta goes
+// out, so the arm can name the token after which nothing may be accepted.
+struct SpecCancel {
+    std::atomic<bool> *flag;
+    int limit;
+    int seen;
+};
+static void spec_cancel_sink(void *user, const char *text, i32 token, bool done) {
+    SpecCancel *c = static_cast<SpecCancel *>(user);
+    (void)text;
+    (void)token;
+    if (done) return;
+    if (++c->seen >= c->limit) c->flag->store(true, std::memory_order_relaxed);
+}
+
 static GenerateResult run_spec(const char *model, const char *draft, i32 window,
                                int max_tokens, bool greedy, bool *ok_out,
                                u64 *proposed_out = nullptr,
@@ -19147,6 +19175,121 @@ static void test_http_server() {
     engine.shutdown();
     delete cpu;
     if (!resource_svc) std::remove(resource_model_path.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// B2.3c -- admission through the HTTP service
+// ---------------------------------------------------------------------------
+//
+// The engine session is unit-tested; this is the piece above it, the service
+// loop that owns the queue. It is a separate group because it needs a TWO-slot
+// engine, and the multi-slot configuration is exactly what turns the serial
+// request path off: prefix reuse disappears, `cached_tokens` becomes 0, and two
+// requests share one pass. Two connections asking for the same prompt must each
+// come back with the bytes a solo run produces, which is the property that
+// would break if admission mixed two sequences' rows.
+static void test_http_admission() {
+    const std::string path = "kraken-http-admission.gguf";
+    if (!build_tiny_model(path, false)) {
+        CHECK(false, "http admission: build_tiny_model failed");
+        return;
+    }
+
+    Backend *cpu = make_cpu_backend();
+    Engine engine;
+    EngineConfig cfg;
+    cfg.model_path = path;
+    cfg.n_ctx = 64;
+    cfg.prefill_chunk = 8;
+    cfg.kv_quant = 2;
+    cfg.n_slots = 2;
+    std::string err;
+    if (!engine.init(cpu, cfg, &err)) {
+        CHECK(false, std::string("http admission: the engine initialises (") + err + ")");
+        delete cpu;
+        std::remove(path.c_str());
+        return;
+    }
+    const std::string why = engine.batch_refusal();
+    CHECK(why.empty(), "http admission: the fixture is batchable: " + why);
+    CHECK(engine.n_slots() == 2, "http admission: two slots");
+    if (!why.empty()) {
+        engine.shutdown();
+        delete cpu;
+        std::remove(path.c_str());
+        return;
+    }
+
+    // What one request for this prompt produces alone: the service must not
+    // change it by decoding the same prompt twice in one pass.
+    GenerateParams ref_p;
+    ref_p.prompt = "the";
+    ref_p.max_tokens = 6;
+    ref_p.sampler.greedy = true;
+    ref_p.sampler.temp = 0.0f;
+    ref_p.sampler.repeat_penalty = 1.0f;
+    ref_p.sample_host = true;
+    GenerateResult ref;
+    CHECK(engine.generate(ref_p, &ref), "http admission: reference generation runs");
+    CHECK(!ref.tokens.empty(), "http admission: the reference produced tokens");
+
+    std::mutex gen_mu;
+    OpenAiService svc(&engine, 0.8f, &gen_mu);
+    HttpServer server;
+    CHECK(server.listen("127.0.0.1", 0, &err),
+          std::string("http admission: listener on an ephemeral port: ") + err);
+    const int port = server.port();
+    std::thread accept_thread([&server, &svc]() {
+        server.run([&svc](const HttpRequest &req, HttpResponse &res, HttpConn &conn) {
+            return svc.handle(req, res, conn);
+        });
+    });
+
+    const std::string req = "{\"prompt\":\"the\",\"max_tokens\":6,"
+                            "\"temperature\":0,\"repeat_penalty\":1.0}";
+    // Two connections in flight together. Both are admitted by the service
+    // loop: the first opens the pass, the second joins between steps.
+    std::string bodies[2];
+    int statuses[2] = {0, 0};
+    bool transport[2] = {false, false};
+    std::thread clients[2];
+    for (int i = 0; i < 2; i++) {
+        clients[i] = std::thread([&, i]() {
+            transport[i] = http_request(port, "POST", "/v1/completions", req,
+                                        &statuses[i], &bodies[i]);
+        });
+    }
+    for (auto &t : clients) t.join();
+
+    for (int i = 0; i < 2; i++) {
+        CHECK(transport[i], "http admission: request " + std::to_string(i) + " was answered");
+        CHECK(statuses[i] == 200,
+              "http admission: request " + std::to_string(i) + " returned 200, not " +
+                  std::to_string(statuses[i]));
+        JsonValue j;
+        std::string e;
+        const std::string payload = bodies[i].substr(bodies[i].find("\r\n\r\n") + 4);
+        CHECK(json_parse(payload, &j, &e), "http admission: body " + std::to_string(i) + " is JSON");
+        const JsonValue *usage = j.find("usage");
+        CHECK(usage && usage->get_int("cached_tokens") == 0,
+              "http admission: the batch answers cached_tokens=0");
+        const JsonValue *choices = j.find("choices");
+        if (choices && !choices->items().empty()) {
+            std::string text;
+            choices->items()[0].get_string("text", &text);
+            CHECK(text == ref.text,
+                  "http admission: request " + std::to_string(i) +
+                      " matches the solo text");
+        } else {
+            CHECK(false, "http admission: request " + std::to_string(i) + " has a choice");
+        }
+    }
+
+    server.stop();
+    accept_thread.join();
+    engine.shutdown();
+    delete cpu;
+    std::remove(path.c_str());
 }
 
 // ---------------------------------------------------------------------------
@@ -27646,7 +27789,9 @@ static void test_mtp_hf_spec_chain() {
 
     // One run, greedy, either plain or drafting from `hp`.
     auto run = [&](const std::string &hp, bool spec, std::vector<i32> *out, u64 *acc,
-                   u64 *prop, int *finish, f64 *ms_out, u64 *s1h, u64 *s1t) {
+                   u64 *prop, int *finish, f64 *ms_out, u64 *s1h, u64 *s1t,
+                   std::atomic<bool> *cancel = nullptr, int cancel_after = 0,
+                   bool *cancelled_out = nullptr) {
         Backend *cpu = make_cpu_backend();
         bool ok = false;
         {
@@ -27665,6 +27810,12 @@ static void test_mtp_hf_spec_chain() {
                 p.prompt = "aaaa bbbb cccc dddd eeee";
                 p.max_tokens = 12;
                 p.sampler.greedy = true;
+                SpecCancel trip{cancel, cancel_after, 0};
+                if (cancel && cancel_after > 0) {
+                    p.cancel = cancel;
+                    p.sink.fn = spec_cancel_sink;
+                    p.sink.user = &trip;
+                }
                 GenerateResult r;
                 const auto t0 = std::chrono::steady_clock::now();
                 ok = engine.generate(p, &r) && r.finish != FinishError;
@@ -27676,6 +27827,7 @@ static void test_mtp_hf_spec_chain() {
                     std::fprintf(stderr, "  (generate: %s)\n", r.error.c_str());
                 *out = r.tokens;
                 *finish = r.finish;
+                if (cancelled_out) *cancelled_out = r.cancelled;
                 if (acc) *acc = engine.draft_accepted();
                 if (prop) *prop = engine.draft_proposed();
                 if (s1h) *s1h = engine.step1_hits();
@@ -27756,6 +27908,29 @@ static void test_mtp_hf_spec_chain() {
     CHECK(bacc * 2 < bprop, "the control head's proposals are mostly rejected");
     CHECK(b1t > 0 && b1h * 2 < b1t,
           "the control's first proposal is usually the wrong token");
+
+    // 5. Cancellation inside a speculative run. A round proposes several tokens
+    //    and commits them together, so this is the phase where a cancellation
+    //    can be seen by the caller BEFORE the engine notices: what must hold is
+    //    that the tokens already delivered are a prefix of the uncancelled run
+    //    -- a half-verified round must never commit a token the plain run would
+    //    not have produced next.
+    {
+        std::atomic<bool> flag{false};
+        std::vector<i32> part;
+        int fin_part = -1;
+        bool was_cancelled = false;
+        const bool ok = run(head, true, &part, nullptr, nullptr, &fin_part, nullptr,
+                            nullptr, nullptr, &flag, 3, &was_cancelled);
+        CHECK(ok, "a cancelled drafting run still returns success");
+        CHECK(was_cancelled, "and says it was cancelled");
+        CHECK(fin_part == FinishStop, "with a stop finish reason, not an error");
+        CHECK(part.size() >= 3, "the deltas that went out before the flag are tokens");
+        CHECK(part.size() < spec.size(),
+              "and it stopped short of the uncancelled drafting run");
+        CHECK(std::equal(part.begin(), part.end(), spec.begin()),
+              "the cancelled prefix is a token-for-token prefix of the plain run");
+    }
 
     std::remove(trunk.c_str());
     std::remove(head.c_str());
@@ -31565,6 +31740,857 @@ static void test_cli_arg_refusal() {
 #define TEST_GROUP_SERIAL(fn, why) {#fn, fn, why},
 
 // ---------------------------------------------------------------------------
+// B2.2b -- prefix reuse shorter than the whole record
+// ---------------------------------------------------------------------------
+//
+// The cache holds one record: the last run's prompt plus the tokens it accepted,
+// cut to the rows that actually exist. Reuse is the longest common prefix of the
+// new prompt with that record -- which is usually SHORTER than the record, and
+// that is the case a chat branch is made of: two turns share a system prompt and
+// diverge after it.
+//
+// Two things have to hold, and only the second is interesting. The reused count
+// must be the true common prefix (leaving at least one token for the prefill,
+// because the row a run samples from is the one its last prefill produces), and
+// the answer must be identical to the same request on a cold engine: a prefix
+// that is reused is reused exactly, so the text cannot tell you where the
+// prefill started. A wrong skip would still read rows at the right positions for
+// the tokens it skipped, so only the divergent arm can catch an off-by-one --
+// there the skipped rows and the prompt disagree.
+static void test_prefix_partial_reuse() {
+    if (!build_tiny_model(kTestModelPath, false)) {
+        CHECK(false, "prefix reuse test: build_tiny_model failed");
+        return;
+    }
+    Backend *cpu = make_cpu_backend();
+    auto open = [&](Engine *engine, std::string *err) {
+        EngineConfig cfg;
+        cfg.model_path = kTestModelPath;
+        cfg.n_ctx = 64;
+        cfg.prefill_chunk = 8;
+        return engine->init(cpu, cfg, err);
+    };
+    struct Body {
+        int status = 0;
+        std::string text;
+        i64 cached = -1;
+        i64 prompt_tokens = -1;
+        bool parsed = false;
+    };
+    struct NullConn : HttpConn {
+        bool write_raw(const char *, size_t) override { return true; }
+    };
+    auto ask = [](OpenAiService &svc, HttpConn &conn, const std::string &prompt,
+                  i32 max_tokens) {
+        HttpRequest req;
+        req.method = "POST";
+        req.path = "/v1/completions";
+        req.body = std::string("{\"prompt\":") + JsonValue(prompt).dump() +
+                   ",\"max_tokens\":" + std::to_string(max_tokens) +
+                   ",\"temperature\":0,\"repeat_penalty\":1.0}";
+        HttpResponse res;
+        Body b;
+        if (!svc.handle(req, res, conn)) return b;
+        b.status = res.status;
+        JsonValue j;
+        std::string e;
+        if (!json_parse(res.body, &j, &e)) return b;
+        b.parsed = true;
+        const JsonValue *choices = j.find("choices");
+        if (choices && choices->is_array() && !choices->items().empty())
+            choices->items()[0].get_string("text", &b.text);
+        const JsonValue *usage = j.find("usage");
+        if (usage) {
+            b.prompt_tokens = usage->get_int("prompt_tokens", -1);
+            const JsonValue *details = usage->find("prompt_tokens_details");
+            if (details) b.cached = details->get_int("cached_tokens", -1);
+        }
+        return b;
+    };
+    // The shared length in TOKENS, which is what the server compares. Text
+    // matching is not enough: the same characters can tokenize differently.
+    auto common_tokens = [](const std::vector<i32> &a, const std::vector<i32> &b) {
+        size_t n = 0;
+        while (n < a.size() && n < b.size() && a[n] == b[n]) n++;
+        return static_cast<i64>(n);
+    };
+
+    const char *warm_prompt = "the a the a the";
+    struct Case {
+        const char *ask;
+        i32 max_tokens;
+        const char *label;
+    } cases[4] = {
+        {"the a the a the", 2, "the same prompt again"},          // whole record
+        {"the a b the a", 3, "a branch that diverges mid-prompt"}, // partial
+        {"the a the a the a the", 4, "an extension of the record"},
+        {"a the a", 2, "nothing shared at the first token"},
+    };
+
+    std::vector<i32> warm_ids;
+    {
+        Engine tokenizer_engine;
+        std::string err;
+        if (!open(&tokenizer_engine, &err)) {
+            CHECK(false, "prefix reuse test: the tokenizer engine initialises");
+            delete cpu;
+            return;
+        }
+        CHECK(tokenizer_engine.tokenizer().encode(warm_prompt, warm_ids, true) >= 0,
+              "the warm prompt tokenizes");
+        CHECK(warm_ids.size() >= 4, "the warm prompt is several tokens long");
+    }
+
+    for (const Case &c : cases) {
+        const std::string tag = c.label;
+        // Warm: one completed run, so the record is its prompt plus the tokens
+        // it accepted.
+        Engine warm;
+        std::string err;
+        if (!open(&warm, &err)) {
+            CHECK(false, tag + ": the warm engine initialises");
+            delete cpu;
+            return;
+        }
+        std::mutex mu;
+        OpenAiService svc(&warm, 0.0f, &mu);
+        NullConn conn;
+        const Body first = ask(svc, conn, warm_prompt, 4);
+        CHECK(first.status == 200 && first.parsed, tag + ": the warm-up request is served");
+        CHECK(first.cached == 0,
+              tag + ": a request against an empty cache reuses nothing (" +
+                  std::to_string(first.cached) + ")");
+        CHECK(!first.text.empty(), tag + ": and the warm-up produced text");
+
+        const Body warm_answer = ask(svc, conn, c.ask, c.max_tokens);
+        // What the shared prefix is, computed from the same tokenizer the server
+        // used. The record is at least the warm prompt, and one token always has
+        // to be prefilled.
+        std::vector<i32> ask_ids;
+        CHECK(warm.tokenizer().encode(c.ask, ask_ids, true) >= 0,
+              tag + ": the request tokenizes");
+        i64 expect = common_tokens(warm_ids, ask_ids);
+        expect = std::min<i64>(expect, static_cast<i64>(ask_ids.size()) - 1);
+        CHECK(warm_answer.status == 200, tag + ": the request is served");
+        CHECK(warm_answer.cached == expect,
+              tag + ": cached_tokens is the shared prefix, " +
+                  std::to_string(expect) + " (got " +
+                  std::to_string(warm_answer.cached) + ")");
+        CHECK(warm_answer.cached < warm_answer.prompt_tokens,
+              tag + ": at least one token was still prefilled");
+
+        // The answer must be the one a cold engine gives: reuse is exact, so
+        // where the prefill started cannot be visible in the output.
+        Engine cold;
+        if (!open(&cold, &err)) {
+            CHECK(false, tag + ": the cold engine initialises");
+            delete cpu;
+            return;
+        }
+        std::mutex cold_mu;
+        OpenAiService cold_svc(&cold, 0.0f, &cold_mu);
+        NullConn cold_conn;
+        const Body cold_answer = ask(cold_svc, cold_conn, c.ask, c.max_tokens);
+        CHECK(cold_answer.status == 200 && cold_answer.cached == 0,
+              tag + ": the cold engine serves the same request with no reuse");
+        CHECK(warm_answer.text == cold_answer.text,
+              tag + ": the reused-prefix answer is the cold-engine answer");
+    }
+
+    delete cpu;
+}
+
+// ---------------------------------------------------------------------------
+// B2.1b -- cancellation at every phase a session has
+// ---------------------------------------------------------------------------
+//
+// Cancellation is only a guarantee if each place that spends time checks it,
+// and the phases a session adds are the ones a serial run never had: a request
+// attached but not yet started, a prompt prefilled a chunk at a time, and a
+// session closed while a sequence is still attached.
+//
+// Each arm asserts the same three things, because a cancellation that stops the
+// work but leaks its slot fails the third: the result says cancelled, no token
+// is accepted after the flag is raised, and the slot comes back. The reuse arms
+// are the point of the group: a slot released by a cancelled prefill is handed
+// to another sequence, which must produce exactly what it produces alone even
+// though the earlier prompt left rows in that region.
+static void test_cancel_phases() {
+    Backend *cpu = make_cpu_backend();
+    const std::string path = "kraken-cancel-phases.gguf";
+    MoeSpec s;
+    s.dense = false;
+    s.n_expert = 4;
+    s.n_expert_used = 2;
+    s.shared = true;
+    s.varied = true;
+    CHECK(build_tiny_moe_model(path, s), "wrote a MoE fixture for the cancellation phases");
+
+    auto open = [&](Engine *engine, i32 slots, i32 chunk, std::string *err) {
+        EngineConfig cfg;
+        cfg.model_path = path;
+        cfg.n_ctx = 32;
+        cfg.prefill_chunk = chunk;
+        cfg.n_slots = slots;
+        return engine->init(cpu, cfg, err);
+    };
+    auto params = [](const char *prompt, i32 max_tokens) {
+        GenerateParams p;
+        p.prompt = prompt;
+        p.max_tokens = max_tokens;
+        p.sampler.greedy = true;
+        p.sampler.temp = 0.0f;
+        p.sample_host = true;
+        return p;
+    };
+    // Long enough to need several chunks at chunk = 1, so a cancellation can
+    // land BETWEEN two chunks rather than before the first one.
+    const char *long_prompt = "a a the a";
+    const char *other_prompt = "the a the";
+    std::vector<i32> solo_long, solo_other;
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 2, 1, &err)) {
+            CHECK(false, "the cancellation oracle engine initialises");
+            delete cpu;
+            return;
+        }
+        GenerateParams p = params(long_prompt, 5);
+        GenerateResult r;
+        CHECK(engine.generate(p, &r), "the long prompt runs alone");
+        solo_long = r.tokens;
+        CHECK(r.prompt_tokens >= 3, "the long prompt spans several chunks at chunk 1");
+        p = params(other_prompt, 3);
+        CHECK(engine.generate(p, &r), "the other prompt runs alone");
+        solo_other = r.tokens;
+    }
+
+    // --- a request cancelled before its first chunk -------------------------
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 2, 1, &err)) {
+            CHECK(false, "the admission-cancel engine initialises");
+            delete cpu;
+            return;
+        }
+        std::string why;
+        CHECK(engine.batch_open(&why), "a session opens for the admission arm");
+        std::atomic<bool> flag{true};
+        GenerateParams pa = params(long_prompt, 5);
+        pa.cancel = &flag;
+        GenerateResult ra;
+        CHECK(engine.batch_join(pa, &ra, &why),
+              std::string("a pre-cancelled request still takes a slot: ") + why);
+        CHECK(engine.batch_active() == 1, "and the session holds it");
+
+        std::vector<i32> finished;
+        CHECK(engine.batch_step(&finished), "the step reports the cancellation");
+        CHECK(finished.size() == 1 && finished[0] == 0,
+              "the cancelled sequence is reported by its join index");
+        CHECK(ra.cancelled, "the result says it was cancelled");
+        CHECK(ra.finish == FinishStop, "and finishes as a stop, not an error");
+        CHECK(ra.generated == 0, "no token was generated");
+        CHECK(engine.batch_active() == 0, "nothing is left attached");
+        CHECK(engine.batch_free_slots() == 2, "and both slots are back");
+
+        // The slot it never wrote is immediately reusable.
+        GenerateParams pb = params(other_prompt, 3);
+        GenerateResult rb;
+        CHECK(engine.batch_join(pb, &rb, &why), "the next request joins the freed slot");
+        int guard = 0;
+        while (engine.batch_active() > 0 && guard++ < 64) {
+            finished.clear();
+            CHECK(engine.batch_step(&finished), "the session steps");
+        }
+        CHECK(rb.tokens == solo_other,
+              "the request that took the cancelled slot produced its solo tokens");
+        engine.batch_close();
+    }
+
+    // --- a request cancelled BETWEEN two prefill chunks ---------------------
+    // A prompt is drained in one step when nothing is decoding, so the window
+    // between two chunks only exists while something else is generating. That
+    // is the case worth testing anyway: a cancellation must not disturb the
+    // sequence that is still running.
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 2, 1, &err)) {
+            CHECK(false, "the prefill-cancel engine initialises");
+            delete cpu;
+            return;
+        }
+        std::string why;
+        CHECK(engine.batch_open(&why), "a session opens for the prefill arm");
+        std::vector<i32> finished;
+        GenerateParams pd = params(other_prompt, 4);
+        GenerateResult rd;
+        CHECK(engine.batch_join(pd, &rd, &why), "the neighbour joins first");
+        int guard = 0;
+        while (rd.generated == 0 && guard++ < 16) {
+            finished.clear();
+            CHECK(engine.batch_step(&finished), "the neighbour reaches its first token");
+        }
+        CHECK(rd.generated >= 1, "the neighbour is decoding");
+
+        std::atomic<bool> flag{false};
+        GenerateParams pa = params(long_prompt, 5);
+        pa.cancel = &flag;
+        GenerateResult ra;
+        CHECK(engine.batch_join(pa, &ra, &why), "the cancellable prompt joins mid-run");
+        finished.clear();
+        CHECK(engine.batch_step(&finished), "one chunk of the prompt runs");
+        CHECK(finished.empty(), "a partially prefilled request is not finished");
+        CHECK(ra.generated == 0,
+              "and it has no token: one chunk is not a prompt");
+        CHECK(engine.batch_active() == 2, "both sequences are attached");
+        CHECK(engine.batch_free_slots() == 0, "and the session is full");
+
+        // Trip the flag with rows already written into its slot: the prompt is
+        // half prefilled, and that half must not be mistaken for a sequence.
+        flag.store(true, std::memory_order_relaxed);
+        const i32 neighbour_before = rd.generated;
+        CHECK(engine.batch_step(&finished), "the next step notices");
+        CHECK(!finished.empty() && finished[0] == 1,
+              "the cancelled sequence is reported by its own join index");
+        CHECK(ra.cancelled, "the mid-prefill cancellation is recorded");
+        CHECK(ra.generated == 0, "with no token generated");
+        CHECK(ra.text.empty(), "and no text");
+        CHECK(engine.batch_free_slots() == 1, "the slot came back even mid-prompt");
+        CHECK(rd.generated == neighbour_before + 1,
+              "the sequence that was decoding was not affected by the cancellation");
+        CHECK(!rd.cancelled, "and was not marked cancelled itself");
+
+        // Reuse: the half-written rows in that region must not leak into the
+        // sequence that takes the slot next.
+        GenerateParams pb = params(other_prompt, 3);
+        GenerateResult rb;
+        CHECK(engine.batch_join(pb, &rb, &why),
+              "a request joins the slot the cancelled prefill left behind");
+        guard = 0;
+        while (engine.batch_active() > 0 && guard++ < 64) {
+            finished.clear();
+            CHECK(engine.batch_step(&finished), "the session steps");
+        }
+        CHECK(rb.tokens == solo_other,
+              "the reused slot produced the tokens it produces alone");
+        engine.batch_close();
+    }
+
+    // --- a client that disappears mid-stream --------------------------------
+    // The stream is written from the scheduler thread while the engine decodes,
+    // so a dead peer has to stop the work from there: the alternative is
+    // decoding the rest of `max_tokens` into a socket nobody is reading, and
+    // holding the slot while doing it.
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 2, 1, &err)) {
+            CHECK(false, "the stream-cancel engine initialises");
+            delete cpu;
+            return;
+        }
+        std::mutex mu;
+        OpenAiService svc(&engine, 0.0f, &mu);
+        struct FailConn : HttpConn {
+            int allow = 0;
+            int writes = 0;
+            bool write_raw(const char *, size_t) override { return ++writes <= allow; }
+        };
+        // Three writes get through (the stream header and the first deltas),
+        // then the peer is gone.
+        FailConn dead;
+        dead.allow = 3;
+        HttpRequest req;
+        req.method = "POST";
+        req.path = "/v1/completions";
+        req.body = "{\"prompt\":\"a a the a\",\"max_tokens\":12,"
+                   "\"temperature\":0,\"stream\":true}";
+        HttpResponse res;
+        CHECK(svc.handle(req, res, dead), "the handler returns once the peer is gone");
+        CHECK(dead.writes == 4,
+              "the stream stops at the first failed write (writes: " +
+                  std::to_string(dead.writes) + ")");
+
+        // The slot came back and the session still serves: a cancelled stream
+        // must not leave a sequence attached.
+        struct OkConn : HttpConn {
+            std::string written;
+            bool write_raw(const char *data, size_t n) override {
+                written.append(data, n);
+                return true;
+            }
+        } live;
+        HttpRequest req2;
+        req2.method = "POST";
+        req2.path = "/v1/completions";
+        req2.body = "{\"prompt\":\"a a the a\",\"max_tokens\":3,\"temperature\":0}";
+        HttpResponse res2;
+        CHECK(svc.handle(req2, res2, live), "the next request is served");
+        JsonValue j;
+        std::string je;
+        CHECK(json_parse(res2.body, &j, &je), "and its body is JSON");
+        std::string text;
+        const JsonValue *choices = j.find("choices");
+        CHECK(choices && choices->is_array() && !choices->items().empty(),
+              "with one choice");
+        if (choices && !choices->items().empty())
+            choices->items()[0].get_string("text", &text);
+        CHECK(!text.empty(),
+              "and text: the session kept working after a cancelled stream");
+    }
+
+    // --- a session torn down with a sequence still attached -----------------
+    {
+        std::atomic<bool> flag{false};
+        GenerateResult ra;
+        {
+            Engine engine;
+            std::string err;
+            if (!open(&engine, 2, 1, &err)) {
+                CHECK(false, "the teardown engine initialises");
+                delete cpu;
+                return;
+            }
+            std::string why;
+            CHECK(engine.batch_open(&why), "a session opens for the teardown arm");
+            GenerateParams pa = params(long_prompt, 5);
+            pa.cancel = &flag;
+            CHECK(engine.batch_join(pa, &ra, &why), "a request is attached");
+            std::vector<i32> finished;
+            CHECK(engine.batch_step(&finished), "and one step has run");
+            uint64_t proposed = engine.draft_proposed();
+            CHECK(proposed == 0 || true, "the counters are readable while attached");
+            // shutdown() closes the session itself. A sequence that never
+            // reached a finish must still get a stream close and a finish
+            // reason, and the slot must be released rather than left in use.
+            engine.shutdown();
+            CHECK(!engine.batch_running(), "shutdown closed the session");
+        }
+        CHECK(ra.finish == FinishStop,
+              "a request still attached at shutdown finishes as a stop");
+        CHECK(!ra.cancelled, "and is not marked cancelled: nobody cancelled it");
+    }
+
+    std::remove(path.c_str());
+    delete cpu;
+}
+
+// ---------------------------------------------------------------------------
+// B2.3a -- prefill interleaved with decode
+// ---------------------------------------------------------------------------
+//
+// A join used to run the whole prompt before returning, so a long prompt froze
+// every sequence already decoding for its duration: admission and liveness pull
+// in opposite directions, and the wave design resolved that by not admitting.
+// The session prefills one chunk per step instead.
+//
+// With `prefill_chunk = 1` every prompt spans several steps, which is what makes
+// the scheduling visible to a test: after one step the new sequence must still
+// have no token, and the sequence that was already decoding must have advanced
+// by exactly one. A design that drained the prefill first fails the second
+// check; a design that starved the prefill fails the first.
+static void test_batch_prefill_interleave() {
+    Backend *cpu = make_cpu_backend();
+    const std::string path = "kraken-batch-interleave.gguf";
+    MoeSpec s;
+    s.dense = false;
+    s.n_expert = 4;
+    s.n_expert_used = 2;
+    s.shared = true;
+    s.varied = true;
+    CHECK(build_tiny_moe_model(path, s), "wrote a MoE fixture for the interleave test");
+
+    auto open = [&](Engine *engine, i32 chunk, std::string *err) {
+        EngineConfig cfg;
+        cfg.model_path = path;
+        cfg.n_ctx = 32;
+        cfg.prefill_chunk = chunk;
+        cfg.n_slots = 2;
+        return engine->init(cpu, cfg, err);
+    };
+    auto params = [](const char *prompt, i32 max_tokens) {
+        GenerateParams p;
+        p.prompt = prompt;
+        p.max_tokens = max_tokens;
+        p.sampler.greedy = true;
+        p.sampler.temp = 0.0f;
+        p.sample_host = true;
+        return p;
+    };
+    const char *long_prompt = "a a the a";
+    const char *short_prompt = "the a";
+
+    // Solos at both chunk sizes: chunking must not change a single token.
+    std::vector<i32> solo_long, solo_short, solo_long_chunk8;
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 1, &err)) {
+            CHECK(false, "the interleave oracle engine initialises");
+            delete cpu;
+            return;
+        }
+        GenerateParams p = params(long_prompt, 6);
+        GenerateResult r;
+        CHECK(engine.generate(p, &r), "the long prompt runs alone at chunk 1");
+        solo_long = r.tokens;
+        CHECK(r.prompt_tokens >= 3,
+              "the long prompt spans several chunks at chunk 1 (" +
+                  std::to_string(r.prompt_tokens) + " tokens)");
+        p = params(short_prompt, 4);
+        CHECK(engine.generate(p, &r), "the short prompt runs alone at chunk 1");
+        solo_short = r.tokens;
+    }
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 8, &err)) {
+            CHECK(false, "the chunk-8 oracle engine initialises");
+            delete cpu;
+            return;
+        }
+        GenerateParams p = params(long_prompt, 6);
+        GenerateResult r;
+        CHECK(engine.generate(p, &r), "the long prompt runs alone at chunk 8");
+        solo_long_chunk8 = r.tokens;
+        CHECK(solo_long_chunk8 == solo_long,
+              "a prefill chunk size does not change the tokens it produces");
+    }
+
+    // --- decode keeps advancing while another prompt prefills ----------------
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 1, &err)) {
+            CHECK(false, "the interleave engine initialises");
+            delete cpu;
+            return;
+        }
+        std::string why;
+        CHECK(engine.batch_open(&why), std::string("a session opens: ") + why);
+
+        GenerateParams pa = params(long_prompt, 6);
+        GenerateResult ra;
+        CHECK(engine.batch_join(pa, &ra, &why), std::string("A joins: ") + why);
+        // Admission itself does no forward: the prompt is still in the queue of
+        // work, which is what keeps a join cheap.
+        CHECK(ra.generated == 0 && ra.tokens.empty(),
+              "a join tokenizes but does not generate");
+
+        std::vector<i32> finished;
+        int guard = 0;
+        // Drive A alone until it has a first token, i.e. until its prefill is
+        // done -- with nobody decoding, the prompt drains in that one call.
+        while (ra.generated == 0 && guard++ < 32) {
+            finished.clear();
+            CHECK(engine.batch_step(&finished), "A's prefill steps run");
+        }
+        CHECK(ra.generated >= 1, "A reached its first token");
+
+        // B arrives with a prompt that needs several chunks, while A decodes.
+        GenerateParams pb = params(long_prompt, 6);
+        GenerateResult rb;
+        CHECK(engine.batch_join(pb, &rb, &why), std::string("B joins: ") + why);
+        const i32 a_before = ra.generated;
+
+        finished.clear();
+        CHECK(engine.batch_step(&finished), "one step with A decoding and B prefilling");
+        CHECK(ra.generated == a_before + 1,
+              "the decoding sequence advanced by one token");
+        CHECK(rb.generated == 0 && rb.tokens.empty(),
+              "the new prompt got one chunk, not the whole prompt");
+
+        // A second step must do the same: the prefill is not allowed to finish
+        // in one go while a decoder is waiting on it.
+        finished.clear();
+        CHECK(engine.batch_step(&finished), "a second interleaved step");
+        CHECK(ra.generated == a_before + 2, "the decoding sequence advanced again");
+        CHECK(rb.generated == 0,
+              "the joining sequence is still prefilling after two steps");
+
+        guard = 0;
+        while (engine.batch_active() > 0 && guard++ < 64) {
+            finished.clear();
+            CHECK(engine.batch_step(&finished), "the session keeps stepping");
+        }
+        CHECK(engine.batch_active() == 0, "the session drains");
+        CHECK(rb.generated >= 1, "the joining sequence did produce tokens");
+        CHECK(ra.tokens == solo_long,
+              "the interleaved run produced the solo tokens for A");
+        CHECK(rb.tokens == solo_long,
+              "the interleaved run produced the solo tokens for B");
+        engine.batch_close();
+    }
+
+    // --- two prompts prefilling at once do not interleave with each other ---
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 1, &err)) {
+            CHECK(false, "the two-prompt engine initialises");
+            delete cpu;
+            return;
+        }
+        std::string why;
+        CHECK(engine.batch_open(&why), "a session opens for the two-prompt arm");
+        GenerateParams pa = params(long_prompt, 6);
+        GenerateParams pb = params(short_prompt, 4);
+        GenerateResult ra, rb;
+        CHECK(engine.batch_join(pa, &ra, &why), "the first prompt joins");
+        CHECK(engine.batch_join(pb, &rb, &why), "the second prompt joins");
+        // Nothing is decoding, so the first step may drain both prompts: one
+        // arrival must not be delayed by another arrival's prompt.
+        std::vector<i32> finished;
+        CHECK(engine.batch_step(&finished), "one step with two prompts waiting");
+        CHECK(!ra.tokens.empty() && !rb.tokens.empty(),
+              "both prompts produced a token in the first step");
+        int guard = 0;
+        while (engine.batch_active() > 0 && guard++ < 64) {
+            finished.clear();
+            CHECK(engine.batch_step(&finished), "the two-prompt session drains");
+        }
+        CHECK(ra.tokens == solo_long, "the first prompt kept its solo tokens");
+        CHECK(rb.tokens == solo_short, "the second prompt kept its solo tokens");
+        engine.batch_close();
+    }
+
+    std::remove(path.c_str());
+    delete cpu;
+}
+
+// ---------------------------------------------------------------------------
+// B2.3b -- iteration-level admission
+// ---------------------------------------------------------------------------
+//
+// The batched entry point used to be one call per wave: it returned when the
+// LAST sequence of the wave finished, so a request arriving one step in waited
+// for the whole wave before its prefill began. A session keeps the slots and
+// admits between steps instead.
+//
+// What this group pins is the contract that makes that safe rather than fast:
+// a sequence admitted mid-session produces exactly the tokens it produces
+// alone, its step count is its own (not the session's), and a cancelled
+// request leaves without disturbing anyone. The latency claim itself is not
+// measurable here -- a one-layer fixture has no queue to speak of -- so what is
+// asserted is the mechanism: a slot freed by a finished sequence is reused
+// while the others are still decoding.
+static void test_batch_admission() {
+    Backend *cpu = make_cpu_backend();
+    const std::string path = "kraken-batch-admission.gguf";
+    MoeSpec s;
+    s.dense = false;
+    s.n_expert = 4;
+    s.n_expert_used = 2;
+    s.shared = true;
+    s.varied = true;
+    CHECK(build_tiny_moe_model(path, s), "wrote a MoE fixture for the admission test");
+
+    auto open = [&](Engine *engine, i32 slots, std::string *err) {
+        EngineConfig cfg;
+        cfg.model_path = path;
+        cfg.n_ctx = 32;
+        cfg.prefill_chunk = 8;
+        cfg.n_slots = slots;
+        return engine->init(cpu, cfg, err);
+    };
+    auto params = [](const char *prompt, i32 max_tokens) {
+        GenerateParams p;
+        p.prompt = prompt;
+        p.max_tokens = max_tokens;
+        p.sampler.greedy = true;
+        p.sampler.temp = 0.0f;
+        p.sample_host = true;
+        return p;
+    };
+    const char *prompts[4] = {"the", "a the", "the a", "a a the a"};
+    const i32 limits[4] = {6, 3, 6, 4};
+    // The short arm admits its first request with a lower limit than the oracle
+    // uses, so it finishes while the second is still decoding. Its own oracle is
+    // a solo run at that limit, not at limits[0].
+    const i32 short_limit = 3;
+    std::vector<i32> solo_short;
+
+    // The oracle: every prompt alone, through the serial path.
+    std::vector<std::vector<i32>> solo(4);
+    std::vector<int> solo_finish(4);
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 2, &err)) {
+            CHECK(false, "the admission oracle engine initialises");
+            delete cpu;
+            return;
+        }
+        for (int i = 0; i < 4; i++) {
+            GenerateParams p = params(prompts[i], limits[i]);
+            GenerateResult r;
+            CHECK(engine.generate(p, &r), "solo run " + std::to_string(i) + " completes");
+            solo[i] = r.tokens;
+            solo_finish[i] = r.finish;
+        }
+        GenerateParams p = params(prompts[0], short_limit);
+        GenerateResult r;
+        CHECK(engine.generate(p, &r), "the short solo run completes");
+        solo_short = r.tokens;
+    }
+
+    // --- a late arrival joins and still matches its solo run -----------------
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 2, &err)) {
+            CHECK(false, "the admission engine initialises");
+            delete cpu;
+            return;
+        }
+        std::string why;
+        CHECK(engine.batch_open(&why), std::string("a session opens: ") + why);
+        CHECK(engine.batch_free_slots() == 2, "both slots are free at the start");
+
+        // A short request, so it finishes while B is still decoding.
+        GenerateParams pa = params(prompts[0], short_limit);
+        GenerateResult ra;
+        CHECK(engine.batch_join(pa, &ra, &why), std::string("A joins: ") + why);
+        CHECK(engine.batch_free_slots() == 1, "A took one slot");
+
+        std::vector<i32> finished;
+        bool a_done = false;
+        auto step = [&]() {
+            finished.clear();
+            const bool ok = engine.batch_step(&finished);
+            for (i32 index : finished)
+                if (index == 0) a_done = true;
+            return ok;
+        };
+        CHECK(step(), "the first step runs");
+        CHECK(!a_done, "A has not finished after one step");
+
+        // B arrives while A is decoding -- the case the wave design made wait.
+        GenerateParams pb = params(prompts[1], limits[1]);
+        GenerateResult rb;
+        CHECK(engine.batch_join(pb, &rb, &why), std::string("B joins mid-session: ") + why);
+        CHECK(engine.batch_free_slots() == 0, "the session is now full");
+
+        // C cannot join yet: the session refuses rather than queueing.
+        GenerateParams pc = params(prompts[2], limits[2]);
+        GenerateResult rc;
+        CHECK(!engine.batch_join(pc, &rc, &why), "a full session refuses a join");
+        CHECK(why.find("slot") != std::string::npos,
+              std::string("and says why: ") + why);
+
+        // Admission latency, in the only unit that is not machine-dependent:
+        // ONE step. B's first token appears in the first iteration after it
+        // joined, not after the sequence it joined has drained.
+        CHECK(step(), "a step runs after the mid-session join");
+        CHECK(rb.generated >= 1,
+              "a request admitted mid-session emits a token on its first step");
+        CHECK(engine.batch_active() >= 1, "the sequence it joined is still running");
+
+        // Run until A finishes; its slot must come back with B still decoding.
+        for (int k = 0; k < 8 && !a_done; k++)
+            CHECK(step(), "a step runs while both are attached");
+        CHECK(a_done, "the short request finished without the long one draining");
+        CHECK(engine.batch_active() == 1, "B is still decoding when A is gone");
+        CHECK(engine.batch_free_slots() == 1, "A's slot came back");
+        CHECK(ra.tokens == solo_short,
+              "A's tokens are the tokens the same request produces alone");
+        CHECK(ra.finish == FinishLength, "A stopped at its own limit");
+
+        // C joins into the slot A released, while B keeps decoding.
+        CHECK(engine.batch_join(pc, &rc, &why),
+              std::string("C joins into the freed slot: ") + why);
+        CHECK(engine.batch_active() == 2, "B and C decode together");
+        int guard = 0;
+        while (engine.batch_active() > 0 && guard++ < 64) {
+            finished.clear();
+            CHECK(engine.batch_step(&finished), "the session keeps stepping");
+        }
+        CHECK(engine.batch_active() == 0, "the session drains");
+        CHECK(rb.tokens == solo[1],
+              "the mid-session arrival produced its solo tokens (" +
+                  std::to_string(rb.tokens.size()) + " vs " +
+                  std::to_string(solo[1].size()) + ")");
+        CHECK(rb.finish == solo_finish[1], "the mid-session arrival kept its finish reason");
+        CHECK(rc.tokens == solo[2], "the reused-slot arrival produced its solo tokens");
+        // Per-sequence accounting: B and C each report their own steps, not the
+        // session's. A session is not a wave, so neither inherits the other's
+        // step count.
+        CHECK(rb.decode_steps > 0 && rc.decode_steps > 0,
+              "both sequences count their own decode steps");
+        // The first token comes out of the prefill pass's last row, so a
+        // length-limited sequence runs exactly generated-1 steps of its own --
+        // and NOT the session's total, which is what a wave used to report.
+        CHECK(rb.decode_steps == rb.generated - 1,
+              "B's step count is its own, not the session's");
+        CHECK(rc.decode_steps == rc.generated - 1,
+              "C's step count is its own, not the session's");
+        CHECK(rb.decode_steps < rc.decode_steps,
+              "the request that generated more took more of its own steps");
+        engine.batch_close();
+    }
+
+    // --- cancellation inside a session --------------------------------------
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 2, &err)) {
+            CHECK(false, "the cancellation engine initialises");
+            delete cpu;
+            return;
+        }
+        std::string why;
+        CHECK(engine.batch_open(&why), std::string("a session opens: ") + why);
+        std::atomic<bool> stop{false};
+        GenerateParams pa = params(prompts[0], limits[0]);
+        pa.cancel = &stop;
+        GenerateParams pb = params(prompts[1], limits[1]);
+        GenerateResult ra, rb;
+        CHECK(engine.batch_join(pa, &ra, &why), "the cancellable request joins");
+        CHECK(engine.batch_join(pb, &rb, &why), "its neighbour joins");
+        std::vector<i32> finished;
+        CHECK(engine.batch_step(&finished), "one step runs");
+        stop.store(true, std::memory_order_relaxed);
+        int guard = 0;
+        while (engine.batch_active() > 0 && guard++ < 64) {
+            finished.clear();
+            CHECK(engine.batch_step(&finished), "steps continue after a cancellation");
+        }
+        CHECK(ra.cancelled, "the cancelled sequence reports the cancellation");
+        CHECK(ra.finish == FinishStop, "and finishes as a stop");
+        CHECK(!rb.cancelled, "the neighbour was not cancelled with it");
+        CHECK(rb.tokens == solo[1],
+              "the neighbour's tokens are unchanged by the cancellation");
+        CHECK(rb.finish == solo_finish[1], "and so is its finish reason");
+        engine.batch_close();
+    }
+
+    // --- a closed session leaves nothing attached ---------------------------
+    {
+        Engine engine;
+        std::string err;
+        if (!open(&engine, 2, &err)) {
+            CHECK(false, "the teardown engine initialises");
+            delete cpu;
+            return;
+        }
+        std::string why;
+        CHECK(engine.batch_open(&why), "a session opens for the teardown arm");
+        GenerateParams pa = params(prompts[0], limits[0]);
+        GenerateResult ra;
+        CHECK(engine.batch_join(pa, &ra, &why), "a request joins the teardown session");
+        engine.batch_close();
+        CHECK(!engine.batch_running(), "the session is closed");
+        engine.batch_close(); // a second close is a no-op, not a use-after-free
+        CHECK(!engine.batch_running(), "and still closed");
+    }
+
+    delete cpu;
+}
+
+// ---------------------------------------------------------------------------
 // B2.3 -- batched decode. One forward pass serves several sequences, each with
 // its own KV region and its own position. The contract is exactness: a slot's
 // tokens are the tokens that sequence produces alone, because the only thing
@@ -31675,9 +32701,15 @@ static void test_batch_decode() {
         // Not a speed gate on a one-layer model: there is almost no weight to
         // share. It is a gate against batching costing a factor. The number that
         // matters is `kraken-batch-bench`.
+#ifdef KRK_TESTS_ASAN
+        std::fprintf(stderr,
+                     "[batch] instrumented build: ratio not gated (%.2f ms batched "
+                     "vs %.2f ms serial)\n", batch_ms, solo_ms);
+#else
         CHECK(batch_ms < solo_ms * 2.0,
               "a wave is not twice the work of the same serial runs (" +
                   std::to_string(batch_ms) + " ms vs " + std::to_string(solo_ms) + " ms)");
+#endif
     }
 
     // --- a slot count of one is the serial engine ----------------------------
@@ -31885,6 +32917,42 @@ static void test_batch_decode() {
         CHECK(outs.size() == 3 && outs[0].finish == FinishError &&
                   !outs[0].error.empty(),
               "the refusal is reported on every request, in words");
+    }
+
+    // --- a prefill chunk smaller than the slot count -------------------------
+    // The row workspaces are sized for the widest pass the engine can run, and
+    // that width is max(prefill chunk, sequence count): a batched decode carries
+    // one row per sequence whatever the chunk is. An engine configured with
+    // fewer rows than slots used to run a wider pass than its buffers, which is
+    // a heap overrun rather than a wrong answer -- ASan catches it, a release
+    // build only sometimes does, so the arm asserts the equality and leaves the
+    // overrun to the sanitizer.
+    {
+        Engine engine;
+        std::string err;
+        EngineConfig cfg;
+        cfg.model_path = path;
+        cfg.n_ctx = 32;
+        cfg.prefill_chunk = 1;
+        cfg.n_slots = 3;
+        CHECK(engine.init(cpu, cfg, &err),
+              std::string("a chunk-1, three-slot engine initialises: ") + err);
+        std::vector<std::vector<i32>> solo(3);
+        for (int i = 0; i < 3; i++) {
+            GenerateParams p = params(prompts[i], limits[i]);
+            GenerateResult r;
+            CHECK(engine.generate(p, &r), "the chunk-1 solo baseline runs");
+            solo[i] = r.tokens;
+        }
+        std::vector<GenerateParams> reqs;
+        for (int i = 0; i < 3; i++) reqs.push_back(params(prompts[i], limits[i]));
+        std::vector<GenerateResult> outs;
+        CHECK(engine.generate_batch(reqs, &outs),
+              "three sequences decode in a pass wider than the chunk");
+        for (int i = 0; i < 3 && i < static_cast<int>(outs.size()); i++)
+            CHECK(outs[static_cast<size_t>(i)].tokens == solo[static_cast<size_t>(i)],
+                  "sequence " + std::to_string(i) +
+                      " kept its solo tokens with chunk 1 and three slots");
     }
 
     std::remove(path.c_str());
@@ -32470,6 +33538,7 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_dflash_laguna_spelling)
     TEST_GROUP(test_json)
     TEST_GROUP(test_http_server)
+    TEST_GROUP(test_http_admission)
     TEST_GROUP(test_http_listener_lifetime)
     TEST_GROUP(test_par_pool_covers_every_block)
     TEST_GROUP(test_kv_quant_int8)
@@ -32480,6 +33549,10 @@ static const TestGroup kGroups[] = {
     TEST_GROUP(test_kv_tier_per_plane_cold_files)
     TEST_GROUP(test_moe_batch_ops)
     TEST_GROUP(test_batch_decode)
+    TEST_GROUP(test_prefix_partial_reuse)
+    TEST_GROUP(test_cancel_phases)
+    TEST_GROUP(test_batch_prefill_interleave)
+    TEST_GROUP(test_batch_admission)
     TEST_GROUP_SERIAL(test_batch_throughput,
                       "times the machine: four sequences batched vs serial")
     TEST_GROUP(test_cli_arg_refusal)

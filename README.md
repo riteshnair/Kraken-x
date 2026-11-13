@@ -241,8 +241,15 @@ is a single held prompt record, not a general radix cache.
 Set `"stream": true` for SSE output. A failed streaming write cancels generation
 at the next token. Non-streaming disconnects are observed only when the final
 response is written, so they cannot provide the same early cancellation signal.
-Generation is serialized by the service, and the engine's separate constrained
-batch path is not unrestricted continuous batching.
+
+With more than one KV slot the service decodes requests together and admits a
+new one at the next decode step: a request that arrives mid-generation waits for
+one step of the work in progress, not for it to finish. Its prompt is then
+prefilled a chunk at a time between decode steps, so a long prompt delays the
+sequences already decoding by one chunk rather than by its whole prefill. The batch itself remains
+constrained (the engine refuses shapes it cannot run per row, and prefix reuse is
+serial-mode only), so this is iteration-level admission over a constrained batch,
+not unrestricted continuous batching.
 
 See [docs/USER-GUIDE.md](docs/USER-GUIDE.md) for streaming, diffusion,
 speculation, server options, and additional examples.

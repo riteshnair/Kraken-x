@@ -1,6 +1,7 @@
 # Kraken pending work
 
-Status: 2026-11-12, after the documentation support-state correction.
+Status: 2026-11-11, after the scheduler work: iteration-level admission,
+prefill interleaved with decode, a cancellation audit, and prefix-reuse tests.
 
 This is the only pending-work list. Historical plans, audits, campaign logs, and
 transcripts were removed because their claims and line references had become
@@ -9,7 +10,12 @@ runs.
 
 ## Evidence rules
 
-- The release CPU and Debug ASan suites currently pass 7579/7579 checks.
+- The release CPU suite passes 8045/8045 checks and the ASan build of the whole
+  suite passes 8044/8044 (`build-cpu`, and `build-asan` with
+  `detect_leaks=1:halt_on_error=1`). The one-check difference is deliberate: the
+  wall-clock ratio gate in `test_batch_decode` is skipped under instrumentation,
+  because ASan re-times two code paths unevenly and the number would be about the
+  sanitizer. ASan runs every group, so a leak in one is not hidden by another.
 - ASan validation uses `detect_leaks=1:halt_on_error=1`, without suppressions.
 - A synthetic fixture proves only the behavior it constructs. It does not prove
   real-model coherence, output quality, acceptance rate, or throughput.
@@ -49,15 +55,21 @@ Status labels:
 
 ## P1: server and scheduler
 
-- [ ] **Iteration-level admission** (CODE). Admit requests at iteration
-  boundaries rather than holding arrivals until a wave drains. Require solo
-  output equality, cancellation safety, and a latency measurement.
-- [ ] **Per-slot prefill scheduling** (CODE). Interleave chunked prefill with
-  active decode without starving either class.
-- [ ] **Request cancellation audit** (CODE). Exercise cancellation during
-  admission, prefill, decode, speculation, and teardown.
-- [ ] **Radix prefix reuse** (CODE). Reuse shared prefixes shorter than the
-  whole record, with exact-output tests.
+- [ ] **Admission latency on a real server** (MEASURE). The scheduler admits
+  between steps (`Engine::batch_open`/`batch_join`/`batch_step`, and the service
+  loop built on them), and `test_batch_admission` pins solo output equality,
+  per-sequence step counts and cancellation inside a session. What is missing is
+  the number: time to first token for a request arriving mid-generation over
+  HTTP, with one slot against several, on a model whose steps are long enough to
+  measure.
+- [ ] **More than one resident prefix** (CODE, needs the KV tier with batching).
+  The cache is one linear KV region, so the longest prefix that can be resident
+  is the last run's; reuse of prefixes SHORTER than that record works and is
+  pinned by `test_prefix_partial_reuse` (same prompt, a branch diverging
+  mid-prompt, an extension, and nothing shared -- each compared against a cold
+  engine). Reusing two branches at once needs per-sequence page ownership, which
+  is the same work as the KV-tier-with-batching item below, so the two are one
+  job rather than two.
 - [ ] **Prefix persistence, journal, TTL, and size bounds** (CODE). Verify
   restart recovery, expiry, corruption handling, and bounded storage.
 - [ ] **KV tier with batching** (CODE). Replace whole-layer, single-sequence
@@ -181,6 +193,16 @@ Status labels:
 
 - Release and full ASan correctness gates are green.
 - Continuous batching, per-row MLA addressing, and HOT/WARM/COLD KV tiers exist.
+- Request cancellation is exercised at every phase a session has:
+  `test_cancel_phases` covers admission before the first chunk, a prompt
+  cancelled between two chunks with a neighbour still decoding, a client that
+  disappears mid-stream, and teardown with a sequence attached; the MTP spec
+  chain cancels inside a proposal round. Each arm also checks the slot comes
+  back and that a cancelled stream does not stop the next request.
+- Iteration-level admission exists: a batch session keeps its slots and the
+  server admits a request between decode steps instead of per wave. A joined
+  prompt is prefilled one chunk per step while anything is decoding, and drained
+  in one call when nothing is.
 - Do not describe them as missing.
 - Wide CPU reduction is opt-in, not the bit-exact default.
 - Self-draft for speed, default CPU experts, missing-expert zero contribution,

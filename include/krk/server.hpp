@@ -56,12 +56,12 @@ private:
     RunResult run_generation(GenerateParams *p, GenerateResult *r);
 
     // ---- batched serving ---------------------------------------------------
-    // One scheduler thread owns the engine's batched entry point. Connections
-    // queue their request and wait on their own result; the thread takes up to
-    // `engine_->n_slots()` of them and decodes them in one pass. Requests that
-    // arrive while a wave runs wait for the next one, which is the honest
-    // boundary of this design: a wave is a wave, not true iteration-level
-    // admission.
+    // One scheduler thread owns the engine's batch session. Connections queue
+    // their request and wait on their own result; the thread admits arrivals at
+    // STEP boundaries, so a request that shows up while others are decoding
+    // joins at the next iteration instead of waiting for the running set to
+    // drain. A session is opened once and kept open, which is what lets the
+    // slots be handed over between requests.
     struct Job {
         GenerateParams *p;
         GenerateResult *r;
@@ -70,13 +70,20 @@ private:
     };
     void scheduler_loop();
     void start_scheduler();
-    bool batch_ready() const { return sched_.joinable(); }
+    // True only while the scheduler thread is alive AND has a session it can
+    // admit into. A thread that gave up (the engine refused the session) must
+    // not take new work: the request would sit in a queue nobody drains, so the
+    // caller falls back to the serial path instead.
+    bool batch_ready() const {
+        return sched_.joinable() && sched_running_.load(std::memory_order_relaxed);
+    }
 
     std::thread sched_;
     std::mutex q_mu_;
     std::condition_variable q_cv_;     // the scheduler waits for work on this
     std::condition_variable done_cv_;  // submitters wait for their result on this
     std::deque<Job *> q_;
+    std::atomic<bool> sched_running_{false};
     bool sched_stop_ = false;
     bool handle_health(HttpResponse &res);
     bool handle_models(HttpResponse &res);
