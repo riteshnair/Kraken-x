@@ -32231,6 +32231,42 @@ static void test_batch_decode() {
               "the refusal is reported on every request, in words");
     }
 
+    // --- a prefill chunk smaller than the slot count -------------------------
+    // The row workspaces are sized for the widest pass the engine can run, and
+    // that width is max(prefill chunk, sequence count): a batched decode carries
+    // one row per sequence whatever the chunk is. An engine configured with
+    // fewer rows than slots used to run a wider pass than its buffers, which is
+    // a heap overrun rather than a wrong answer -- ASan catches it, a release
+    // build only sometimes does, so the arm asserts the equality and leaves the
+    // overrun to the sanitizer.
+    {
+        Engine engine;
+        std::string err;
+        EngineConfig cfg;
+        cfg.model_path = path;
+        cfg.n_ctx = 32;
+        cfg.prefill_chunk = 1;
+        cfg.n_slots = 3;
+        CHECK(engine.init(cpu, cfg, &err),
+              std::string("a chunk-1, three-slot engine initialises: ") + err);
+        std::vector<std::vector<i32>> solo(3);
+        for (int i = 0; i < 3; i++) {
+            GenerateParams p = params(prompts[i], limits[i]);
+            GenerateResult r;
+            CHECK(engine.generate(p, &r), "the chunk-1 solo baseline runs");
+            solo[i] = r.tokens;
+        }
+        std::vector<GenerateParams> reqs;
+        for (int i = 0; i < 3; i++) reqs.push_back(params(prompts[i], limits[i]));
+        std::vector<GenerateResult> outs;
+        CHECK(engine.generate_batch(reqs, &outs),
+              "three sequences decode in a pass wider than the chunk");
+        for (int i = 0; i < 3 && i < static_cast<int>(outs.size()); i++)
+            CHECK(outs[static_cast<size_t>(i)].tokens == solo[static_cast<size_t>(i)],
+                  "sequence " + std::to_string(i) +
+                      " kept its solo tokens with chunk 1 and three slots");
+    }
+
     std::remove(path.c_str());
     delete cpu;
 }

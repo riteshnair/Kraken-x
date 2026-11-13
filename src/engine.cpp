@@ -1392,7 +1392,14 @@ bool Engine::init(Backend *be, const EngineConfig &cfg, std::string *err) {
     }
 
     const size_t as = be_->act_size();
-    const i64 C = chunk_;
+    // The WIDEST pass this engine can run, in rows. A prefill is bounded by the
+    // chunk, but a batched decode is bounded by the sequence count -- one row
+    // per sequence -- and those two numbers are independent. Sizing the row
+    // workspaces by the chunk alone meant `--chunk 1` with more than one slot
+    // ran a two-row pass through one-row buffers: ASan reported a heap overrun
+    // in the per-row exponent array (`ws_rexp_`) the first time a batched decode
+    // ran with a chunk smaller than the slot count.
+    const i64 C = std::max<i64>(chunk_, n_slots_);
     // The ledger's baseline: what the device already had taken before this
     // engine allocated anything. Without it, `unaccounted` at the end of init is
     // ambiguous between "a buffer we forgot" and "the desktop and the driver",
