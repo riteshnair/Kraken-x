@@ -42,6 +42,45 @@ only from an actual complete run. The test runner uses `--run-group <name>`;
 `--filter` is unsupported. Build `kraken` and `kraken-server` beside the test
 binary because CLI and HTTP groups execute them.
 
+## Native Windows / MinGW diagnosis
+
+For CPU-only Windows validation, use a fresh build directory for each mode and
+keep the compiler/toolchain identical between Debug and Release. Define the SDK
+surface needed by the current Windows APIs explicitly; do not rely on a shell's
+ambient defaults:
+
+```powershell
+cmake -S . -B build-win-release -G Ninja `
+  -DCMAKE_BUILD_TYPE=Release -DKRK_ENABLE_HIP=OFF `
+  "-DCMAKE_CXX_FLAGS=-D_WIN32_WINNT=0x0A00"
+cmake --build build-win-release --target kraken-tests --verbose
+.\build-win-release\kraken-tests.exe --run-group test_minicpm3_whole_graph
+
+cmake -S . -B build-win-debug -G Ninja `
+  -DCMAKE_BUILD_TYPE=Debug -DKRK_ENABLE_HIP=OFF `
+  "-DCMAKE_CXX_FLAGS=-D_WIN32_WINNT=0x0A00"
+cmake --build build-win-debug --target kraken-tests --verbose
+.\build-win-debug\kraken-tests.exe --run-group test_minicpm3_whole_graph
+```
+
+Use separate build trees; never infer the active mode from the directory name.
+Leave `KRK_NATIVE_CPU` at the same setting in both (normally its native-host
+default); changing the host ISA is a separate portability experiment, not an
+optimization-only comparison. Inspect verbose compile commands to confirm the
+test and `krk_core` objects use the expected flags. CMake keeps `krk_core` at
+`-O0` in Debug and `-O3` in optimized configurations. A Debug pass is diagnostic
+evidence only; it does not
+validate Release behavior. For an optimization-sensitive failure, preserve the
+unmodified Release reproduction first, then try one flag per fresh tree (for
+example `-fno-strict-aliasing`, then `-fno-inline`). Do not call either flag a
+fix unless the fault is localized and a regression test passes in normal
+Release. If available, capture the native debugger's full stack and all-thread
+backtrace for the failing group. Report the MinGW/GCC version, CMake and Ninja
+versions, exact configure/build commands, group output, process exit code, and
+backtrace; do not report only that the process crashed. Run the full suite only
+after the focused reproduction is understood, and report the count from that
+actual run.
+
 ## Change discipline
 
 - Preserve existing numerical and refusal contracts unless the task explicitly

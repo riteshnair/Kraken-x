@@ -37,6 +37,27 @@ Status labels:
 
 ## P0: correctness against independent references
 
+- [ ] **Windows MinGW Release-only test crashes** (HARDWARE). Reported on a
+  Windows host: `test_minicpm3_whole_graph` passes 13/13 in an `-O0 -g` build,
+  while Release (`-O2`) faults during `Model::load`; the reporter says 80+ groups
+  fail under Release. This establishes optimization sensitivity, not yet strict-
+  aliasing UB or a lambda lifetime defect. The `Model::load` arch-key lambda
+  captures its local `std::string` by reference within the same function, so a
+  fault at its invocation may be secondary corruption. This branch fixes a
+  confirmed build-mode trap: `krk_core` had unconditional `-O3` even in CMake
+  Debug; it now uses `-O0` in Debug and `-O3` otherwise. It also guards the
+  AVX-512 one-row dispatch on the baseline F16C implementation being compiled.
+  GNU 12.2 Linux builds of both Debug and Release now pass the focused group
+  13/13, which does not reproduce or resolve the reported Windows fault. First
+  reproduce both modes from separate clean Windows trees using the same
+  toolchain, verify actual flags for `krk_core` as well as the test object, and
+  save a debugger backtrace. Then compare one-at-a-time
+  `-fno-strict-aliasing` / `-fno-inline` builds and localize the first invalid
+  read/write before changing semantics. Close only with a
+  specific fix, the focused Release regression passing, and a full Release suite
+  count from Windows. Agent procedure: `AGENTS.md` → “Native Windows / MinGW
+  diagnosis”. No Windows runtime is available in this environment, so this
+  report is not independently reproduced here.
 - [ ] **OLMoE shared path** (FILE). Run the exact model and bounded llama.cpp
   oracle on the same prompt. Close when texts agree or a stage diff identifies
   the first divergence. CPU/device agreement alone is insufficient.

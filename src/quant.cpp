@@ -6085,7 +6085,10 @@ void dot_wide_dispatch(const void *w, const f32 *x, i64 n, i64 rows, f32 *out,
 // only lever left is lanes. It is exported because BackgroundCpu::gemm reaches
 // its rows == 1 arm from outside this anonymous scope.
 f32 vec_dot_wide1(DType t, const void *w, const f32 *x, i64 n) {
-#if defined(KRK_DOT_AVX512)
+// vec_dot_wide_row is compiled only in the F16C/AVX-512 implementation block
+// above. KRK_DOT_AVX512 alone describes compiler support, not whether the
+// baseline translation unit enables F16C (portable builds intentionally do not).
+#if defined(KRK_DOT_AVX512) && defined(KRK_DOT_F16C)
     if ((t == DType::F32 || t == DType::F16) && vec_dot_wide() &&
         cpu_has_avx512bw()) {
         const u8 *wb = static_cast<const u8 *>(w);

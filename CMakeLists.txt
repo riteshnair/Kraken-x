@@ -212,8 +212,14 @@ else()
     # both compile with the same flags; disable with
     # -DKRK_NATIVE_CPU=OFF for portable binaries.
     option(KRK_NATIVE_CPU "Build krk_core with -march=native" ON)
-    target_compile_options(krk_core PRIVATE -O3 -Wall -Wextra -Wshadow
-                                             -Wno-unused-parameter)
+    # Do not hard-code -O3 in Debug configurations. In particular, a Debug
+    # test on MinGW/Windows must compile Model::load and the rest of krk_core
+    # without the optimization whose Release-only crash it is meant to isolate.
+    # Release and the other optimized configurations retain the fast path.
+    target_compile_options(krk_core PRIVATE
+        $<$<CONFIG:Debug>:-O0>
+        $<$<NOT:$<CONFIG:Debug>>:-O3>
+        -Wall -Wextra -Wshadow -Wno-unused-parameter)
     if(KRK_NATIVE_CPU)
         target_compile_options(krk_core PRIVATE -march=native)
         # AVX2 dot-product kernels on by default for native builds.
