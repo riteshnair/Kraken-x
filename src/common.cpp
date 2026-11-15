@@ -3,6 +3,8 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstring>
 #include <ctime>
 #include <mutex>
 
@@ -45,8 +47,54 @@ void log_printf(Log lvl, const char *fmt, ...) {
 // allocation
 // ---------------------------------------------------------------------------
 
+#if defined(KRK_HOST_GUARD)
+namespace {
+// Debug-only guard bands around every host buffer. The SIMD kernels write into
+// host_alloc buffers, so a 16-byte canary either side catches an overrun at
+// free and prints the size plus a backtrace before aborting. The payload is the
+// base plus an alignment-sized gap so the caller's alignment is preserved.
+constexpr size_t kGuard = 16;
+struct GuardHead {
+    void *raw;
+    size_t size;
+};
+inline void guard_fill(u8 *p, size_t n, u8 v) { std::memset(p, v, n); }
+inline bool guard_intact(const u8 *p, size_t n) {
+    for (size_t i = 0; i < n; i++)
+        if (p[i] != 0xAB) return false;
+    return true;
+}
+void guard_fail(const GuardHead *h) {
+    std::fprintf(stderr,
+                 "[host-guard] canary corrupted: size=%zu raw=%p\n",
+                 h->size, h->raw);
+    std::fflush(stderr);
+    std::abort();
+}
+} // namespace
+#endif
+
 void *host_alloc(size_t bytes, size_t alignment) {
     if (bytes == 0) bytes = 1;
+#if defined(KRK_HOST_GUARD)
+    // The gap must hold the header and the leading canary, and must be a
+    // multiple of the caller's alignment so the returned payload stays aligned.
+    const size_t gap = alignment > 64 ? alignment : 64;
+    const size_t total = gap + bytes + kGuard;
+    u8 *raw = static_cast<u8 *>(_aligned_malloc(total, gap));
+    if (!raw) {
+        KRK_ERROR("out of memory: %zu bytes", bytes);
+        std::abort();
+    }
+    u8 *payload = raw + gap;
+    GuardHead *h = reinterpret_cast<GuardHead *>(payload) - 1;
+    h->raw = raw;
+    h->size = bytes;
+    guard_fill(reinterpret_cast<u8 *>(h) - kGuard, kGuard, 0xAB);
+    guard_fill(payload, bytes, 0xCD);
+    guard_fill(payload + bytes, kGuard, 0xAB);
+    return payload;
+#else
 #if defined(_WIN32)
     void *p = _aligned_malloc(bytes, alignment);
 #else
@@ -58,10 +106,21 @@ void *host_alloc(size_t bytes, size_t alignment) {
         std::abort();
     }
     return p;
+#endif
 }
 
 void *host_realloc(void *p, size_t bytes, size_t alignment) {
     if (bytes == 0) bytes = 1;
+#if defined(KRK_HOST_GUARD)
+    void *q = host_alloc(bytes, alignment);
+    if (p) {
+        GuardHead *h = reinterpret_cast<GuardHead *>(p) - 1;
+        const size_t keep = h->size < bytes ? h->size : bytes;
+        std::memcpy(q, p, keep);
+        host_free(p);
+    }
+    return q;
+#else
 #if defined(_WIN32)
     void *q = _aligned_realloc(p, bytes, alignment);
 #else
@@ -73,6 +132,7 @@ void *host_realloc(void *p, size_t bytes, size_t alignment) {
         std::abort();
     }
     return q;
+#endif
 }
 
 // The raw probe. `GlobalMemoryStatusEx` is a kernel call and the staging paths
@@ -147,10 +207,20 @@ size_t host_total_bytes() {
 
 void host_free(void *p) {
     if (!p) return;
+#if defined(KRK_HOST_GUARD)
+    u8 *payload = static_cast<u8 *>(p);
+    GuardHead *h = reinterpret_cast<GuardHead *>(payload) - 1;
+    const bool before = guard_intact(reinterpret_cast<u8 *>(h) - kGuard, kGuard);
+    const bool after = guard_intact(payload + h->size, kGuard);
+    if (!before || !after) guard_fail(h);
+    guard_fill(payload, h->size, 0xCD);
+    _aligned_free(h->raw);
+#else
 #if defined(_WIN32)
     _aligned_free(p);
 #else
     std::free(p);
+#endif
 #endif
 }
 
@@ -263,7 +333,11 @@ MappedFile::~MappedFile() { close(); }
 
 bool MappedFile::open(const std::string &path, std::string *err) {
     close();
-    HANDLE fh = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+    // FILE_SHARE_DELETE mirrors POSIX semantics: a mapping may outlive the
+    // name, so a fixture can be unlinked while still open. Without it
+    // std::remove() fails on Windows for any file this process still maps.
+    HANDLE fh = CreateFileA(path.c_str(), GENERIC_READ,
+                            FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (fh == INVALID_HANDLE_VALUE) {
         if (err) *err = "cannot open '" + path + "'";
@@ -317,7 +391,8 @@ FileReader::~FileReader() { close(); }
 
 bool FileReader::open(const std::string &path) {
     close();
-    HANDLE fh = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+    HANDLE fh = CreateFileA(path.c_str(), GENERIC_READ,
+                            FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (fh == INVALID_HANDLE_VALUE) return false;
     handle_ = fh;

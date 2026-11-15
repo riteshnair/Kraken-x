@@ -27,6 +27,16 @@
 #include <algorithm>
 #include <string>
 
+#if defined(_MSC_VER)
+// MSVC/UCRT has no clock_gettime; timespec_get(TIME_UTC) is the C11 equivalent.
+#ifndef CLOCK_MONOTONIC
+#define CLOCK_MONOTONIC 0
+#endif
+inline int clock_gettime(int, timespec *ts) {
+    return timespec_get(ts, TIME_UTC) == TIME_UTC ? 0 : -1;
+}
+#endif
+
 #include "krk/common.hpp"
 
 namespace krk {

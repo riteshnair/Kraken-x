@@ -545,7 +545,23 @@ static void test_q8_0_scale_array_row_keyed() {
     for (int o = 0; o < n_out; o++)
         dot_q8_0_q8_x8(w.data() + static_cast<size_t>(o) * row_bytes, xq.data(),
                        dx.data(), n_in, n_in, nb, ref.data() + o, n_out);
-    if (!q8_0_wsc_supported()) return;  // nothing to compare on a non-VNNI host
+    if (!q8_0_wsc_supported()) {
+        // This host has no VNNI, so the wsc side-array fast path is not built.
+        // Still run a real check: the tiled x8 dispatcher must agree with the
+        // single-row dispatcher, which is the scalar/AVX2 fallback here. A bare
+        // return would leave the group at 0/0, and the runner (correctly) reads
+        // a silent zero-check group as a skip that looks like a pass.
+        for (int o = 0; o < n_out; o++) {
+            const f32 want = dot_q8_0_q8(
+                w.data() + static_cast<size_t>(o) * row_bytes, xq.data(),
+                dx.data(), n_in);
+            CHECK_NEAR(ref[static_cast<size_t>(o)], want,
+                       1e-4f * std::fabs(want) + 1e-4f,
+                       "the tiled q8_0 row matches the single-row dispatcher "
+                       "without VNNI");
+        }
+        return;
+    }
     const i64 npair = nb / 2;
     std::vector<f32> wsc(static_cast<size_t>(n_out * npair * 16));
     build_q8_0_wscales(w.data(), row_bytes, n_out, n_in, wsc.data());
@@ -11400,9 +11416,18 @@ private:
     // wakes on its own timer instead, so the simulated duration survives load.
     static void sim_wait(double ns) {
         if (!(ns > 0.0)) return;
-        std::this_thread::sleep_for(
-            std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                std::chrono::duration<double, std::nano>(ns)));
+        using namespace std::chrono;
+        // Spin to an absolute deadline. sleep_for/sleep_until round up to the OS
+        // timer tick (~15.6 ms by default on Windows, ~1 ms only after
+        // timeBeginPeriod), which maps a 2 ms arm and a 13 ms arm onto the same
+        // measured time and collapses the ratio to 1.0. This group runs in the
+        // serial lane, so the spin does not contend with another arm.
+        const steady_clock::time_point deadline =
+            steady_clock::now() +
+            duration_cast<steady_clock::duration>(duration<double, std::nano>(ns));
+        while (steady_clock::now() < deadline) {
+            // spin to the deadline
+        }
     }
     bool aperture_ = false;
     bool direct_ = false;
@@ -30484,7 +30509,34 @@ static void test_qwen4exp_hc_mix() {
 // reports come out of the clock. That is the only way this suite can reach the
 // branch a Resizable-BAR box takes -- the card on this machine reports a 256 MiB
 // aperture and the probe keeps the ring on every run.
+#if defined(_WIN32)
+namespace {
+// The simulated arms below are timed by sleeping for a rate-shaped duration.
+// Windows' default timer tick is ~15.6 ms, so a 2 ms arm and a 13 ms arm both
+// round to one tick and their ratio collapses to 1.0 -- the failure this group
+// reported on a CPU-only Windows host. Raise the resolution to 1 ms for the
+// duration of the probe so sleep_for measures the injected rate.
+struct ProbeHiResTimer {
+    using Fn = UINT(WINAPI *)(UINT);
+    Fn end_ = nullptr;
+    ProbeHiResTimer() {
+        if (HMODULE m = LoadLibraryA("winmm.dll")) {
+            auto begin = reinterpret_cast<Fn>(GetProcAddress(m, "timeBeginPeriod"));
+            end_ = reinterpret_cast<Fn>(GetProcAddress(m, "timeEndPeriod"));
+            if (begin) begin(1);
+        }
+    }
+    ~ProbeHiResTimer() {
+        if (end_) end_(1);
+    }
+};
+} // namespace
+#endif
+
 static void test_pageable_path_probe() {
+#if defined(_WIN32)
+    ProbeHiResTimer hires;
+#endif
     const size_t mib = static_cast<size_t>(1) << 20;
     const size_t gib = static_cast<size_t>(1) << 30;
 

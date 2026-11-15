@@ -13,6 +13,18 @@
 #include <ctime>
 #include <thread>
 
+#if defined(_MSC_VER)
+// The throughput probes below time a loop with clock_gettime(CLOCK_MONOTONIC),
+// which the MSVC/UCRT runtime does not provide. timespec_get(TIME_UTC) is the
+// portable C11 equivalent and is close enough for a bench-only probe.
+#ifndef CLOCK_MONOTONIC
+#define CLOCK_MONOTONIC 0
+#endif
+inline int clock_gettime(int, timespec *ts) {
+    return timespec_get(ts, TIME_UTC) == TIME_UTC ? 0 : -1;
+}
+#endif
+
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <immintrin.h>
 #endif
@@ -3158,8 +3170,8 @@ KRK_TARGET_ATTR("avx2,fma,avxvnni") void dot_q4_K_q8_x8_d_avxvnni(
 // unsigned operand and the int8 activation the signed one) then does a 32-value
 // sub-block in a single instruction, against two for maddubs + madd.
 #if defined(KRK_DOT_AVX512)
-KRK_TARGET_ATTR("avx512f,avx512bw,avx512vl,avx512vnni")
-[[maybe_unused]] void dot_q4_K_q8_sx_x8_vnni_d(
+[[maybe_unused]] KRK_TARGET_ATTR("avx512f,avx512bw,avx512vl,avx512vnni")
+void dot_q4_K_q8_sx_x8_vnni_d(
     const u8 *w, const i8 *xq, const f32 *dx, const i32 *sx, i64 n, i64 rstride, i64 dstride,
                               i64 sstride, f32 *out, i64 out_stride) {
     const __m256i kLo = _mm256_set1_epi8(0x0F);
@@ -3229,8 +3241,8 @@ KRK_TARGET_ATTR("avx512f,avx512bw,avx512vl,avx512vnni")
 #if defined(KRK_DOT_AVX2)
 // The AVX2 twin, for hosts without VNNI: maddubs + madd instead of dpbusd.
 // Same batched min term, which is where most of the gain is.
-KRK_TARGET_ATTR("avx2,fma")
-[[maybe_unused]] void dot_q4_K_q8_sx_x8_avx2_d(
+[[maybe_unused]] KRK_TARGET_ATTR("avx2,fma")
+void dot_q4_K_q8_sx_x8_avx2_d(
     const u8 *w, const i8 *xq, const f32 *dx, const i32 *sx, i64 n, i64 rstride, i64 dstride,
                               i64 sstride, f32 *out, i64 out_stride) {
     const __m256i kLo = _mm256_set1_epi8(0x0F);
@@ -3476,8 +3488,8 @@ f32 dot_q6_K_q8_sq4_avx2_d(const u8 *w, const i8 *xq, const f32 *dx,
 // and the nibble unpack with it -- is decoded ONCE and used eight times. That
 // is the prefill shape, and without it Q6_K prefill runs at GEMV speed.
 #if defined(KRK_DOT_AVX512)
-KRK_TARGET_ATTR("avx512f,avx512bw,avx512vl,avx512vnni")
-[[maybe_unused]] void dot_q6_K_q8_sq4_x8_vnni_d(
+[[maybe_unused]] KRK_TARGET_ATTR("avx512f,avx512bw,avx512vl,avx512vnni")
+void dot_q6_K_q8_sq4_x8_vnni_d(
     const u8 *w, const i8 *xq, const f32 *dx, const i32 *sq4, i64 n, i64 rstride, i64 dstride,
                                i64 sstride, f32 *out, i64 out_stride) {
     const __m256i zero = _mm256_setzero_si256();
@@ -3535,8 +3547,8 @@ KRK_TARGET_ATTR("avx512f,avx512bw,avx512vl,avx512vnni")
 }
 #endif // KRK_DOT_AVX512
 
-KRK_TARGET_ATTR("avx2,fma")
-[[maybe_unused]] void dot_q6_K_q8_sq4_x8_avx2_d(
+[[maybe_unused]] KRK_TARGET_ATTR("avx2,fma")
+void dot_q6_K_q8_sq4_x8_avx2_d(
     const u8 *w, const i8 *xq, const f32 *dx, const i32 *sq4, i64 n, i64 rstride, i64 dstride,
                                i64 sstride, f32 *out, i64 out_stride) {
     const __m256i ones16 = _mm256_set1_epi16(1);
@@ -3635,8 +3647,8 @@ f32 dot_q6_K_q8_sq4_d_avxvnni(const u8 *w, const i8 *xq, const f32 *dx,
     return _mm_cvtss_f32(lo);
 }
 
-KRK_TARGET_ATTR("avx2,fma,avxvnni")
-[[maybe_unused]] void dot_q6_K_q8_sq4_x8_d_avxvnni(
+[[maybe_unused]] KRK_TARGET_ATTR("avx2,fma,avxvnni")
+void dot_q6_K_q8_sq4_x8_d_avxvnni(
     const u8 *w, const i8 *xq, const f32 *dx, const i32 *sq4, i64 n, i64 rstride,
                                   i64 dstride, i64 sstride, f32 *out,
                                   i64 out_stride) {
@@ -5255,6 +5267,19 @@ void dot_q8_0_q8_x8_tier(i32 tier, const u8 *w, const i8 *xq, const f32 *dx,
 void dot_q8_0_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
                     i64 rstride, i64 dstride, f32 *out, i64 out_stride) {
     const i64 nb = n / 32;
+    // The rung selector is shared by the AVX-512, AVX2 and VNNI arms, so it
+    // lives outside every feature guard: a build with AVX2 but without
+    // AVX-512 (clang, older GCC) still reaches the AVX2 arm and needs it.
+    static const i32 forced = [] {
+        const char *e = std::getenv("KRK_CPU_Q80_KERNEL");
+        if (!e || !e[0]) return 0;
+        if (std::strcmp(e, "vnni") == 0) return 3;
+        if (std::strcmp(e, "bw") == 0) return 2;
+        if (std::strcmp(e, "avx2") == 0) return 1;
+        if (std::strcmp(e, "scalar") == 0) return -1;
+        return 0;  // unknown value: auto
+    }();
+    auto want = [&](i32 rung) { return forced == 0 || forced == rung; };
 #if defined(KRK_DOT_AVX512)
     static const bool bw = [] {
         const char *e = std::getenv("KRK_CPU_Q80_NOBW");
@@ -5276,16 +5301,6 @@ void dot_q8_0_q8_x8(const u8 *w, const i8 *xq, const f32 *dx, i64 n,
     // one is tested on a host that has it and how the rungs that are absent
     // here are exercised elsewhere. A forced rung that the CPU cannot run falls
     // through to the next rather than raising SIGILL.
-    static const i32 forced = [] {
-        const char *e = std::getenv("KRK_CPU_Q80_KERNEL");
-        if (!e || !e[0]) return 0;
-        if (std::strcmp(e, "vnni") == 0) return 3;
-        if (std::strcmp(e, "bw") == 0) return 2;
-        if (std::strcmp(e, "avx2") == 0) return 1;
-        if (std::strcmp(e, "scalar") == 0) return -1;
-        return 0;  // unknown value: auto
-    }();
-    auto want = [&](i32 rung) { return forced == 0 || forced == rung; };
     if (bw && (nb & 1) == 0 && want(3) && cpu_has_vnni()) {
         dot_q8_0_q8_x8_vnni(w, xq, dx, n, rstride, dstride, out, out_stride);
         return;

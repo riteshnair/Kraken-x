@@ -167,6 +167,12 @@ inline i64 cpu_max_khz(i64 cpu) {
 // the caller on the identity fallback. Single-group only (< 64 logical CPUs),
 // which covers every client hybrid this engine targets.
 inline bool detect_cpu_topology_win(CpuTopology &t, i64 hc) {
+#if defined(__MINGW32__) || defined(__MINGW64__)
+    // MinGW's SDK headers do not expose PROCESSOR_RELATIONSHIP::EfficiencyClass,
+    // so hybrid detection is unavailable here; fall back to the identity path.
+    (void)t; (void)hc;
+    return false;
+#else
     DWORD len = 0;
     GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
     if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || len == 0) return false;
@@ -221,6 +227,7 @@ inline bool detect_cpu_topology_win(CpuTopology &t, i64 hc) {
     // not claim a complete topology.
     if (static_cast<i64>(t.order.size()) < hc && !t.hybrid) return false;
     return true;
+#endif
 }
 #endif
 

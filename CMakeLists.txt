@@ -141,6 +141,19 @@ set(KRK_CORE_SOURCES
 )
 
 add_library(krk_core STATIC ${KRK_CORE_SOURCES})
+option(KRK_HOST_GUARD "Debug-only guard bands on host buffers (localises corruption)" OFF)
+if(KRK_HOST_GUARD)
+    target_compile_definitions(krk_core PRIVATE KRK_HOST_GUARD=1)
+endif()
+option(KRK_HEAP_GUARD "Debug-only global new/delete guard bands (localises corruption)" OFF)
+if(KRK_HEAP_GUARD)
+    target_sources(krk_core PRIVATE src/heap_guard.cpp)
+endif()
+option(KRK_MEM_WATCHDOG "Debug-only range check on large memcpy/memset calls" OFF)
+if(KRK_MEM_WATCHDOG)
+    target_sources(krk_core PRIVATE src/mem_watchdog.cpp)
+    target_compile_options(krk_core PRIVATE -fno-builtin)
+endif()
 target_include_directories(krk_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 if(WIN32)
     target_link_libraries(krk_core PUBLIC ws2_32)
@@ -221,13 +234,28 @@ else()
         $<$<NOT:$<CONFIG:Debug>>:-O3>
         -Wall -Wextra -Wshadow -Wno-unused-parameter)
     if(KRK_NATIVE_CPU)
-        target_compile_options(krk_core PRIVATE -march=native)
         # AVX2 dot-product kernels on by default for native builds.
         target_compile_definitions(krk_core PRIVATE KRK_DOT_AVX2=1)
         # AVX-VNNI (_mm256_dpbusd_epi32, 256-bit VEX) is available on Meteor
         # Lake and Zen 4+; march=native enables it but we define this so
         # guarded 256-bit VNNI paths can be compiled in.
         target_compile_definitions(krk_core PRIVATE KRK_DOT_AVXVNNI=1)
+        if(MINGW)
+            # MinGW/GCC codegen bug: with AVX enabled for a translation unit the
+            # compiler can spill 256-bit values with `vmovdqa` into 32-byte
+            # stack slots, but the Windows x64 ABI only guarantees 16-byte
+            # alignment. The result is a nondeterministic 0xC0000005 (alignment
+            # fault) inside ordinary non-SIMD code such as Model::load. GCC
+            # cannot promise 32-byte incoming alignment on this target
+            # (-mpreferred-stack-boundary is capped at 4). So tune scheduling
+            # natively for all files but only enable AVX in the two files whose
+            # kernels are written against it.
+            target_compile_options(krk_core PRIVATE -mtune=native)
+            set_source_files_properties(src/quant.cpp src/backend_cpu.cpp
+                PROPERTIES COMPILE_OPTIONS "-march=native")
+        else()
+            target_compile_options(krk_core PRIVATE -march=native)
+        endif()
     endif()
 endif()
 
