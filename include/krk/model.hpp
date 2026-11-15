@@ -1522,6 +1522,7 @@ public:
     // is built once here instead of a second kernel path that would have to
     // special-case a shared weight.
     std::vector<f32> ple_proj_norm_rep;
+    f32 *ple_proj_norm_rep_dev = nullptr; // device mirror for device backends
 
     // NeoX inverse frequencies, length head_dim/2, host-resident (tiny).
     const std::vector<f32> &inv_freq() const { return inv_freq_; }

@@ -27,6 +27,9 @@ void *krk_attn_resource_instances[] = {
     reinterpret_cast<void *>(&attention_bexact_kernel<4, 16>),  // hd 128 QT 16
     reinterpret_cast<void *>(&attention_bexact_kernel<8, 4>),   // hd 256 QT 4
     reinterpret_cast<void *>(&attention_bexact_kernel<8, 8>),   // hd 256 QT 8
-    reinterpret_cast<void *>(&attention_wmma_kernel),           // hd 256 matrix cores
+    reinterpret_cast<void *>(&attention_wmma_kernel<64>),      // hd 64 matrix cores
+    reinterpret_cast<void *>(&attention_wmma_kernel<128>),     // hd 128 matrix cores
+    reinterpret_cast<void *>(&attention_wmma_kernel<256>),     // hd 256 matrix cores
+    reinterpret_cast<void *>(&attention_wmma_kernel<512>),     // hd 512 matrix cores
     reinterpret_cast<void *>(&attention_decode_kernel<4>),      // decode row, same chain
 };

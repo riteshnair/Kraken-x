@@ -157,6 +157,21 @@ endif()
 target_include_directories(krk_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 if(WIN32)
     target_link_libraries(krk_core PUBLIC ws2_32)
+    if(NOT MINGW AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        # CMake links Windows Clang executables with -nostartfiles -nostdlib,
+        # which drops compiler-rt builtins (__cpu_model / __cpu_features2
+        # referenced by __builtin_cpu_supports) unless linked explicitly.
+        execute_process(COMMAND "${CMAKE_CXX_COMPILER}" -print-libgcc-file-name
+                        OUTPUT_VARIABLE _krk_rt_builtins
+                        OUTPUT_STRIP_TRAILING_WHITESPACE
+                        ERROR_QUIET)
+        if(_krk_rt_builtins)
+            file(TO_CMAKE_PATH "${_krk_rt_builtins}" _krk_rt_builtins)
+            if(EXISTS "${_krk_rt_builtins}")
+                target_link_libraries(krk_core PUBLIC "${_krk_rt_builtins}")
+            endif()
+        endif()
+    endif()
 endif()
 
 if(KRK_ENABLE_NPU)
@@ -574,6 +589,31 @@ if(KRK_ENABLE_HIP)
     message(STATUS "kraken: HIP backend enabled, targets = ${KRK_GPU_TARGETS} "
                    "(HIP compiler ${CMAKE_HIP_COMPILER_ID} "
                    "${CMAKE_HIP_COMPILER_VERSION}, CXX ${CMAKE_CXX_COMPILER_ID})")
+
+    if(WIN32 AND _krk_rocm_root)
+        # Stage the SDK's HIP runtime next to the binaries so Windows resolves
+        # the SDK's amdhip64_<major>.dll before any driver-installed copy in
+        # System32 (mirrors scripts/build_windows.ps1).
+        file(GLOB _krk_hip_runtime_dlls
+             "${_krk_rocm_root}/bin/amdhip64_*.dll"
+             "${_krk_rocm_root}/bin/amd_comgr.dll"
+             "${_krk_rocm_root}/bin/rocm_kpack.dll")
+        set(_krk_staged_dlls "")
+        foreach(_dll IN LISTS _krk_hip_runtime_dlls)
+            get_filename_component(_dll_name "${_dll}" NAME)
+            set(_dst "${CMAKE_CURRENT_BINARY_DIR}/${_dll_name}")
+            add_custom_command(
+                OUTPUT "${_dst}"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_dll}" "${_dst}"
+                DEPENDS "${_dll}"
+                COMMENT "Staging HIP runtime DLL ${_dll_name}")
+            list(APPEND _krk_staged_dlls "${_dst}")
+        endforeach()
+        if(_krk_staged_dlls)
+            add_custom_target(krk_hip_runtime DEPENDS ${_krk_staged_dlls})
+            add_dependencies(krk_hip krk_hip_runtime)
+        endif()
+    endif()
 endif()
 
 
@@ -735,11 +775,32 @@ if(KRK_HIP_AVAILABLE)
     # implementations of the same block layout is where a silent mis-read
     # hides, so it is a test rather than a comment.
     add_executable(kraken-i8k tools/gemm_i8k_verify.cpp)
-    target_link_libraries(kraken-i8k PRIVATE krk_core krk_hip)
+    set_source_files_properties(tools/gemm_i8k_verify.cpp PROPERTIES
+                                LANGUAGE HIP)
+    target_link_libraries(kraken-i8k PRIVATE krk_core)
+    if(TARGET hip::device)
+        target_link_libraries(kraken-i8k PRIVATE hip::device)
+    elseif(HIP_FOUND)
+        target_link_libraries(kraken-i8k PRIVATE ${HIP_LIBRARIES})
+    endif()
     # The kernel headers are included as the backend includes them
     # ("kernels/..."), so the tool compiles the same file the engine does.
+    # Standalone HIP translation unit rather than linking krk_hip so kernel
+    # stubs in gemm_dp4a.hpp are not duplicated.
     target_include_directories(kraken-i8k PRIVATE
+                               ${CMAKE_CURRENT_SOURCE_DIR}/include
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src
                                ${CMAKE_CURRENT_SOURCE_DIR}/src/hip)
+    target_compile_options(kraken-i8k PRIVATE -O3 -ffast-math
+                                              -fno-finite-math-only)
+    foreach(tgt IN LISTS CMAKE_HIP_ARCHITECTURES)
+        string(TOUPPER "${tgt}" tgt_uc)
+        target_compile_definitions(kraken-i8k PRIVATE
+                                   "KRK_OFFLOAD_${tgt_uc}=1")
+    endforeach()
+    if(TARGET krk_hip_runtime)
+        add_dependencies(kraken-i8k krk_hip_runtime)
+    endif()
     # Per-shape raw kernel speed with the launch cost amortized out of the
     # measurement: `(T(N) - T(1)) / (N - 1)`. This is the number the perf plan's
     # acceptance criteria are written against, because the engine's own per-op

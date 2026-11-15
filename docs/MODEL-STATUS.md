@@ -4,6 +4,92 @@ This file separates current source support from historical checkpoint runs. Use
 [Model support](MODEL-SUPPORT-MATRIX.md) for the current architecture matrix and
 [TO-DO.md](../TO-DO.md) for open verification.
 
+## Device & `--ram-tier 16` sweep, 2026-11-15
+
+Current post-prefill-optimization checkpoint run on local GGUF models.
+
+**Machine, runtime, and build:**
+- CPU / host RAM: AMD Ryzen 9 5900XT (16C/32T), 95.9 GiB RAM, Windows.
+- GPU / runtime: AMD Radeon RX 9070 XT (`gfx1201`, RDNA4, 64 CU, wave32, WMMA
+  `gfx12`, 15.9 GiB VRAM, BAR measured wide at `15.7 GB/s` pageable /
+  `18.9 GB/s` pinned on 16 MiB H2D copy), HIP `7.16.26331`, driver `71626331`.
+- Binary: `./build-hip/kraken.exe` (`Release`, `amdclang++ 23.0.0git`).
+- KV note: HIP backend fell back from default `--kv-quant turbo3` to `f16` on
+  all runs below.
+- `HOT %` follows the `first cache` summary line (`HOT / (HOT + WARM + COLD)`).
+
+### Standard sweep (`--bench --greedy --max-tokens 64 --ctx 4096 --chunk 512`)
+
+**Results (`33` local GGUFs tested, `28` exit `0`, `3` clean loader refusals, `2` range-guard exit `2`):**
+
+| Model | Size MiB | Arch | Load ms | Prefill tok/s | Decode tok/s | ms/tok | HOT % | Status |
+|---|---:|---|---:|---:|---:|---:|---:|---|
+| `Laguna-S-2.1-PS-IQ2_XXS` | 32093 | `laguna` (MoE) | 23127 | 19.3 | 14.3 | 69.8 | 79.9% | range guard fired (rc=2) |
+| `K2-Horizon-MoVA-36B-A4B-Q4_K_M` | 21331 | - | - | - | - | - | - | refused (rc=1: layer 0 attention output gate 4096 wide, expected 32) |
+| `laguna-xs2-Q4_K_M` | 19335 | `laguna` (MoE) | 18297 | 108.3 | 35.9 | 27.8 | 93.2% | ran (rc=0) |
+| `LFM2.5-24B-A2B-QAD-Q4_0` | 12949 | `lfm2moe` (MoE) | 9273 | 399.8 | 90.3 | 11.1 | 99.6% | ran (rc=0) |
+| `Mellum2.1-12B-A2.5B-Thinking-Q8_0` | 12326 | `mellum` (MoE) | 9536 | 632.0 | 67.4 | 14.8 | 100.0% | range guard fired (rc=2) |
+| `Underdog-Saluki-27B-1.0-IQ2-mix-MTP-abliterated` | 7962 | `qwen35` | 5141 | 407.1 | 30.2 | 33.1 | - | ran (rc=0) |
+| `omnicoder-9b-q6_k` | 7018 | `qwen35` | 3858 | 1207.4 | 56.2 | 17.8 | - | ran (rc=0) |
+| `Qwen2.5-Coder-7B-Instruct-Q5_K_M` | 5192 | `qwen2` | 4417 | 1372.7 | 83.5 | 12.0 | - | ran (rc=0) |
+| `qwen35-9b-instruct-nvfp4` | 5067 | `qwen35` | 3523 | 1119.5 | 78.4 | 12.8 | - | ran (rc=0) |
+| `lacuna-v1-Q4_K_M` | 4836 | `llama` | 4247 | 1471.9 | 81.2 | 12.3 | - | ran (rc=0) |
+| `Qwen3-8B-Q4_K_M` | 4794 | `qwen3` | 3748 | 1395.2 | 80.2 | 12.5 | - | ran (rc=0) |
+| `mythos-9b-unhinged-heretic.i1-Q4_K_M` | 4794 | `qwen3` | 4320 | 1430.7 | 80.5 | 12.4 | - | ran (rc=0) |
+| `Qwen3.5-9B-DeepSeek-V4-Flash-MTP-Q3_K_M` | 4518 | `qwen35` | 3036 | 1092.9 | 68.5 | 14.6 | - | ran (rc=0) |
+| `Opus4.7-GODs.Ghost.Codex.Distill.4B-Q8_0` | 4274 | `qwen35` | 3577 | 1864.9 | 93.3 | 10.7 | - | ran (rc=0) |
+| `Qwen3-4B-Q8_0` | 4082 | `qwen3` | 3478 | 2059.7 | 96.4 | 10.4 | - | ran (rc=0) |
+| `VibeThinker-3B.Q8_0` | 3133 | `qwen2` | 2936 | 2830.5 | 0.0 | - | - | ran (rc=0), emits EOS (0 dec tok) |
+| `Samastam-2.5B-Q8_0` | 2560 | `llama` | 2295 | 4744.1 | 156.6 | 6.4 | - | ran (rc=0) |
+| `Phi-3.5-mini-instruct-python_coding_assistanQ4_K_M` | 2211 | `llama` | 1989 | 2709.9 | 109.0 | 9.2 | - | ran (rc=0) |
+| `smolcode-coder-cpp-3b-q4_k_m` | 2007 | `qwen2` | 2218 | 2935.2 | 161.1 | 6.2 | - | ran (rc=0) |
+| `smolcode-coder-cpp-1.5b-q4_k_m` | 1065 | `qwen2` | 1380 | 4414.0 | 202.8 | 4.9 | - | ran (rc=0) |
+| `bitnet-2b-tq1_0` | 1054 | `bitnet` | 1223 | 1098.9 | 65.9 | 15.2 | - | ran (rc=0) |
+| `Llama-3.2-1B-Instruct-Q8_0` | 1259 | `llama` | 1032 | 6537.5 | 282.4 | 3.5 | - | ran (rc=0) |
+| `olmoe-1b-7b-0924-q4_k_m-imat` | 4018 | `olmoe` (MoE) | 3382 | 738.4 | 108.7 | 9.2 | 100.0% | ran (rc=0) |
+| `llada-moe-7b-a1b-instruct-td-q4_k_m` | 4311 | `llada-moe` (MoE) | 3327 | 772.6 | 114.8 | 8.7 | 100.0% | ran (rc=0) |
+| `gemma-4-E4B-it-Q4_K_M` | 5088 | `gemma4` | 6990 | 1599.1 | 80.1 | 12.5 | - | ran (rc=0) |
+| `gemma-4-12B-IQ4_XS` | 6380 | - | - | - | - | - | - | refused (rc=1: `embedding_length_per_layer_input` missing) |
+| `Qwen3.5-9B-Q4_K_M` | 5596 | `qwen35` | 3120 | 1287.4 | 74.9 | 13.3 | - | ran (rc=0) |
+| `DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M` | 9884 | `deepseek2` (MoE) | 10206 | 705.2 | 60.7 | 16.5 | 100.0% | ran (rc=0) |
+| `gemma-4-26B-A4B-it-qat-UD-Q4_K_XL` | 13588 | - | - | - | - | - | - | refused (rc=1: `embedding_length_per_layer_input` missing) |
+| `GLM-4.7-Flash-Q4_K_M` | 17292 | `deepseek2` (MoE) | 16041 | 74.2 | 25.6 | 39.1 | 92.9% | ran (rc=0) |
+| `Qwen3.5-35B-A3B-UD-Q4_K_XL` | 18775 | `qwen35moe` (MoE) | 13090 | 82.5 | 26.3 | 38.0 | 91.4% | ran (rc=0) |
+| `NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-noMTP` | 18872 | `nemotron_h_moe` | 14146 | 90.3 | 31.1 | 32.2 | 90.4% | ran (rc=0) |
+| `qwable-v1-mxfp4_moe` | 19322 | `qwen35moe` (MoE) | 21385 | 124.5 | 25.0 | 40.1 | 91.2% | ran (rc=0) |
+
+Note on range-guard exits: `Laguna-S-2.1-PS-IQ2_XXS` tripped the f16 activation
+bounds check (`silu 1, experts-sum 200`, residual `max exponent 60`), and
+`Mellum2.1-12B-A2.5B-Thinking-Q8_0` tripped `experts-sum 1` (`max exponent 60`),
+exiting with `2` (`--cpu` comparison required before trusting output). `VibeThinker-3B.Q8_0` emitted EOS immediately (`decode 0 tokens`, exiting `0`).
+Note on refusals: `K2-Horizon-MoVA-36B-A4B-Q4_K_M` fails validation cleanly because layer 0 attention output gate width (`4096`) exceeds expected head count (`32`); `gemma-4-12B-IQ4_XS` and `gemma-4-26B-A4B-it-qat-UD-Q4_K_XL` refuse cleanly because their `gemma4` GGUFs omit `embedding_length_per_layer_input`.
+
+### 16 GB RAM-restricted large-model sweep (`--ram-tier 16 --bench --greedy --max-tokens 32 --ctx 2048 --chunk 512`)
+
+Run under `--ram-tier 16`, which plans WARM within a 16 GiB host tier (`9830 MiB`
+WARM with `4096 MiB` pinned prefix) and enforces a hard Windows
+`SetProcessWorkingSetSizeEx` working-set cap of `12.8 GiB` (`13107.2 MiB`, `80%`
+of `16.0 GiB`). Note: on a `95.9 GiB` physical host, this enforces the engine's
+planned WARM/VRAM budgets and the process physical working-set cap cleanly, while
+external OS file-cache pressure still differs from a physical 16 GiB RAM machine
+(matching the caveat in [bench_bounded_moe.sh](../scripts/bench_bounded_moe.sh)).
+
+**Results (`11` large models `19.7–78.1 GiB` tested, `8` exit `0`, `1` range-guard exit `2`, `2` clean refusals):**
+
+| Model | Size MiB | Arch | Load ms | Prefill tok/s | Decode tok/s | ms/tok | HOT % (H/W/C) | File read MiB | Peak WS / Priv MiB | Status |
+|---|---:|---|---:|---:|---:|---:|---|---:|---|---|
+| `MiniCPM-V-4_7-35B-A3B-Q4_K_M` | 20185 | `qwen35moe` (MoE) | 6614 | 12.6 | 18.0 | 55.5 | 79.5% (10611/104/2640) | 4825 | 11969.3 / 11325.7 | ran (rc=0) |
+| `NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB_QAT_IQ2_S` | 20998 | `nemotron_h_moe` | 10253 | 13.0 | 8.8 | 113.9 | 67.3% (10290/2074/2915) | 3430 | 13107.5 / 13703.4 | ran (rc=0) |
+| `K2-Horizon-MoVA-36B-A4B-Q4_K_M` | 21331 | - | - | - | - | - | - | - | - | refused (rc=1: layer 0 attention output gate 4096 wide, expected 32) |
+| `Tiel-Coder-35B-A3B-UD-Q5_K_XL` | 25360 | `qwen35moe` (MoE) | 15048 | 4.9 | 6.7 | 149.0 | 71.7% (9510/423/3336) | 7463 | 13107.3 / 14089.5 | ran (rc=0) |
+| `Qwen3-Coder-53B-A3B-Instruct-TOTAL-RECALL-v2-MASTER-CODER-L.i1-Q4_K_M` | 30657 | `qwen3moe` (MoE) | 10914 | 5.4 | 6.3 | 159.0 | 80.9% (24430/38/5736) | 15664 | 13107.7 / 12791.0 | ran (rc=0) |
+| `Laguna-S-2.1-PS-IQ2_XXS` | 32093 | `laguna` (MoE) | 10252 | 4.1 | 5.5 | 181.1 | 59.9% (11852/858/7085) | 16439 | 13107.4 / 13818.1 | range guard fired (rc=2) |
+| `DeepSeek-V4-Flash-0731-K160-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-imatrix` | 54806 | - | - | - | - | - | - | - | - | refused (rc=1: layer 2 missing `blk.2.attn_compressor_wkv.weight`) |
+| `gpt-oss-120b-Q8_0` | 60450 | `gpt-oss` | 7951 | 5.9 | 10.5 | 94.9 | 76.7% (4133/3/1250) | 15759 | 13107.2 / 12985.0 | ran (rc=0) |
+| `Qwen3.8-Flash-Next-REAP-320-YMQ-M-TI` | 63872 | `qwen4exp` (MoE) | 9486 | 5.9 | 4.6 | 216.7 | 53.8% (10800/2359/6909) | 14689 | 13107.3 / 12166.7 | ran (rc=0) |
+| `Ornith-1.5-122B-Q4_K_M-UNCENSORED` | 75694 | `qwen35moe` (MoE) | 13504 | 2.5 | 2.0 | 497.0 | 16.3% (2790/3942/10352) | 56400 | 13108.1 / 12693.9 | ran (rc=0) |
+| `qwen3.8-flash-next-reap-288-Q4_K_M` | 79925 | `qwen4exp` (MoE) | 8721 | 4.4 | 3.2 | 310.1 | 43.6% (8809/2016/9363) | 29069 | 13107.2 / 11856.5 | ran (rc=0) |
+
 ## Historical device sweep, 2026-10-26
 
 The table below records one run per model on the original measurement machine.

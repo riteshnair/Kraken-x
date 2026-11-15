@@ -3281,7 +3281,22 @@ public:
             krk_op_scope.retag("gemm(grid)");
         } else if (rung == GemmRung::kWmma) {
 #if defined(KRK_WMMA_COMPILED)
-            const int wnf = wmma_nf();
+            static const bool wmma_override = [] {
+                const char *en = std::getenv("KRK_WMMA_NF");
+                const char *em = std::getenv("KRK_WMMA_MB");
+                return (en && *en) || (em && *em);
+            }();
+            int wnf = wmma_nf();
+            int wmb = wnf >= 2 ? wmma_cfg_n2::MB : wmma_mb();
+            if (!wmma_override) {
+                if (rows <= 32) {
+                    wnf = 1;
+                    wmb = 1;
+                } else if (rows <= 64) {
+                    wnf = 2;
+                    wmb = 1;
+                }
+            }
             const int wbn = wmma_cfg::BN;
             const unsigned bx =
                 static_cast<unsigned>((n_out + wbn - 1) / wbn);
@@ -3291,7 +3306,6 @@ public:
             // BM=32 stages it 6 times at wmb=1 and twice at wmb=4. Bit-identical
             // by construction -- same staged f16 values, same K order per
             // accumulator, only the scheduling moves.
-            const int wmb = wnf >= 2 ? wmma_cfg_n2::MB : wmma_mb();
             const i64 tile_m =
                 static_cast<i64>(wnf >= 2 ? wmma_cfg_n2::BM : wmma_cfg::BM) *
                 wmb;
@@ -3347,9 +3361,38 @@ public:
             // MODE 2 keeps the fragment loads and WMMA and skips the staging.
             // Both produce a wrong answer by construction, so they are
             // diagnostic arms only -- `kraken-bench` under the env switch.
-            if (wt == DType::Q4_K) {
-                if ((gemm_stage_only() || gemm_mma_only()) &&
-                    !getenv("KRK_GEMM_ARM_QUIET")) {
+            auto dispatch_wmma = [&](auto launch_fn) {
+                if (wnf >= 2) {
+                    if (wmb <= 1) {
+                        launch_fn(std::integral_constant<int, 1>{},
+                                  wmma_cfg_n2{});
+                    } else {
+                        launch_fn(std::integral_constant<int, 2>{},
+                                  wmma_cfg_n2{});
+                    }
+                } else if (wmb >= 4) {
+                    launch_fn(std::integral_constant<int, 4>{}, wmma_cfg{});
+                } else if (wmb >= 2) {
+                    launch_fn(std::integral_constant<int, 2>{}, wmma_cfg{});
+                } else {
+                    launch_fn(std::integral_constant<int, 0>{}, wmma_cfg{});
+                }
+            };
+            auto launch_mode = [&](auto dt_tag, auto mode_tag) {
+                constexpr int kDT = decltype(dt_tag)::value;
+                constexpr int kMODE = decltype(mode_tag)::value;
+                dispatch_wmma([&](auto mbo_tag, auto cfg_tag) {
+                    using Cfg = decltype(cfg_tag);
+                    constexpr int kMBO = decltype(mbo_tag)::value;
+                    gemm_wmma_kernel<Cfg, kMODE, kDT, kMBO>
+                        <<<grid, Cfg::THREADS>>>(
+                            wh, static_cast<int>(wt), n_out, n_in, row_bytes,
+                            xh, rows, oh, split, slice, parts, pstride);
+                });
+            };
+            if (wt == DType::Q4_K &&
+                (gemm_stage_only() || gemm_mma_only())) {
+                if (!getenv("KRK_GEMM_ARM_QUIET")) {
                     static bool said = false;
                     if (!said) {
                         said = true;
@@ -3358,58 +3401,72 @@ public:
                                                        : "mma-only");
                     }
                 }
-                // ONE launch shape for every arm, so an arm can differ from
-                // the default only in the template arguments.
                 constexpr int kQ4K = static_cast<int>(DType::Q4_K);
-#define KRK_GEMM_LAUNCH(CFG, MODE, MBO)                                      \
-    gemm_wmma_kernel<CFG, MODE, kQ4K, MBO><<<grid, CFG::THREADS>>>(          \
-        wh, static_cast<int>(wt), n_out, n_in, row_bytes, xh, rows, oh,      \
-        split, slice, parts, pstride)
-                // The diagnostic arms instantiate the SAME config the default
-                // does. They used to hard-code wmma_cfg (BM 32, MB 1, 26 kB
-                // LDS) whatever the default was, so the split they print
-                // described a kernel the engine does not run -- and on the 8B
-                // at 501 tokens that kernel measures 696.4 tok/s against the
-                // n2 default's 816.6. A split of the wrong kernel is worse
-                // than no split, because it is a number that looks like
-                // evidence.
                 if (gemm_stage_only()) {
-                    if (wnf >= 2) KRK_GEMM_LAUNCH(wmma_cfg_n2, 1, 2);
-                    else KRK_GEMM_LAUNCH(wmma_cfg, 1, 0);
-                } else if (gemm_mma_only()) {
-                    if (wnf >= 2) KRK_GEMM_LAUNCH(wmma_cfg_n2, 2, 2);
-                    else KRK_GEMM_LAUNCH(wmma_cfg, 2, 0);
-                } else if (wnf >= 2) {
-                    KRK_GEMM_LAUNCH(wmma_cfg_n2, 0, 2);
-                } else if (wmb >= 4) {
-                    KRK_GEMM_LAUNCH(wmma_cfg, 0, 4);
-                } else if (wmb >= 2) {
-                    KRK_GEMM_LAUNCH(wmma_cfg, 0, 2);
+                    if (wnf >= 2)
+                        gemm_wmma_kernel<wmma_cfg_n2, 1, kQ4K, 2>
+                            <<<grid, wmma_cfg_n2::THREADS>>>(
+                                wh, static_cast<int>(wt), n_out, n_in,
+                                row_bytes, xh, rows, oh, split, slice, parts,
+                                pstride);
+                    else
+                        gemm_wmma_kernel<wmma_cfg, 1, kQ4K, 0>
+                            <<<grid, wmma_cfg::THREADS>>>(
+                                wh, static_cast<int>(wt), n_out, n_in,
+                                row_bytes, xh, rows, oh, split, slice, parts,
+                                pstride);
                 } else {
-                    KRK_GEMM_LAUNCH(wmma_cfg, 0, 0);
+                    if (wnf >= 2)
+                        gemm_wmma_kernel<wmma_cfg_n2, 2, kQ4K, 2>
+                            <<<grid, wmma_cfg_n2::THREADS>>>(
+                                wh, static_cast<int>(wt), n_out, n_in,
+                                row_bytes, xh, rows, oh, split, slice, parts,
+                                pstride);
+                    else
+                        gemm_wmma_kernel<wmma_cfg, 2, kQ4K, 0>
+                            <<<grid, wmma_cfg::THREADS>>>(
+                                wh, static_cast<int>(wt), n_out, n_in,
+                                row_bytes, xh, rows, oh, split, slice, parts,
+                                pstride);
                 }
-#undef KRK_GEMM_LAUNCH
-            } else if (wnf >= 2)
-                gemm_wmma_kernel<wmma_cfg_n2, 0, -1, 2>
-                    <<<grid, wmma_cfg_n2::THREADS>>>(
-                        wh, static_cast<int>(wt), n_out, n_in,
-                        row_bytes, xh, rows, oh, split, slice,
-                        parts, pstride);
-            else if (wmb >= 4)
-                gemm_wmma_kernel<wmma_cfg, 0, -1, 4><<<grid, wmma_cfg::THREADS>>>(
-                    wh, static_cast<int>(wt), n_out, n_in,
-                    row_bytes, xh, rows, oh, split, slice,
-                    parts, pstride);
-            else if (wmb >= 2)
-                gemm_wmma_kernel<wmma_cfg, 0, -1, 2><<<grid, wmma_cfg::THREADS>>>(
-                    wh, static_cast<int>(wt), n_out, n_in,
-                    row_bytes, xh, rows, oh, split, slice,
-                    parts, pstride);
-            else
-                gemm_wmma_kernel<wmma_cfg, 0, -1><<<grid, wmma_cfg::THREADS>>>(
-                    wh, static_cast<int>(wt), n_out, n_in,
-                    row_bytes, xh, rows, oh, split, slice,
-                    parts, pstride);
+            } else {
+                switch (wt) {
+                    case DType::Q4_K:
+                        launch_mode(
+                            std::integral_constant<int, static_cast<int>(DType::Q4_K)>{},
+                            std::integral_constant<int, 0>{});
+                        break;
+                    case DType::Q5_K:
+                        launch_mode(
+                            std::integral_constant<int, static_cast<int>(DType::Q5_K)>{},
+                            std::integral_constant<int, 0>{});
+                        break;
+                    case DType::Q6_K:
+                        launch_mode(
+                            std::integral_constant<int, static_cast<int>(DType::Q6_K)>{},
+                            std::integral_constant<int, 0>{});
+                        break;
+                    case DType::Q8_0:
+                        launch_mode(
+                            std::integral_constant<int, static_cast<int>(DType::Q8_0)>{},
+                            std::integral_constant<int, 0>{});
+                        break;
+                    case DType::Q4_0:
+                        launch_mode(
+                            std::integral_constant<int, static_cast<int>(DType::Q4_0)>{},
+                            std::integral_constant<int, 0>{});
+                        break;
+                    case DType::F16:
+                        launch_mode(
+                            std::integral_constant<int, static_cast<int>(DType::F16)>{},
+                            std::integral_constant<int, 0>{});
+                        break;
+                    default:
+                        launch_mode(std::integral_constant<int, -1>{},
+                                    std::integral_constant<int, 0>{});
+                        break;
+                }
+            }
             if (split > 1) {
                 const i64 total = rows * n_out;
                 gemm_reduce_kernel<256>
@@ -3731,8 +3788,8 @@ public:
         return q == KvQuant::F16 || q == KvQuant::Int8;
     }
 
-    size_t kv_row_bytes(i64 kv_dim, KvQuant q) const override {
-        if (q != KvQuant::Int8) return Backend::kv_row_bytes(kv_dim, q);
+    size_t kv_row_bytes(i64 kv_dim, KvQuant q, i64 hd = 0) const override {
+        if (q != KvQuant::Int8) return Backend::kv_row_bytes(kv_dim, q, hd);
         const size_t blocks = static_cast<size_t>((kv_dim + 31) / 32);
         return static_cast<size_t>(kv_dim) + blocks * sizeof(f32);
     }
@@ -3853,7 +3910,7 @@ public:
             !attn_hash_mode() && attention_wmma_ok(d.hd, d.kv_int8, d.window) &&
             attention_wmma(out, q, kc, vc, d.n_head, d.n_kv, d.hd, d.n_tok,
                            d.pos0, pstride, d.scale, caps_.lds_bytes, nullptr,
-                           d.sinks))
+                           d.sinks, d.window))
             return;
 
         // Bit-exact prefill (see attention_bexact_kernel): the same arithmetic
@@ -4282,6 +4339,17 @@ public:
         const unsigned blocks = static_cast<unsigned>((n + 255) / 256);
         gdn_mul_act_kernel<<<blocks, 256>>>(static_cast<_Float16 *>(a),
                                             static_cast<const _Float16 *>(b), n);
+    }
+
+    void mul_slice(void *a, const void *b, i64 rows, i64 width, i64 stride,
+                   i64 off) override {
+        KRK_TIME_OP("mul_slice");
+        const i64 total = rows * width;
+        if (total <= 0) return;
+        const unsigned blocks = static_cast<unsigned>((total + 255) / 256);
+        gdn_mul_slice_kernel<<<blocks, 256>>>(
+            static_cast<_Float16 *>(a), static_cast<const _Float16 *>(b),
+            rows, width, stride, off);
     }
 
     // ---- prism.hadamard activation transform (Backend::hadamard_act) ----

@@ -271,8 +271,9 @@ void rmsnorm_rows(f32 *out, const f32 *x, const f32 *w, i64 rows, i64 n, f32 eps
 //
 // Neither loop can be made 8x: each is roughly one load and one FMA per eight
 // lanes, and the score loop pays a horizontal reduce per key. Measured below.
-#if (defined(__x86_64__) || defined(__i386__)) && \
-    (defined(__GNUC__) || defined(__clang__)) && !defined(_MSC_VER)
+#if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || \
+     defined(_M_IX86)) &&                                             \
+    (defined(__GNUC__) || defined(__clang__))
 #define KRK_ATTN_AVX2 1
 #endif
 
@@ -342,6 +343,7 @@ __attribute__((target("avx2,fma"))) inline void attn_score64(
         scores[j] += _mm_cvtss_f32(t);
     }
 }
+#endif // KRK_ATTN_AVX2
 
 // The visible-key window for one query row, computed once and shared.
 //
@@ -502,6 +504,7 @@ inline AttnRange attn_range(const AttnDesc &d, i64 t) {
     return r;
 }
 
+#if defined(KRK_ATTN_AVX2)
 // One (token, head) row on the f32 cache. Same arithmetic as the scalar body,
 // same masks, same softmax, same sink rule -- only the two inner loops change.
 // `kbase`/`vbase` address the first VISIBLE key's head slice and `row_stride`
@@ -659,6 +662,10 @@ public:
             for (void *p : entry.second) host_free(p);
         pool_free_.clear();
         pool_free_bytes_ = 0;
+        {
+            std::lock_guard<std::mutex> g(read_mu_);
+            source_readers_.clear();
+        }
         if (npu_) npu::destroy(npu_);
     }
 
@@ -727,27 +734,22 @@ public:
     //
     // `KRK_WARM_READ=memcpy` restores the old path for an A/B.
     void set_weight_sources(const std::vector<WeightSource> &sources) override {
-        std::lock_guard<std::mutex> g(read_mu_);
-        sources_ = sources;
-    }
-    // One reader handle per (thread, path). No lock, and two threads never
-    // share a HANDLE -- on Windows a handle serialises concurrent ReadFile
-    // calls, which is why the load pipeline gives each reader its own.
-    struct ThreadReaders {
-        std::vector<std::pair<std::string, std::unique_ptr<FileReader>>> by_path;
-        FileReader *get(const std::string &path) {
-            for (auto &kv : by_path)
-                if (kv.first == path) return kv.second.get();
-            auto up = std::make_unique<FileReader>();
-            if (!up->open(path)) return nullptr;
-            by_path.emplace_back(path, std::move(up));
-            return by_path.back().second.get();
+        // Closing pooled readers before swapping sources_ releases OS file
+        // handles on model reload and bumps read_gen_ so in-flight borrows
+        // from the prior source table do not re-enter the pool.
+        std::vector<std::vector<std::unique_ptr<FileReader>>> stale;
+        {
+            std::lock_guard<std::mutex> g(read_mu_);
+            ++read_gen_;
+            sources_ = sources;
+            stale.swap(source_readers_);
+            source_readers_.resize(sources_.size());
         }
-    };
-    static ThreadReaders &thread_readers() {
-        static thread_local ThreadReaders t;
-        return t;
     }
+    // Pooled FileReader handles per weight source instead of thread_local
+    // storage: Windows ReadFile serializes concurrent calls on a single HANDLE,
+    // so each active caller checks out its own reader without triggering
+    // per-thread TLS destructor teardown hazards on ephemeral worker threads.
     bool read_host(void *dst, const void *mapped_src, size_t bytes) override {
         if (!dst || !mapped_src || bytes == 0) return true;
         static const bool pull = [] {
@@ -759,15 +761,50 @@ public:
             std::memcpy(dst, mapped_src, bytes);
             return false;
         }
-        const size_t src = source_index(mapped_src);
+        std::string path;
+        size_t off = 0;
+        size_t src = static_cast<size_t>(-1);
+        size_t gen = 0;
+        bool in_range = false;
+        std::unique_ptr<FileReader> reader;
+        {
+            std::lock_guard<std::mutex> g(read_mu_);
+            src = source_index(mapped_src);
+            if (src != static_cast<size_t>(-1)) {
+                const WeightSource &s = sources_[src];
+                off = static_cast<const u8 *>(mapped_src) - s.map_base;
+                in_range = bytes <= s.map_size - off;
+                if (in_range) {
+                    gen = read_gen_;
+                    if (src < source_readers_.size() && !source_readers_[src].empty()) {
+                        reader = std::move(source_readers_[src].back());
+                        source_readers_[src].pop_back();
+                    } else {
+                        path = s.path;
+                    }
+                }
+            }
+        }
         if (src == static_cast<size_t>(-1)) {
             std::memcpy(dst, mapped_src, bytes);
             return false;
         }
-        const WeightSource &s = sources_[src];
-        const size_t off = static_cast<const u8 *>(mapped_src) - s.map_base;
-        FileReader *r = thread_readers().get(s.path);
-        if (!r || !r->at(off, dst, bytes)) {
+        if (!in_range) {
+            ++read_fail_;
+            return false;
+        }
+        bool opened = reader != nullptr;
+        if (!opened) {
+            reader = std::make_unique<FileReader>();
+            opened = reader->open(path);
+        }
+        const bool ok = opened && reader->at(off, dst, bytes);
+        if (ok) {
+            std::lock_guard<std::mutex> g(read_mu_);
+            if (gen == read_gen_ && src < source_readers_.size())
+                source_readers_[src].push_back(std::move(reader));
+        }
+        if (!ok) {
             ++read_fail_;
             std::memcpy(dst, mapped_src, bytes);
             return false;
@@ -855,9 +892,8 @@ public:
     }
     mutable std::mutex read_mu_;
     std::vector<WeightSource> sources_;
-    std::vector<std::unique_ptr<FileReader>> readers_;
-    std::mutex slot_mu_[4];
-    std::atomic<size_t> rr_{0};
+    std::vector<std::vector<std::unique_ptr<FileReader>>> source_readers_;
+    size_t read_gen_{0};
     mutable std::atomic<size_t> read_fail_{0};
 
     void *alloc(size_t bytes) override { return host_alloc(bytes); }

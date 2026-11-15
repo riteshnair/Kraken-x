@@ -4559,8 +4559,10 @@ bool Engine::forward_core(const i32 *toks, i32 n, i32 pos0, LogitMode mode) {
                        ppl_width_, ppl_width_);
         // One RMS per (token, layer) slice: the weight is the file's single
         // [n_embd_per_layer] vector, repeated per layer by the loader.
-        be_->rmsnorm_grouped(ws_ppl_in_, ws_ppl_in_,
-                             model_.ple_proj_norm_rep.data(), n, mc.n_layer,
+        const f32 *ple_w = model_.ple_proj_norm_rep_dev
+                               ? model_.ple_proj_norm_rep_dev
+                               : model_.ple_proj_norm_rep.data();
+        be_->rmsnorm_grouped(ws_ppl_in_, ws_ppl_in_, ple_w, n, mc.n_layer,
                              ppl_npl_, ppl_width_, mc.rms_eps);
         be_->add_inplace(ws_ppl_in_, ws_ppl_, n * ppl_width_);
         be_->scale_act(ws_ppl_in_, 1.0f / std::sqrt(2.0f), n, ppl_width_, ppl_width_);
@@ -11092,8 +11094,7 @@ static f64 sampled_accept_prob(const f32 *trow, const f32 *drow, i64 n) {
         i32 id;
     };
     Pick pt[20], pd[20];
-    thread_local std::vector<i32> idx;
-    idx.resize(static_cast<size_t>(n));
+    std::vector<i32> idx(static_cast<size_t>(n));
     for (i32 side = 0; side < 2; side++) {
         const f32 *row = side ? drow : trow;
         Pick *out = side ? pd : pt;
@@ -11170,8 +11171,7 @@ static void sampler_support(const f32 *logits, const SampleParams &sp,
         ps.push_back(1.0);
         return;
     }
-    thread_local std::vector<i32> idx;
-    idx.resize(static_cast<size_t>(n_vocab));
+    std::vector<i32> idx(static_cast<size_t>(n_vocab));
     for (i32 i = 0; i < n_vocab; i++) idx[static_cast<size_t>(i)] = i;
     i32 keep = n_vocab;
     if (sp.top_k > 0 && sp.top_k < keep) keep = sp.top_k;
@@ -12225,6 +12225,32 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
         // time into a row called "plan".
         KRK_TIME_HOST_N(n == 1 ? "moe.route.rest" : "moe.route.rest.batch", hs_rp);
 
+        // Cache-Prior env var and layer residency are constant across all rows of
+        // this chunk before acquire()/evict() runs; hoist both once per layer to
+        // avoid per-token getenv locks and per-(token, slot) map lookups.
+        f32 cache_prior_lambda = 0.0f;
+        if (const char *e = std::getenv("KRK_CACHE_PRIOR")) {
+            cache_prior_lambda = static_cast<f32>(std::atof(e));
+        }
+        const bool need_host_res = router_pref_ || cache_prior_lambda > 0.0f;
+        const bool precompute_res =
+            (static_cast<i64>(n) * k > ne) || (n > 1 && need_host_res);
+        if (precompute_res) {
+            route_res_.resize(static_cast<size_t>(ne));
+            for (i32 e = 0; e < ne; e++) {
+                u8 st = 0;
+                if (model_.experts().in_vram(layer, e)) st = 2;
+                else if (need_host_res && model_.experts().in_host(layer, e)) st = 1;
+                route_res_[static_cast<size_t>(e)] = st;
+            }
+        }
+        auto res_rank_of = [&](i32 e) -> int {
+            if (precompute_res) return static_cast<int>(route_res_[static_cast<size_t>(e)]);
+            if (model_.experts().in_vram(layer, e)) return 2;
+            if (need_host_res && model_.experts().in_host(layer, e)) return 1;
+            return 0;
+        };
+
         // ---- build the routing plan -------------------------------------
         // moe_sel_/moe_wt_ are [token, slot]; the gate weights are renormalized
         // over the k selected experts (the Qwen convention).
@@ -12310,10 +12336,6 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
             // is in the top-J (always selected). bias = lambda * delta * m_tilde.
             // delta = max(prob) - min(prob) for this layer's router output.
             // Weights use the original (unbiased) probability.
-            f32 cache_prior_lambda = 0.0f;
-            if (const char *e = std::getenv("KRK_CACHE_PRIOR")) {
-                cache_prior_lambda = static_cast<f32>(std::atof(e));
-            }
             f32 delta_avg = 0.0f;
             if (cache_prior_lambda > 0.0f) {
                 f32 mx = -1e30f, mn = 1e30f;
@@ -12348,8 +12370,7 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                 // (J=1 for standard MoE, J=2 for granular)
                 // We check if e is in the top-J by score
                 // m_tilde: 1 if cached or top-J
-                bool in_cache = model_.experts().in_vram(layer, e) ||
-                                model_.experts().in_host(layer, e);
+                const bool in_cache = res_rank_of(e) > 0;
                 // top-J: always promote top-J experts
                 // Determine if e is in top-J by score
                 bool is_topJ = moe_prob_[static_cast<size_t>(e)] >= topJ_threshold;
@@ -12451,10 +12472,52 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
             // for a while.
             auto resident_rank = [&](i32 e) {
                 if (!router_pref_) return 0;
-                if (model_.experts().in_vram(layer, e)) return 2;
-                if (model_.experts().in_host(layer, e)) return 1;
-                return 0;
+                return res_rank_of(e);
             };
+            const bool post_bias_only = (rb != nullptr && !pre_bias);
+            if (!hash_ids && !router_pref_ && cache_prior_lambda <= 0.0f &&
+                !grouped && k <= 64) {
+                // Single-pass exact top-k matching (score, -expert_id) tie-breaking
+                // and sc >= -1.0f floor of the general two-pass loop below.
+                f32 top_sc[64];
+                i32 top_id[64];
+                for (i32 j = 0; j < k; j++) {
+                    top_sc[j] = -1.0f;
+                    top_id[j] = -1;
+                }
+                i32 kept = 0;
+                for (i32 e = 0; e < ne; e++) {
+                    const f32 sc = moe_prob_[static_cast<size_t>(e)] +
+                                   (post_bias_only ? rb[static_cast<size_t>(e)] : 0.0f);
+                    if (sc < -1.0f) continue;
+                    if (kept == k && sc <= top_sc[k - 1]) continue;
+                    i32 pos = kept;
+                    for (i32 j = 0; j < kept; j++) {
+                        if (sc > top_sc[j]) {
+                            pos = j;
+                            break;
+                        }
+                    }
+                    const i32 end = (kept < k) ? kept : (k - 1);
+                    for (i32 j = end; j > pos; j--) {
+                        top_sc[j] = top_sc[j - 1];
+                        top_id[j] = top_id[j - 1];
+                    }
+                    top_sc[pos] = sc;
+                    top_id[pos] = e;
+                    if (kept < k) kept++;
+                }
+                for (i32 s = 0; s < k; s++) {
+                    const i32 best = top_id[s];
+                    if (best >= 0 && res_rank_of(best) == 2) router_hot_++;
+                    sel[s] = best;
+                    wt[s] = best >= 0 ? moe_prob_[static_cast<size_t>(best)] : 0.0f;
+                    if (scan_on && !scan_dev_layer && best >= 0)
+                        expert_hits_[static_cast<size_t>(layer) *
+                                         static_cast<size_t>(ne) +
+                                     static_cast<size_t>(best)] += 1;
+                }
+            } else {
             for (i32 s = 0; !hash_ids && s < k; s++) {
                 // The top available score first, so "near-equal" has something
                 // to be near. With the preference off this is the only pass and
@@ -12494,7 +12557,7 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                     // Counted in both arms: the share of picks that hit VRAM is
                     // what the preference is for, and the control has to be able
                     // to show it too.
-                    if (model_.experts().in_vram(layer, best)) router_hot_++;
+                    if (res_rank_of(best) == 2) router_hot_++;
                     if (router_pref_) {
                         router_picks_++;
                         // Exact compare: the top scorer's own score IS `top`, so
@@ -12509,6 +12572,7 @@ bool Engine::moe_ffn(const LayerWeights &L, i32 layer, i32 n) {
                     expert_hits_[static_cast<size_t>(layer) *
                                      static_cast<size_t>(ne) +
                                  static_cast<size_t>(best)] += 1;
+            }
             }
             // Sum-normalize, then scale. llama.cpp does both only when the
             // file asks for them, but this engine normalized unconditionally

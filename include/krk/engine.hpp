@@ -1937,6 +1937,7 @@ private:
     // The routing plan for the current chunk: which tokens each expert got.
     std::vector<i32> moe_sel_;    // [chunk, k] expert id per (token, slot)
     std::vector<f32> moe_wt_;     // [chunk, k] renormalized gate weight
+    std::vector<u8> route_res_;   // [n_expert] per-layer residency (2=VRAM, 1=WARM, 0=cold)
     std::vector<i32> group_rows_; // [<=chunk] token ids in the current group
     std::vector<f32> group_wt_;   // [<=chunk] their gate weights
 

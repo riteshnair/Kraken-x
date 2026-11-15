@@ -37,10 +37,12 @@ cmake --build build-asan --target kraken kraken-server kraken-tests -j2
 ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 ./build-asan/kraken-tests
 ```
 
-Current expected result for both suites is 7579/7579 checks. Update that number
-only from an actual complete run. The test runner uses `--run-group <name>`;
-`--filter` is unsupported. Build `kraken` and `kraken-server` beside the test
-binary because CLI and HTTP groups execute them.
+Current observed test count for the CPU-only Windows Release suite is 8309/8309
+checks across 190 groups (`8323/8323` checks with HIP enabled; ASan suite not
+re-run in this Windows environment). Update these counts only from an actual
+complete run. The test runner uses `--run-group <name>`; `--filter` is
+unsupported. Build `kraken` and `kraken-server` beside the test binary because
+CLI and HTTP groups execute them.
 
 ## Native Windows / MinGW diagnosis
 

@@ -30,6 +30,9 @@ static inline int krk_win_unsetenv(const char *name) { return _putenv_s(name, ""
 #include "krk/trace.hpp"
 
 #if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif

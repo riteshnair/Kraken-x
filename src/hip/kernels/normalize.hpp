@@ -76,7 +76,8 @@ __global__ void __launch_bounds__(THREADS)
     const f32 scale = scale_sh;
 
     for (i64 i = threadIdx.x; i < n; i += THREADS)
-        orow[i] = static_cast<_Float16>(static_cast<f32>(xr[i]) * sc * scale * w[i]);
+        orow[i] = static_cast<_Float16>(static_cast<f32>(xr[i]) * sc * scale *
+                                       (w ? w[i] : 1.0f));
 }
 
 // ---------------------------------------------------------------------------
@@ -203,7 +204,8 @@ __global__ void __launch_bounds__(THREADS)
     const f32 scale = scale_sh;
 
     for (i64 i = threadIdx.x; i < n; i += THREADS)
-        orow[i] = static_cast<_Float16>(static_cast<f32>(xr[i]) * mul_sh * scale * w[i]);
+        orow[i] = static_cast<_Float16>(static_cast<f32>(xr[i]) * mul_sh * scale *
+                                       (w ? w[i] : 1.0f));
 }
 
 // ---------------------------------------------------------------------------

@@ -67,6 +67,11 @@ static void rv32_ternary_differential() {
           "RV32 VDOT exactly matches native TQ1_0 integer dot");
 }
 
+static bool bytes_equal(const std::vector<f32> &a, const std::vector<f32> &b) {
+    return a.size() == b.size() &&
+           std::memcmp(a.data(), b.data(), a.size() * sizeof(f32)) == 0;
+}
+
 static void runtime_recovery() {
     std::vector<i8> trits(256);
     for (i32 i = 0; i < 256; i++) trits[i] = static_cast<i8>((i * 17 + 3) % 3 - 1);
@@ -113,15 +118,15 @@ static void runtime_recovery() {
     const i64 grouped_cols[] = {4, 4};
     cpu->gemm_group(grouped_out, x.data(), grouped_w, DType::TQ1_0, grouped_cols,
                     256, 2, 1);
-    CHECK(std::memcmp(grouped_a.data(), baseline.data(), sizeof(baseline)) == 0 &&
-          std::memcmp(grouped_b.data(), baseline.data(), sizeof(baseline)) == 0,
+    CHECK(bytes_equal(grouped_a, baseline) &&
+          bytes_equal(grouped_b, baseline),
           "default grouped GEMM remains bit-identical to ungrouped GEMM");
     set_activation_recovery_mode(ActivationRecoveryMode::Residual);
     cpu->gemm(recovered.data(), x.data(), w.data(), DType::TQ1_0, 4, 256, 1);
     cpu->gemm_group(grouped_out, x.data(), grouped_w, DType::TQ1_0, grouped_cols,
                     256, 2, 1);
-    CHECK(std::memcmp(grouped_a.data(), recovered.data(), sizeof(recovered)) == 0 &&
-          std::memcmp(grouped_b.data(), recovered.data(), sizeof(recovered)) == 0,
+    CHECK(bytes_equal(grouped_a, recovered) &&
+          bytes_equal(grouped_b, recovered),
           "residual grouped GEMM uses the same per-matrix policy");
     f32 base_error = 0, recovered_error = 0;
     for (i32 o = 0; o < 4; o++) {
@@ -137,7 +142,7 @@ static void runtime_recovery() {
     for (i32 o = 0; o < 4; o++) reference[o] = vec_dot(DType::TQ1_0, w.data() + o * 54, x.data(), 256);
     set_activation_recovery_mode(ActivationRecoveryMode::Adaptive);
     cpu->gemm(fallback.data(), x.data(), w.data(), DType::TQ1_0, 4, 256, 1);
-    CHECK(std::memcmp(fallback.data(), reference.data(), sizeof(fallback)) == 0,
+    CHECK(bytes_equal(fallback, reference),
           "adaptive high-risk row is bit-identical to native F32 activation GEMM");
     set_activation_recovery_mode(ActivationRecoveryMode::Off);
 }

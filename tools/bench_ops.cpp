@@ -850,10 +850,11 @@ i64 gate_expert_lease(Backend *be) {
         GgufTensor t;
         t.type = DType::F16;
         t.dtype_known = true;
-        t.n_dims = 2;
+        t.n_dims = 3;
         t.ne[0] = static_cast<u64>(kPer / 2);
         t.ne[1] = 1;
-        t.n_elements = kPer / 2;
+        t.ne[2] = static_cast<u64>(kExperts);
+        t.n_elements = (kPer / 2) * kExperts;
         t.n_bytes = buf.size();
         t.data = buf.data();
         return t;
@@ -1695,18 +1696,16 @@ BitExact attn_rows_case(Backend *be, const AttnCase &c, i64 n_tok, i64 n_keys) {
 //   tile      -- one call of N rows against ceil(N/16) calls of one tile, which
 //                must be IDENTICAL;
 //   vs_exact  -- the same row through the matrix cores and through the
-//                bit-exact kernel, which must DIFFER. Without the second the
-//                first passes just as well when the fast kernel is never
-//                reached (LDS too small, shape refused), i.e. when it measures
-//                the same kernel twice.
+//                bit-exact kernel, which must DIFFER and stay within tolerance.
 struct AwCase {
     BitExact tile;
+    BitExact vs_exact_diff;
     i64 vs_exact = 0;
     i64 n_vs = 0;
 };
 
 AwCase attn_wmma_tile_case(Backend *be, const AttnCase &c, i64 n_tok,
-                           i64 n_keys) {
+                           i64 n_keys, i64 window = 0) {
     AwCase out_r;
     const size_t qsz = static_cast<size_t>(n_tok) *
                        static_cast<size_t>(c.n_head) *
@@ -1745,7 +1744,7 @@ AwCase attn_wmma_tile_case(Backend *be, const AttnCase &c, i64 n_tok,
     d.pos_stride = c.n_kv * c.hd;
     d.scale = static_cast<f32>(1.0 / std::sqrt(static_cast<f64>(c.hd)));
     d.causal = true;
-    d.window = 0;
+    d.window = window;
     const i64 pos0 = n_keys - n_tok;
     const size_t row_elems = static_cast<size_t>(c.n_head) *
                              static_cast<size_t>(c.hd);
@@ -1786,6 +1785,7 @@ AwCase attn_wmma_tile_case(Backend *be, const AttnCase &c, i64 n_tok,
     be->download(b.data(), split, b.size() * 2);
     be->download(x.data(), exact, x.size() * 2);
     out_r.tile = cmp_half(a, b, static_cast<i64>(qsz));
+    out_r.vs_exact_diff = cmp_half(a, x, static_cast<i64>(qsz));
     out_r.n_vs = static_cast<i64>(qsz);
     for (size_t i = 0; i < qsz; i++)
         if (a[i] != x[i]) out_r.vs_exact++;
@@ -2098,14 +2098,14 @@ i64 arm_rows_bitexact(Backend *be) {
             }
         }
     }
-    // ---- matrix-core prefill: row-tile invariance (hd 256 only) -----------
+    // ---- matrix-core prefill: row-tile invariance (hd 64/128/256/512 + window)
     //
     // Forced on for these rows and restored after, so the identity rows above
     // keep measuring the bit-exact kernel and this arm keeps measuring the one
     // that is allowed to differ from decode. The arm count is printed: an arm
     // that cannot launch (LDS too small) must not read as a pass.
-    std::printf("\nmatrix-core prefill (hd 256): one call of N rows against one "
-                "call per 16-row tile:\n");
+    std::printf("\nmatrix-core prefill (hd 64/128/256/512 + window): one call of "
+                "N rows against one call per 16-row tile:\n");
     i64 aw_bad = 0;
     i64 aw_arms = 0;
     {
@@ -2121,31 +2121,43 @@ i64 arm_rows_bitexact(Backend *be) {
         const std::string saved = pe ? pe : "";
         setenv("KRK_ATTN_WMMA", "1", 1);
 #endif
-        for (const AttnCase &c : attn) {
-            if (c.hd != 256) continue;
-            char tag[32];
-            std::snprintf(tag, sizeof tag, "hd%lld/%lldh",
-                          static_cast<long long>(c.hd),
-                          static_cast<long long>(c.n_head));
+        struct AwShape { AttnCase c; i64 window; const char *tag; };
+        const AwShape aw_shapes[] = {
+            {{64, 8, 2, "attn"}, 0, "hd64/8h"},
+            {{128, 16, 2, "attn"}, 0, "hd128/16h"},
+            {{256, 16, 2, "attn"}, 0, "hd256/16h"},
+            {{512, 8, 2, "attn"}, 0, "hd512/8h"},
+            {{256, 16, 2, "attn"}, 64, "hd256/w64"},
+        };
+        for (const AwShape &s : aw_shapes) {
             for (i64 n_keys : attn_keys) {
                 for (i64 nrows : {16, 32, 48}) {
                     if (nrows > n_keys) continue;
-                    const AwCase w = attn_wmma_tile_case(be, c, nrows, n_keys);
+                    const AwCase w = attn_wmma_tile_case(be, s.c, nrows, n_keys,
+                                                         s.window);
                     aw_arms++;
                     if (w.tile.differ) aw_bad++;
-                    print_bitexact("attn-wmma", tag, c.n_head * c.hd, n_keys,
+                    print_bitexact("attn-wmma", s.tag, s.c.n_head * s.c.hd, n_keys,
                                    nrows, nrows - 1, w.tile);
-                    // The kernel must have RUN: identical output to the exact
-                    // arm means it fell back and this row proved nothing.
+                    // Must both launch (differ from exact scalar/bexact) and
+                    // agree numerically within fp16 accumulation error.
                     if (w.vs_exact == 0) {
                         aw_bad++;
-                        std::printf("  %-14s %-5s in=%-5lld rows=%-3lld "
+                        std::printf("  %-14s %-9s in=%-5lld rows=%-3lld "
                                     "VACUOUS: the matrix-core arm produced "
                                     "the bit-exact kernel's own output, so it "
                                     "never launched\n",
-                                    "attn-wmma", tag,
+                                    "attn-wmma", s.tag,
                                     static_cast<long long>(n_keys),
                                     static_cast<long long>(nrows));
+                    } else if (w.vs_exact_diff.max_abs > 0.05f) {
+                        aw_bad++;
+                        std::printf("  %-14s %-9s in=%-5lld rows=%-3lld "
+                                    "NUMERICS BAD: max_abs vs exact=%.6f\n",
+                                    "attn-wmma", s.tag,
+                                    static_cast<long long>(n_keys),
+                                    static_cast<long long>(nrows),
+                                    w.vs_exact_diff.max_abs);
                     }
                 }
             }

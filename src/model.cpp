@@ -2567,6 +2567,15 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
                 std::copy(one.begin(), one.end(),
                           ple_proj_norm_rep.begin() + static_cast<size_t>(g * npl));
         }
+        if (be_->has_device_memory()) {
+            const size_t bytes = static_cast<size_t>(wid) * sizeof(f32);
+            ple_proj_norm_rep_dev = static_cast<f32 *>(be_->alloc(bytes));
+            if (!ple_proj_norm_rep_dev) {
+                if (err) *err = "out of device memory for per_layer_proj_norm";
+                return false;
+            }
+            be_->upload(ple_proj_norm_rep_dev, ple_proj_norm_rep.data(), bytes, 0);
+        }
         KRK_INFO("per-layer embd: n_layer %lld x %lld wide, model proj [%lld, %lld]",
                  static_cast<long long>(cfg_.n_layer), static_cast<long long>(npl),
                  static_cast<long long>(ple_model_proj.n_out),
@@ -2923,7 +2932,7 @@ bool Model::load(Backend &be, const std::string &path, std::string *err) {
             // default 1.0 below is then the exact value.
             f32 *os = upload_f32(blk_key("blk.%d.layer_output_scale.weight", l));
             if (os) {
-                L.out_scale = *os;
+                be_->download_f32(&L.out_scale, os, 1);
                 be_->release(os);
             }
         }
@@ -6446,7 +6455,8 @@ void Model::unload() {
     // for the lifetime of the graph.
     std::unordered_set<f32 *> released_global_f32;
     for (f32 *f : {out_norm_, out_norm_bias_, embd_norm_, embd_norm_bias_,
-                   hc_head_norm_, hc_head_base_, hc_head_scale_, ple_proj_norm})
+                   hc_head_norm_, hc_head_base_, hc_head_scale_, ple_proj_norm,
+                   ple_proj_norm_rep_dev})
         if (f && released_global_f32.insert(f).second) be_->release(f);
     if (prefetch_host_) be_->release_host(prefetch_host_);
     prefetch_host_ = nullptr;
@@ -6535,6 +6545,8 @@ void Model::unload() {
     tok_embd_ = {};
     out_head_ = {};
     out_norm_ = nullptr;
+    ple_proj_norm = nullptr;
+    ple_proj_norm_rep_dev = nullptr;
     be_ = nullptr;
 }
 

@@ -150,6 +150,18 @@ __global__ void gdn_mul_act_kernel(_Float16 *__restrict__ a,
     a[i] = static_cast<_Float16>(static_cast<f32>(a[i]) * static_cast<f32>(b[i]));
 }
 
+__global__ void gdn_mul_slice_kernel(_Float16 *__restrict__ a,
+                                     const _Float16 *__restrict__ b, i64 rows,
+                                     i64 width, i64 stride, i64 off) {
+    const i64 i = static_cast<i64>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const i64 total = rows * width;
+    if (i >= total) return;
+    const i64 r = i / width;
+    const i64 c = i % width;
+    a[i] = static_cast<_Float16>(static_cast<f32>(a[i]) *
+                                 static_cast<f32>(b[r * stride + off + c]));
+}
+
 // Laguna's attention output gate: one scalar per (token, head) multiplies the
 // whole head row. x is [n_tok, n_head*hd] and g is dense [n_tok, n_head], so
 // the elementwise gdn_mul_act_kernel above cannot express it -- the operands

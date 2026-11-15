@@ -1407,7 +1407,7 @@ bool ExpertCache::pick_warm_victim(u64 *out) {
     bool best_shadow = false; // the copy backs an expert that is in VRAM
     for (const auto &kv : slots_) {
         const Slot &s = kv.second;
-        if (!s.in_host()) continue;
+        if (!s.in_host() || s.leased) continue;
         const bool shadow = s.in_vram();
         if (!have) {
             best = kv.first;
@@ -1742,6 +1742,10 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
     const void *batch_src[3] = {};
     size_t batch_len[3] = {};
     int nb = 0;
+    void *upload_dst[3] = {};
+    const void *upload_src[3] = {};
+    size_t upload_len[3] = {};
+    int nu = 0;
     // Collected here and issued as ONE concurrent batch after the loop. Three
     // slices read one at a time, one expert after another, is the whole of a
     // 20 ms layer on GLM-4.7-Flash (~1 GB/s of weight traffic); the three
@@ -1809,17 +1813,18 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
             batch_src[nb] = warms[i]->data;
             batch_len[nb] = per;
             nb++;
+        } else if (be_->has_device_memory()) {
+            // Rejected or no WARM tier on a device backend: dsts[i]->data is
+            // device memory, so stream/pull from the mapping via upload()
+            // instead of passing a device pointer to read_host_batch().
+            upload_dst[nu] = dsts[i]->data;
+            upload_src[nu] = t->plane(e);
+            upload_len[nu] = per;
+            total_read += per;
+            nu++;
         } else {
-            // Rejected or no tier: read it in the way the cache did before the
-            // tier existed, straight from the mapping through the pull path.
-            //
-            // Timed as a READ, not as a transfer: this IS the file read, and on
-            // the arm this cache exists for -- no WARM tier, so every miss comes
-            // here -- it is the whole I/O cost of the run. It used to sit
-            // outside every timer, and the consequence was a profile that
-            // claimed `expert-path read 0.0 ms` while the same run reported
-            // 366 MiB read from the file. `xfer` is for the DMA out of a WARM
-            // buffer, where the bytes are already in RAM.
+            // CPU/host-pooled backend: dsts[i]->data is host memory, so read
+            // straight into it through the reader pool.
             read_reqs[nr].dst = dsts[i]->data;
             read_reqs[nr].mapped_src = t->plane(e);
             read_reqs[nr].bytes = per;
@@ -1827,15 +1832,17 @@ const ResidentExpert *ExpertCache::acquire(const ExpertSource &src, i32 layer,
             nr++;
         }
     }
-    if (nr > 0) {
+    if (loaded && (nr > 0 || nu > 0)) {
         MsTimer read_clock(&read_ms_, phase_sink(&pf_read_ms_, &dc_read_ms_));
         // `warm.read` is the DISK-TIER read a cold expert pays. On a model
         // whose routed set does not fit, this row is the step.
         HostAdd h("expert.warm.read");
-        be_->read_host_batch(read_reqs, nr);
+        if (nr > 0) be_->read_host_batch(read_reqs, nr);
+        for (int u = 0; u < nu; u++)
+            be_->upload(upload_dst[u], upload_src[u], upload_len[u], 0);
         h.bytes(static_cast<krk::i64>(total_read));
     }
-    {
+    if (loaded && nb > 0) {
         MsTimer t(&xfer_ms_, phase_sink(&pf_xfer_ms_, &dc_xfer_ms_));
         // A COLD miss just read those bytes into WARM, and when that copy is
         // pinned the read left them in a buffer the device can be handed

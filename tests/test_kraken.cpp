@@ -17355,15 +17355,18 @@ static std::string run_generate_text(const std::string &exe,
                                      const std::string &model,
                                      const std::string &prompt, int chunk,
                                      int n, const std::string &tag,
-                                     int &rc_out) {
+                                     int &rc_out,
+                                     const char *extra = nullptr) {
+    const std::string full_tag = tag + std::string(extra ? extra : "");
     const std::string o = "kraken-prefill-gen-" + std::to_string(chunk) +
-                          tag + ".txt";
+                          full_tag + ".txt";
     const std::string e = "kraken-prefill-err-gen-" + std::to_string(chunk) +
-                          tag + ".txt";
+                          full_tag + ".txt";
     std::string cmd = "\"" + exe + "\" -m \"" + model + "\" -p \"" + prompt +
                       "\" --ctx 64 --chunk " + std::to_string(chunk) +
-                      " --greedy -n " + std::to_string(n) + " > \"" + o +
-                      "\" 2> \"" + e + "\"";
+                      " --greedy -n " + std::to_string(n) +
+                      (extra ? (" " + std::string(extra)) : std::string()) +
+                      " > \"" + o + "\" 2> \"" + e + "\"";
 #ifdef _WIN32
     const std::string full = "call " + cmd;
 #else
@@ -17711,9 +17714,27 @@ static void test_gemma_family_chunk_gate() {
         CHECK(build_gemma_gate_model(f.file, f.arch, f.cap),
               (std::string("wrote the ") + f.arch + " fixture this gate prefills")
                   .c_str());
-        const PrefillProbe c1 = run_prefill_hash(exe, f.file, prompt, 1, false);
-        const PrefillProbe c8 = run_prefill_hash(exe, f.file, prompt, 8, false);
-        const PrefillProbe c32 = run_prefill_hash(exe, f.file, prompt, 32, false);
+        const char *extra = nullptr;
+#ifdef KRK_TEST_HIP_BUILD
+        // gemma2 carries attention.logit_softcapping, which HIP refuses by
+        // name; exercise the refusal on default HIP and run the chunk gate
+        // on the supported --cpu reference, while gemma3 stays on HIP.
+        if (f.cap) {
+            const PrefillProbe refused =
+                run_prefill_hash(exe, f.file, prompt, 8, false);
+            CHECK(!refused.ok &&
+                      refused.err.find("softcap") != std::string::npos,
+                  "gemma2 refuses HIP cleanly because attention softcap is "
+                  "CPU/NPU-only");
+            extra = "--cpu";
+        }
+#endif
+        const PrefillProbe c1 =
+            run_prefill_hash(exe, f.file, prompt, 1, false, false, extra);
+        const PrefillProbe c8 =
+            run_prefill_hash(exe, f.file, prompt, 8, false, false, extra);
+        const PrefillProbe c32 =
+            run_prefill_hash(exe, f.file, prompt, 32, false, false, extra);
         CHECK(c1.ok, (std::string(f.arch) + " loads and prefills at chunk 1").c_str());
         CHECK(c8.ok, (std::string(f.arch) + " loads and prefills at chunk 8").c_str());
         CHECK(c32.ok,
@@ -17758,8 +17779,8 @@ static void test_gemma_family_chunk_gate() {
         // Token generation on the same file: a greedy decode must run and
         // print text (a load that refused, or a NaN forward, prints nothing).
         int rc = -1;
-        const std::string txt =
-            run_generate_text(exe, f.file, prompt.substr(0, 40), 1, 8, f.arch, rc);
+        const std::string txt = run_generate_text(
+            exe, f.file, prompt.substr(0, 40), 1, 8, f.arch, rc, extra);
         CHECK(rc == 0 && !txt.empty(),
               (std::string(f.arch) +
                ": decodes 8 greedy tokens without failing")
@@ -17771,8 +17792,14 @@ static void test_gemma_family_chunk_gate() {
     const std::string nokey = "kraken-gemma2-nocap.gguf";
     CHECK(build_gemma_gate_model(nokey, "gemma2", false),
           "wrote the same gemma2 file without attention.logit_softcapping");
-    const PrefillProbe a = run_prefill_hash(exe, capped, prompt, 8, false);
-    const PrefillProbe bcap = run_prefill_hash(exe, nokey, prompt, 8, false);
+    const char *ctrl_extra = nullptr;
+#ifdef KRK_TEST_HIP_BUILD
+    ctrl_extra = "--cpu";
+#endif
+    const PrefillProbe a =
+        run_prefill_hash(exe, capped, prompt, 8, false, false, ctrl_extra);
+    const PrefillProbe bcap =
+        run_prefill_hash(exe, nokey, prompt, 8, false, false, ctrl_extra);
     CHECK(a.ok && bcap.ok, "both gemma2 files prefill");
     if (a.ok && bcap.ok) {
         CHECK(a.trace != bcap.trace,

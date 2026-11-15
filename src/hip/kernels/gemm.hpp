@@ -532,6 +532,252 @@ __device__ __forceinline__ void q4k_decode_raw(const Q4KRaw &r, int chunk,
     }
 }
 
+using u16_a2 = u16 __attribute__((aligned(2)));
+using uint4_a2 = uint4 __attribute__((aligned(2)));
+
+template <bool VEC16>
+__device__ __forceinline__ uint4 pipe_load_v4(const u8 *p, bool vec_ok) {
+    if (vec_ok) {
+        if constexpr (VEC16) return *reinterpret_cast<const uint4 *>(p);
+        return *reinterpret_cast<const uint4_a2 *>(p);
+    }
+    return make_uint4(d_u32(p), d_u32(p + 4), d_u32(p + 8), d_u32(p + 12));
+}
+
+template <int DT>
+struct WeightPipe {
+    struct Raw {
+        u8 unused;
+    };
+    static constexpr bool kHasPipe = false;
+    __device__ __forceinline__ static void load(const u8 *, int, bool, bool,
+                                                Raw &) {}
+    __device__ __forceinline__ static void decode(const Raw &, int,
+                                                  _Float16 *) {}
+};
+
+template <>
+struct WeightPipe<static_cast<int>(DType::Q4_K)> {
+    using Raw = Q4KRaw;
+    static constexpr bool kHasPipe = true;
+    __device__ __forceinline__ static void load(const u8 *blk, int chunk,
+                                                bool vec16, bool, Raw &r) {
+        q4k_load_raw(blk, chunk, vec16, r);
+    }
+    __device__ __forceinline__ static void decode(const Raw &r, int chunk,
+                                                  _Float16 *y) {
+        q4k_decode_raw(r, chunk, y);
+    }
+};
+
+template <>
+struct WeightPipe<static_cast<int>(DType::Q5_K)> {
+    struct Raw {
+        u32 hdr;
+        u32 sc[3];
+        u32 qh[8];
+        u32 p[8];
+    };
+    static constexpr bool kHasPipe = true;
+    __device__ __forceinline__ static void load(const u8 *blk, int chunk,
+                                                bool vec16, bool, Raw &r) {
+        const int g = chunk >> 1;
+        const uint4 h = pipe_load_v4<true>(blk, vec16);
+        r.hdr = h.x;
+        r.sc[0] = h.y;
+        r.sc[1] = h.z;
+        r.sc[2] = h.w;
+        const uint4 qh0 = pipe_load_v4<true>(blk + 16, vec16);
+        const uint4 qh1 = pipe_load_v4<true>(blk + 32, vec16);
+        const uint4 p0 = pipe_load_v4<true>(blk + 48 + g * 32, vec16);
+        const uint4 p1 = pipe_load_v4<true>(blk + 64 + g * 32, vec16);
+        r.qh[0] = qh0.x; r.qh[1] = qh0.y; r.qh[2] = qh0.z; r.qh[3] = qh0.w;
+        r.qh[4] = qh1.x; r.qh[5] = qh1.y; r.qh[6] = qh1.z; r.qh[7] = qh1.w;
+        r.p[0] = p0.x; r.p[1] = p0.y; r.p[2] = p0.z; r.p[3] = p0.w;
+        r.p[4] = p1.x; r.p[5] = p1.y; r.p[6] = p1.z; r.p[7] = p1.w;
+    }
+    __device__ __forceinline__ static void decode(const Raw &r, int chunk,
+                                                  _Float16 *y) {
+        const f32 d = d_h2f(static_cast<u16>(r.hdr & 0xFFFFu));
+        const f32 dmin = d_h2f(static_cast<u16>(r.hdr >> 16));
+        u8 si, mi;
+        if (chunk < 4) {
+            si = static_cast<u8>(q4k_scale_at(r.sc, chunk) & 63);
+            mi = static_cast<u8>(q4k_scale_at(r.sc, chunk + 4) & 63);
+        } else {
+            si = static_cast<u8>((q4k_scale_at(r.sc, chunk + 4) & 0xF) |
+                                 ((q4k_scale_at(r.sc, chunk - 4) >> 6) << 4));
+            mi = static_cast<u8>((q4k_scale_at(r.sc, chunk + 4) >> 4) |
+                                 ((q4k_scale_at(r.sc, chunk) >> 6) << 4));
+        }
+        const f32 dl = d * static_cast<f32>(si);
+        const f32 mn = dmin * static_cast<f32>(mi);
+        const int nsh = (chunk & 1) == 0 ? 0 : 4;
+#pragma unroll
+        for (int w = 0; w < 8; w++) {
+            const u32 pack = r.p[w];
+            const u32 hpack = r.qh[w];
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int base = static_cast<int>((pack >> (8 * e + nsh)) & 0xF);
+                const int hb =
+                    static_cast<int>((hpack >> (8 * e + chunk)) & 1u) << 4;
+                y[w * 4 + e] =
+                    static_cast<_Float16>(dl * static_cast<f32>(base + hb) - mn);
+            }
+        }
+    }
+};
+
+template <>
+struct WeightPipe<static_cast<int>(DType::Q6_K)> {
+    struct Raw {
+        u32 d_sc;
+        u32 ql[8];
+        u32 qh[8];
+    };
+    static constexpr bool kHasPipe = true;
+    __device__ __forceinline__ static void load(const u8 *blk, int chunk, bool,
+                                                bool vec2, Raw &r) {
+        const int g = chunk >> 2;
+        const int p = chunk & 3;
+        const u8 *ql_p = blk + g * 64 + ((p & 1) ? 32 : 0);
+        const u8 *qh_p = blk + 128 + g * 32;
+        if (vec2) {
+            const u16 d16 = *reinterpret_cast<const u16_a2 *>(blk + 208);
+            const u16 sc16 =
+                *reinterpret_cast<const u16_a2 *>(blk + 192 + g * 8 + p * 2);
+            r.d_sc = static_cast<u32>(d16) | (static_cast<u32>(sc16) << 16);
+        } else {
+            const u16 d16 = static_cast<u16>(blk[208] | (blk[209] << 8));
+            const u8 *scp = blk + 192 + g * 8 + p * 2;
+            const u16 sc16 = static_cast<u16>(scp[0] | (scp[1] << 8));
+            r.d_sc = static_cast<u32>(d16) | (static_cast<u32>(sc16) << 16);
+        }
+        const uint4 l0 = pipe_load_v4<false>(ql_p, vec2);
+        const uint4 l1 = pipe_load_v4<false>(ql_p + 16, vec2);
+        const uint4 h0 = pipe_load_v4<false>(qh_p, vec2);
+        const uint4 h1 = pipe_load_v4<false>(qh_p + 16, vec2);
+        r.ql[0] = l0.x; r.ql[1] = l0.y; r.ql[2] = l0.z; r.ql[3] = l0.w;
+        r.ql[4] = l1.x; r.ql[5] = l1.y; r.ql[6] = l1.z; r.ql[7] = l1.w;
+        r.qh[0] = h0.x; r.qh[1] = h0.y; r.qh[2] = h0.z; r.qh[3] = h0.w;
+        r.qh[4] = h1.x; r.qh[5] = h1.y; r.qh[6] = h1.z; r.qh[7] = h1.w;
+    }
+    __device__ __forceinline__ static void decode(const Raw &r, int chunk,
+                                                  _Float16 *y) {
+        const f32 d = d_h2f(static_cast<u16>(r.d_sc & 0xFFFFu));
+        const i8 s0 =
+            static_cast<i8>(static_cast<u8>((r.d_sc >> 16) & 0xFFu));
+        const i8 s1 = static_cast<i8>(static_cast<u8>(r.d_sc >> 24));
+        const f32 dl0 = d * static_cast<f32>(s0);
+        const f32 dl1 = d * static_cast<f32>(s1);
+        const u32 nsh = (chunk & 2) ? 4u : 0u;
+        const u32 hsh = static_cast<u32>(chunk & 3) * 2u;
+#pragma unroll
+        for (int w = 0; w < 8; w++) {
+            const u32 codes = ((r.ql[w] >> nsh) & 0x0F0F0F0Fu) |
+                              (((r.qh[w] >> hsh) & 0x03030303u) << 4);
+            const f32 dl = (w < 4) ? dl0 : dl1;
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int qv = static_cast<int>((codes >> (8 * e)) & 0x3Fu);
+                y[w * 4 + e] =
+                    static_cast<_Float16>(dl * static_cast<f32>(qv - 32));
+            }
+        }
+    }
+};
+
+template <>
+struct WeightPipe<static_cast<int>(DType::Q8_0)> {
+    struct Raw {
+        u32 d;
+        u32 q[8];
+    };
+    static constexpr bool kHasPipe = true;
+    __device__ __forceinline__ static void load(const u8 *blk, int, bool,
+                                                bool vec2, Raw &r) {
+        r.d = vec2 ? static_cast<u32>(*reinterpret_cast<const u16_a2 *>(blk))
+                   : static_cast<u32>(blk[0] | (blk[1] << 8));
+        const uint4 q0 = pipe_load_v4<false>(blk + 2, vec2);
+        const uint4 q1 = pipe_load_v4<false>(blk + 18, vec2);
+        r.q[0] = q0.x; r.q[1] = q0.y; r.q[2] = q0.z; r.q[3] = q0.w;
+        r.q[4] = q1.x; r.q[5] = q1.y; r.q[6] = q1.z; r.q[7] = q1.w;
+    }
+    __device__ __forceinline__ static void decode(const Raw &r, int,
+                                                  _Float16 *y) {
+        const f32 d = d_h2f(static_cast<u16>(r.d));
+#pragma unroll
+        for (int w = 0; w < 8; w++) {
+            const u32 pack = r.q[w];
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const i8 qv =
+                    static_cast<i8>(static_cast<u8>((pack >> (8 * e)) & 0xFFu));
+                y[w * 4 + e] = static_cast<_Float16>(d * static_cast<f32>(qv));
+            }
+        }
+    }
+};
+
+template <>
+struct WeightPipe<static_cast<int>(DType::Q4_0)> {
+    struct Raw {
+        u32 d;
+        u32 p[4];
+    };
+    static constexpr bool kHasPipe = true;
+    __device__ __forceinline__ static void load(const u8 *blk, int, bool,
+                                                bool vec2, Raw &r) {
+        r.d = vec2 ? static_cast<u32>(*reinterpret_cast<const u16_a2 *>(blk))
+                   : static_cast<u32>(blk[0] | (blk[1] << 8));
+        const uint4 p0 = pipe_load_v4<false>(blk + 2, vec2);
+        r.p[0] = p0.x; r.p[1] = p0.y; r.p[2] = p0.z; r.p[3] = p0.w;
+    }
+    __device__ __forceinline__ static void decode(const Raw &r, int,
+                                                  _Float16 *y) {
+        const f32 d = d_h2f(static_cast<u16>(r.d));
+#pragma unroll
+        for (int w = 0; w < 4; w++) {
+            const u32 pack = r.p[w];
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int lo = static_cast<int>((pack >> (8 * e)) & 0xFu) - 8;
+                const int hi =
+                    static_cast<int>((pack >> (8 * e + 4)) & 0xFu) - 8;
+                y[w * 4 + e] = static_cast<_Float16>(d * static_cast<f32>(lo));
+                y[16 + w * 4 + e] =
+                    static_cast<_Float16>(d * static_cast<f32>(hi));
+            }
+        }
+    }
+};
+
+template <>
+struct WeightPipe<static_cast<int>(DType::F16)> {
+    struct Raw {
+        u32 p[16];
+    };
+    static constexpr bool kHasPipe = true;
+    __device__ __forceinline__ static void load(const u8 *blk, int, bool vec16,
+                                                bool, Raw &r) {
+#pragma unroll
+        for (int q = 0; q < 4; q++) {
+            const uint4 v = pipe_load_v4<true>(blk + q * 16, vec16);
+            r.p[q * 4 + 0] = v.x;
+            r.p[q * 4 + 1] = v.y;
+            r.p[q * 4 + 2] = v.z;
+            r.p[q * 4 + 3] = v.w;
+        }
+    }
+    __device__ __forceinline__ static void decode(const Raw &r, int,
+                                                  _Float16 *y) {
+#pragma unroll
+        for (int w = 0; w < 16; w++)
+            *reinterpret_cast<u32 *>(&y[w * 2]) = r.p[w];
+    }
+};
+
 // MODE exists for the probe's staging-vs-MMA split (probe_decode §2c): the
 // engine always launches MODE 0. MODE 1 keeps the staging loops and the
 // barriers but skips the WMMA, folding a cheap LDS read of the staged tiles
@@ -616,14 +862,13 @@ inline int pick_split(int base_blocks, i64 n_in, int bk,
     return best;
 }
 
-// MBO overrides CFG::MB at the instantiation, so the MB lever can be swept
-// without a rebuild. 0 = use the config's own value.
-template <typename CFG, int MODE = 0, int DT = -1, int MBO = 0>
-__global__ void __launch_bounds__(CFG::THREADS)
-    gemm_wmma_kernel(const u8 *__restrict__ w, int wt, i64 n_out, i64 n_in,
-                     size_t w_row_bytes, const _Float16 *__restrict__ x, i64 rows,
-                     _Float16 *__restrict__ out, i64 n_split, i64 slice_len,
-                     f32 *__restrict__ partials, i64 part_stride) {
+// Shared device body for tiled WMMA GEMM across single-matrix and grouped launches.
+template <typename CFG, int MODE, int DT, int MB>
+__device__ __forceinline__ void gemm_wmma_tile_body(
+    const u8 *__restrict__ w, int wt, i64 n_out, i64 n_in, size_t w_row_bytes,
+    const _Float16 *__restrict__ x, i64 rows, i64 row_base, i64 col_base,
+    _Float16 *__restrict__ out, i64 k_off, i64 k_n, f32 *__restrict__ partials,
+    i64 part_off) {
     constexpr int BM = CFG::BM;
     constexpr int BN = CFG::BN;
     constexpr int BK = CFG::BK;
@@ -631,7 +876,6 @@ __global__ void __launch_bounds__(CFG::THREADS)
     constexpr int WAVES_M = CFG::WAVES_M;
     constexpr int WAVES_N = CFG::WAVES_N;
     constexpr int LD_PAD = CFG::LD_PAD;
-    constexpr int MB = MBO > 0 ? MBO : CFG::MB;
     static_assert(MB >= 1 && MB <= 8, "MB outside the accumulator array");
     constexpr int NF = CFG::NF;
     static_assert(NF >= 1 && NF <= 2, "NF outside the epilogue mapping");
@@ -639,20 +883,6 @@ __global__ void __launch_bounds__(CFG::THREADS)
     // staged by ONE pass and consumed by MB back-to-back MMAs (§22.20).
     __shared__ _Float16 xs[MB][BM][BK + LD_PAD];
     __shared__ _Float16 ws[BN][BK + LD_PAD];
-
-    // This block's K slice, from the z grid dimension (see the
-    // Split-K note above). The last slice may be shorter than
-    // slice_len; the staging bounds checks below handle that.
-    const i64 k_off = static_cast<i64>(blockIdx.z) * slice_len;
-    const i64 k_n = k_off + slice_len <= n_in
-                        ? slice_len
-                        : n_in - k_off;
-    const i64 part_off = static_cast<i64>(blockIdx.z) * part_stride;
-
-    // One block owns MB consecutive M tiles and keeps MB accumulators, so the
-    // staged weight tile is amortised over MB*BM rows of output.
-    const i64 row_base = static_cast<i64>(blockIdx.y) * (BM * MB);
-    const i64 col_base = static_cast<i64>(blockIdx.x) * BN;
 
     const int tid = static_cast<int>(threadIdx.x);
     const int lane = tid & 31;
@@ -669,6 +899,8 @@ __global__ void __launch_bounds__(CFG::THREADS)
     // keeps any other layout working (and bit-identical).
     const bool vec_w = (reinterpret_cast<uintptr_t>(w) & 15u) == 0 &&
                        (w_row_bytes & 15u) == 0;
+    const bool vec_w2 = (reinterpret_cast<uintptr_t>(w) & 1u) == 0 &&
+                        (w_row_bytes & 1u) == 0;
 
     v8float acc[MB][NF];
 #pragma unroll
@@ -753,35 +985,29 @@ __global__ void __launch_bounds__(CFG::THREADS)
         }
     };
 
-    // Q4_K pipeline state: the raw bytes of the chunk this thread stages
+    // Weight pipeline state: the raw bytes of the chunk this thread stages
     // in the current K-tile round (cur) and in the next (nxt). With
     // BK=128 the weight tile holds exactly THREADS 32-value chunks, so
     // thread tid always stages chunk tid of the tile — one chunk per
     // thread per round.
-    Q4KRaw q4k_cur{}, q4k_nxt{};
-    bool q4k_cur_ok = false;
-    if constexpr (DT == static_cast<int>(DType::Q4_K) && MODE != 2) {
+    using Pipe = WeightPipe<DT>;
+    typename Pipe::Raw pipe_cur{}, pipe_nxt{};
+    bool pipe_cur_ok = false;
+    if constexpr (Pipe::kHasPipe && MODE != 2) {
         static_assert(BN * (BK / 32) == THREADS,
                       "pipelined staging: one 32-value chunk per thread");
-        // Prologue: round 0's bytes. Chunk cchunk of round 0 lives in
-        // block 0 of the row, which is always inside the allocation
-        // once the row exists (any nonzero n_in allocates >= 1 block).
         const int st_r = tid / (BK / 32);
         const int st_cchunk = tid % (BK / 32);
         const i64 st_gc = col_base + st_r;
-        // Round 0's chunk of this slice is global chunk
-        // (k_off/32)+st_cchunk, which may sit in a block past the
-        // row's last when k_off > 0: only prefetch when the whole
-        // 144-byte block is inside the row's allocation.
         const int gchunk0 = static_cast<int>(k_off / 32) + st_cchunk;
         const int bidx0 = gchunk0 / cpb;
         if (st_gc < n_out &&
             static_cast<size_t>(bidx0) * block_bytes + block_bytes <=
                 w_row_bytes) {
             const u8 *wrow = w + static_cast<size_t>(st_gc) * w_row_bytes;
-            q4k_load_raw(wrow + static_cast<size_t>(bidx0) * block_bytes,
-                         gchunk0 % cpb, vec_w, q4k_cur);
-            q4k_cur_ok = true;
+            Pipe::load(wrow + static_cast<size_t>(bidx0) * block_bytes,
+                       gchunk0 % cpb, vec_w, vec_w2, pipe_cur);
+            pipe_cur_ok = true;
         }
     }
 
@@ -839,18 +1065,15 @@ __global__ void __launch_bounds__(CFG::THREADS)
         }
         {
         // ---- stage the dequantized weight tile (BN x BK) ----
-        if constexpr (DT == static_cast<int>(DType::Q4_K)) {
-            // Software-pipelined Q4_K staging: cur's decode is pure ALU
-            // while nxt's twelve dword loads are in flight.
+        if constexpr (Pipe::kHasPipe) {
+            // Software-pipelined weight staging: cur's decode overlaps with
+            // nxt's global loads across all pipelined formats.
             const int st_r = tid / (BK / 32);
             const int st_cchunk = tid % (BK / 32);
             const i64 st_gc = col_base + st_r;
             const int gchunk =
                 static_cast<int>((k_off + k0) / 32) + st_cchunk;
 
-            // Prefetch round kt+1. A chunk is only readable when the
-            // whole 144-byte block holding it sits inside the row;
-            // chunks past n_in are zero-filled below, never decoded.
             bool nxt_ok = false;
             if (kt + 1 < k_tiles && st_gc < n_out) {
                 const int gchunk_n =
@@ -860,19 +1083,15 @@ __global__ void __launch_bounds__(CFG::THREADS)
                     w_row_bytes) {
                     const u8 *wrow =
                         w + static_cast<size_t>(st_gc) * w_row_bytes;
-                    q4k_load_raw(wrow + static_cast<size_t>(bidx_n) * block_bytes,
-                                 gchunk_n % cpb, vec_w, q4k_nxt);
+                    Pipe::load(wrow + static_cast<size_t>(bidx_n) * block_bytes,
+                               gchunk_n % cpb, vec_w, vec_w2, pipe_nxt);
                     nxt_ok = true;
                 }
             }
 
-            const bool cur_ok = q4k_cur_ok && (k0 + st_cchunk * 32 < k_n);
+            const bool cur_ok = pipe_cur_ok && (k0 + st_cchunk * 32 < k_n);
             if (cur_ok) {
-                q4k_decode_raw(q4k_cur, gchunk % cpb, tmp);
-                // Paired dword stores: the staged values come out of the
-                // decoder as register-resident pairs (both the row stride
-                // BK+8 and the pair offset are even, so the stores stay
-                // aligned).
+                Pipe::decode(pipe_cur, gchunk % cpb, tmp);
 #pragma unroll
                 for (int z = 0; z < 32; z += 2)
                     *reinterpret_cast<u32 *>(&ws[st_r][st_cchunk * 32 + z]) =
@@ -882,8 +1101,8 @@ __global__ void __launch_bounds__(CFG::THREADS)
                 for (int z = 0; z < 32; z++)
                     ws[st_r][st_cchunk * 32 + z] = static_cast<_Float16>(0.0f);
             }
-            q4k_cur = q4k_nxt;
-            q4k_cur_ok = nxt_ok;
+            pipe_cur = pipe_nxt;
+            pipe_cur_ok = nxt_ok;
         } else {
         for (int i = tid; i < BN * (BK / 32); i += THREADS) {
             const int r = i / (BK / 32);
@@ -967,6 +1186,24 @@ __global__ void __launch_bounds__(CFG::THREADS)
         }
     }
     }
+}
+
+template <typename CFG, int MODE = 0, int DT = -1, int MBO = 0>
+__global__ void __launch_bounds__(CFG::THREADS)
+    gemm_wmma_kernel(const u8 *__restrict__ w, int wt, i64 n_out, i64 n_in,
+                     size_t w_row_bytes, const _Float16 *__restrict__ x, i64 rows,
+                     _Float16 *__restrict__ out, i64 n_split, i64 slice_len,
+                     f32 *__restrict__ partials, i64 part_stride) {
+    constexpr int MB = MBO > 0 ? MBO : CFG::MB;
+    const i64 k_off = static_cast<i64>(blockIdx.z) * slice_len;
+    const i64 k_n = k_off + slice_len <= n_in ? slice_len : n_in - k_off;
+    const i64 part_off = static_cast<i64>(blockIdx.z) * part_stride;
+    const i64 row_base = static_cast<i64>(blockIdx.y) * (CFG::BM * MB);
+    const i64 col_base = static_cast<i64>(blockIdx.x) * CFG::BN;
+    (void)n_split;
+    gemm_wmma_tile_body<CFG, MODE, DT, MB>(
+        w, wt, n_out, n_in, w_row_bytes, x, rows, row_base, col_base, out,
+        k_off, k_n, partials, part_off);
 }
 
 // Split-K tail: one fp32 partial per (split, row, col), reduced to

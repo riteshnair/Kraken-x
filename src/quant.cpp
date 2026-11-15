@@ -2888,6 +2888,19 @@ KRK_TARGET_ATTR("avx2,fma") void dot_q4_K_q8_x8_d(
 // 256-bit AVX-VNNI variants: replace maddubs+madd with a single
 // vpdpbusd (u8*s8 dot, 4 products accumulated into i32) per 32-byte chunk.
 // Available on Meteor Lake, Alder Lake, Zen 4+.
+// Separate inline helper with explicit target attribute: Clang 23 does not
+// propagate function target attributes into local lambdas.
+KRK_TARGET_ATTR("avx2,fma,avxvnni") inline __m256 acc_q4k_vnni(
+    __m256 acc, __m256i zero, __m256i ones8, __m256i qn, __m256i xv,
+    f32 sxk, f32 smk) {
+    const __m256i iI = _mm256_dpbusd_epi32(zero, qn, xv);
+    const __m256i iS = _mm256_dpbusd_epi32(zero, ones8, xv);
+    const __m256 fI = _mm256_cvtepi32_ps(iI);
+    const __m256 fS = _mm256_cvtepi32_ps(iS);
+    acc = _mm256_fmadd_ps(fI, _mm256_set1_ps(sxk), acc);
+    return _mm256_fnmadd_ps(fS, _mm256_set1_ps(smk), acc);
+}
+
 KRK_TARGET_ATTR("avx2,fma,avxvnni") f32 dot_q4_K_q8_d_avxvnni(
     const u8 *w, const i8 *xq, const f32 *dx, i64 n) {
     const __m256i kLo = _mm256_set1_epi8(0x0F);
@@ -2912,21 +2925,14 @@ KRK_TARGET_ATTR("avx2,fma,avxvnni") f32 dot_q4_K_q8_d_avxvnni(
             u8 s1, m1, s2, m2;
             get_scale_min_k4(static_cast<int>(j / 32) + 0, sc, &s1, &m1);
             get_scale_min_k4(static_cast<int>(j / 32) + 1, sc, &s2, &m2);
-            const auto accumulate = [&](__m256i qn, __m256i xv, f32 sxk,
-                                        f32 smk) -> void {
-                const __m256i iI = _mm256_dpbusd_epi32(zero, qn, xv);
-                const __m256i iS = _mm256_dpbusd_epi32(zero, ones8, xv);
-                const __m256 fI = _mm256_cvtepi32_ps(iI);
-                const __m256 fS = _mm256_cvtepi32_ps(iS);
-                acc = _mm256_fmadd_ps(fI, _mm256_set1_ps(sxk), acc);
-                acc = _mm256_fnmadd_ps(fS, _mm256_set1_ps(smk), acc);
-            };
             const f32 dx1 = dx[base / 32];
             const f32 dx2 = dx[(base + 32) / 32];
-            accumulate(q_lo, x_lo, dx1 * d * static_cast<f32>(s1),
-                       dx1 * dmin * static_cast<f32>(m1));
-            accumulate(q_hi, x_hi, dx2 * d * static_cast<f32>(s2),
-                       dx2 * dmin * static_cast<f32>(m2));
+            acc = acc_q4k_vnni(acc, zero, ones8, q_lo, x_lo,
+                               dx1 * d * static_cast<f32>(s1),
+                               dx1 * dmin * static_cast<f32>(m1));
+            acc = acc_q4k_vnni(acc, zero, ones8, q_hi, x_hi,
+                               dx2 * d * static_cast<f32>(s2),
+                               dx2 * dmin * static_cast<f32>(m2));
             qs += 32;
         }
     }
@@ -3119,21 +3125,14 @@ KRK_TARGET_ATTR("avx2,fma,avxvnni") void dot_q4_K_q8_x8_d_avxvnni(
                     reinterpret_cast<const __m256i *>(xr + base));
                 const __m256i x_hi = _mm256_loadu_si256(
                     reinterpret_cast<const __m256i *>(xr + base + 32));
-                const auto accumulate = [&](__m256i qn, __m256i xv, f32 sxk,
-                                            f32 smk) -> void {
-                    const __m256i iI = _mm256_dpbusd_epi32(zero, qn, xv);
-                    const __m256i iS = _mm256_dpbusd_epi32(zero, ones8, xv);
-                    const __m256 fI = _mm256_cvtepi32_ps(iI);
-                    const __m256 fS = _mm256_cvtepi32_ps(iS);
-                    acc[r] = _mm256_fmadd_ps(fI, _mm256_set1_ps(sxk), acc[r]);
-                    acc[r] = _mm256_fnmadd_ps(fS, _mm256_set1_ps(smk), acc[r]);
-                };
                 const f32 dx1 = dr[base / 32];
                 const f32 dx2 = dr[(base + 32) / 32];
-                accumulate(q_lo, x_lo, dx1 * d * static_cast<f32>(s1),
-                           dx1 * dmin * static_cast<f32>(m1));
-                accumulate(q_hi, x_hi, dx2 * d * static_cast<f32>(s2),
-                           dx2 * dmin * static_cast<f32>(m2));
+                acc[r] = acc_q4k_vnni(acc[r], zero, ones8, q_lo, x_lo,
+                                      dx1 * d * static_cast<f32>(s1),
+                                      dx1 * dmin * static_cast<f32>(m1));
+                acc[r] = acc_q4k_vnni(acc[r], zero, ones8, q_hi, x_hi,
+                                      dx2 * d * static_cast<f32>(s2),
+                                      dx2 * dmin * static_cast<f32>(m2));
             }
             qs += 32;
         }
